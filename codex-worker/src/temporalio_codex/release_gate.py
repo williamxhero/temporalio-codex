@@ -13,6 +13,8 @@ REQUIRED_ACCEPTANCE_CASES = (
     "cancel",
     "codex_activity_uncertainty",
     "github_readback",
+    "installed_artifact",
+    "local_temporal_restart",
     "legacy_inspection",
 )
 

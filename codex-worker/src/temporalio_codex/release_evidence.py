@@ -9,6 +9,7 @@ _SHA_LENGTH = 40
 class EvidenceKind(StrEnum):
     DETERMINISTIC = "deterministic"
     LOCAL_TEMPORAL = "local_temporal"
+    INSTALLED_ARTIFACT = "installed_artifact"
     LIVE_CODEX_SDK = "live_codex_sdk"
     LIVE_GITHUB = "live_github"
     WINDOWS = "windows"

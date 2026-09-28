@@ -10,13 +10,6 @@ from pathlib import Path
 from temporalio_codex.entry_models import ENTRY_CONTRACT_VERSION
 
 RETIREMENT_SCHEMA_VERSION = "temporalio-codex-retirement/v1"
-_LEGACY_EXECUTION_MARKERS = (
-    "dispatch.py",
-    "advance_runtime",
-    "managed_recovery",
-    "supervisor",
-    "parent-model continuation",
-)
 _HANDOFF_MARKERS = (
     "spec_runner_handoff.py",
     "new requests enter the runner directly",

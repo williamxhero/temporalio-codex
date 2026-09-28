@@ -38,6 +38,14 @@ def qualify_installed_artifact(
     """Inspect the installed package without importing repository source."""
     errors: list[str] = []
     refs: list[str] = []
+    if not build_id.strip():
+        errors.append("build_id is required")
+    if not qualification_run_id.strip():
+        errors.append("qualification_run_id is required")
+    if len(candidate_sha) != 40:
+        errors.append("candidate_sha must be a 40-character commit SHA")
+    if not artifact_ref.strip():
+        errors.append("artifact_ref is required")
     try:
         distribution = importlib.metadata.distribution(PACKAGE_NAME)
         package_version = distribution.version

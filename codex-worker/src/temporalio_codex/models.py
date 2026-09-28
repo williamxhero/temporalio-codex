@@ -25,6 +25,7 @@ class StageResult:
 
 @dataclass(frozen=True)
 class RunResult:
+    workflow_id: str
     status: StageOutcome
     stage: str
     summary: str

@@ -17,6 +17,7 @@ class CodexRunWorkflow:
             start_to_close_timeout=timedelta(seconds=30),
         )
         return RunResult(
+            workflow_id=workflow.info().workflow_id,
             status=stage_result.outcome,
             stage=stage_result.stage,
             summary=stage_result.summary,

@@ -4,4 +4,9 @@ Install the development environment with `uv sync --extra dev` and run the
 foundation tests with `uv run pytest`.
 
 The package contains the external Temporal Worker workflow and Activity seam.
-The local Server, Worker and client startup commands are added by TC-00.2.
+Start a local Server with `temporal server start-dev`, then start the Worker
+with `uv run temporalio-codex-worker`. Submit a run from another terminal with
+`uv run temporalio-codex-run --requirement "..."`.
+
+The client derives a stable Workflow ID from the requirement when
+`--workflow-id` is omitted. Reusing a completed ID is rejected explicitly.

@@ -61,7 +61,8 @@ class GitHubDeliveryAdapter:
             receipt = await self._cleanup(operation)
         else:
             raise ValueError(f"unsupported GitHub phase: {operation.phase.value}")
-        self._receipts[operation.operation_id] = receipt
+        if receipt.outcome is DeliveryOutcome.COMPLETED:
+            self._receipts[operation.operation_id] = receipt
         return receipt
 
     async def _pull_request(self, operation: DeliveryOperation) -> DeliveryReceipt:
@@ -196,8 +197,11 @@ class GitHubDeliveryAdapter:
         )
 
     async def _cleanup(self, operation: DeliveryOperation) -> DeliveryReceipt:
-        for issue_number in operation.issue_numbers:
-            await self.gateway.close_issue(issue_number)
+        try:
+            for issue_number in operation.issue_numbers:
+                await self.gateway.close_issue(issue_number)
+        except Exception:
+            return self._unknown(operation, "cleanup write outcome is unknown")
         return DeliveryReceipt(
             operation_id=operation.operation_id,
             phase=operation.phase,

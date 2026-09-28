@@ -1,3 +1,6 @@
+import asyncio
+from contextlib import suppress
+
 from temporalio import activity
 
 from temporalio_codex.codex_adapter import CodexAdapter
@@ -87,7 +90,25 @@ async def codex_stage(operation: CodexOperation) -> CodexObservation:
                 can_resume_thread=operation.thread_id is not None,
             ),
         )
-    return await _codex_adapter.execute(operation)
+
+    async def heartbeat_while_running() -> None:
+        while True:
+            activity.heartbeat(
+                {
+                    "operation_id": operation.operation_id,
+                    "stage": operation.stage,
+                    "progress": "codex operation running",
+                }
+            )
+            await asyncio.sleep(10)
+
+    heartbeat_task = asyncio.create_task(heartbeat_while_running())
+    try:
+        return await _codex_adapter.execute(operation)
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
 
 
 @activity.defn(name="delivery-git-stage")

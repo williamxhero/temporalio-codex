@@ -97,6 +97,7 @@ class CodexRunWorkflow:
                         start_to_close_timeout=timedelta(
                             seconds=stage.start_to_close_timeout_seconds
                         ),
+                        heartbeat_timeout=timedelta(seconds=30),
                         retry_policy=RetryPolicy(
                             initial_interval=timedelta(milliseconds=10),
                             maximum_interval=timedelta(milliseconds=50),
@@ -239,6 +240,7 @@ class CodexRunWorkflow:
                 start_to_close_timeout=timedelta(
                     seconds=stage.start_to_close_timeout_seconds
                 ),
+                heartbeat_timeout=timedelta(seconds=30),
                 retry_policy=RetryPolicy(
                     initial_interval=timedelta(milliseconds=10),
                     maximum_interval=timedelta(milliseconds=50),

@@ -16,6 +16,7 @@ def complete_evidence(**overrides) -> SpecDeliveryEvidence:
         unresolved_findings=(),
         delivery_status="completed",
         delivery_run_id="delivery-run-1",
+        push_operation_id="delivery-run-1:push",
         pull_request_number=42,
         pull_request_url="https://github.com/owner/repo/pull/42",
         merge_commit_sha="merge-1",

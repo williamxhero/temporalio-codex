@@ -61,6 +61,7 @@ async def test_fake_delivery_adapter_caches_unknown_write_outcome() -> None:
         {"workspace": None},
         {"phase": DeliveryPhase.ACCEPTANCE},
         {"phase": DeliveryPhase.MERGE},
+        {"phase": DeliveryPhase.PUSH},
     ],
 )
 async def test_delivery_operation_validation_rejects_missing_scope(overrides) -> None:

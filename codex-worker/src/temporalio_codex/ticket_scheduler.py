@@ -25,6 +25,7 @@ class TicketPlan:
 class SchedulerInput:
     specs: tuple[SpecPlan, ...]
     tickets: tuple[TicketPlan, ...]
+    completion_operations: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ def validate_scheduler_graph(input: SchedulerInput) -> tuple[str, ...]:
     errors: list[str] = []
     spec_keys = [spec.key for spec in input.specs]
     ticket_keys = [ticket.key for ticket in input.tickets]
+    completion_keys = [key for key, _ in input.completion_operations]
     if not input.specs:
         errors.append("at least one SPEC is required")
     for spec in input.specs:
@@ -61,6 +63,12 @@ def validate_scheduler_graph(input: SchedulerInput) -> tuple[str, ...]:
         errors.append("SPEC keys must be unique")
     if len(set(ticket_keys)) != len(ticket_keys):
         errors.append("ticket keys must be unique")
+    if len(set(completion_keys)) != len(completion_keys):
+        errors.append("completion ticket keys must be unique")
+    if set(completion_keys) - set(ticket_keys):
+        errors.append("completion operations reference unknown tickets")
+    if any(not key.strip() or not operation.strip() for key, operation in input.completion_operations):
+        errors.append("completion operations require ticket and operation identities")
     known_specs = set(spec_keys)
     known_tickets = set(ticket_keys)
     for spec in input.specs:

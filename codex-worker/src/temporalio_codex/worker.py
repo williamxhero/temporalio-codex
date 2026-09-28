@@ -31,6 +31,7 @@ from temporalio_codex.planning_activities import configure_spec_issue_gateway, p
 from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
 from temporalio_codex.spec_issue_adapter import GhCliSpecIssueGateway
 from temporalio_codex.ticket_workflows import TicketSchedulerWorkflow
+from temporalio_codex.whole_flow_workflows import RequirementDeliveryWorkflow
 
 
 async def run_worker(
@@ -55,6 +56,7 @@ async def run_worker(
             RequirementPlanningWorkflow,
             TicketSchedulerWorkflow,
             DeliverySummaryWorkflow,
+            RequirementDeliveryWorkflow,
         ],
         activities=[
             foundation_stage,

@@ -28,6 +28,8 @@ class LocalGitAdapter:
             DeliveryPhase.CI,
         }:
             return await self._verify_candidate(operation)
+        if operation.phase is DeliveryPhase.PUSH:
+            return await self._verify_remote(operation)
         raise ValueError(f"unsupported local Git phase: {operation.phase.value}")
 
     async def _prepare_candidate(
@@ -124,6 +126,60 @@ class LocalGitAdapter:
             candidate_sha=current_sha,
             acceptance_version=operation.acceptance_version,
             evidence_refs=(f"git:{workspace}:HEAD={current_sha}",),
+        )
+
+    async def _verify_remote(self, operation: DeliveryOperation) -> DeliveryReceipt:
+        repository = Path(operation.repository).resolve()
+        remote_ref = f"refs/heads/{operation.target_branch}"
+        push_summary = "origin push completed"
+        try:
+            await self._git(
+                repository,
+                "push",
+                "origin",
+                f"{operation.merge_commit_sha}:{remote_ref}",
+            )
+        except GitCommandError:
+            push_summary = "origin push response was lost; readback attempted"
+        try:
+            remote = await self._git(repository, "ls-remote", "origin", remote_ref)
+        except GitCommandError:
+            return DeliveryReceipt(
+                operation_id=operation.operation_id,
+                phase=operation.phase,
+                outcome=DeliveryOutcome.UNKNOWN,
+                summary="origin push and readback are unknown",
+                candidate_sha=operation.candidate_sha,
+                merged_sha=operation.merge_commit_sha,
+                pull_request_number=operation.pull_request_number,
+                readback_required=True,
+            )
+        remote_sha = remote.split()[0] if remote.split() else ""
+        contains_merge = remote_sha == operation.merge_commit_sha
+        outcome = (
+            DeliveryOutcome.COMPLETED
+            if contains_merge
+            else DeliveryOutcome.FAILED
+        )
+        return DeliveryReceipt(
+            operation_id=operation.operation_id,
+            phase=operation.phase,
+            outcome=outcome,
+            summary=(
+                f"{push_summary}; origin remote contains verified merge"
+                if contains_merge
+                else "origin remote does not contain expected merge"
+            ),
+            candidate_sha=operation.candidate_sha,
+            merged_sha=operation.merge_commit_sha,
+            remote_sha=remote_sha or None,
+            remote_contains_merge=contains_merge,
+            pull_request_number=operation.pull_request_number,
+            evidence_refs=(
+                f"origin:{operation.target_branch}={remote_sha}"
+                if remote_sha
+                else "",
+            ),
         )
 
     async def _assert_clean(self, workspace: Path) -> None:

@@ -47,6 +47,7 @@ class TicketSchedulerWorkflow:
             self._status = SchedulerStatus.BLOCKED
             self._reason = "; ".join(errors)
             return self._result()
+        completion_operations = dict(input.completion_operations)
         while len(self._completed_tickets) < len(input.tickets):
             active_spec = self._active_spec()
             if active_spec is None:
@@ -58,6 +59,11 @@ class TicketSchedulerWorkflow:
                 self._status = SchedulerStatus.BLOCKED
                 self._reason = f"SPEC {active_spec} has no ready ticket frontier"
                 return self._result()
+            automatic = [key for key in frontier if key in completion_operations]
+            if automatic:
+                for ticket_key in automatic:
+                    self._complete(ticket_key, completion_operations[ticket_key])
+                continue
             await workflow.wait_condition(
                 lambda: bool(
                     set(self._completed_tickets).intersection(frontier)
@@ -66,6 +72,10 @@ class TicketSchedulerWorkflow:
             )
         self._status = SchedulerStatus.COMPLETED
         return self._result()
+
+    def _complete(self, ticket_key: str, operation_id: str) -> None:
+        self._completed_tickets.add(ticket_key)
+        self._completion_operations[ticket_key] = operation_id
 
     @workflow.update(name="complete_ticket")
     async def complete_ticket(self, ticket_key: str, operation_id: str) -> bool:

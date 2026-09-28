@@ -27,6 +27,7 @@ class SpecDeliveryEvidence:
     unresolved_findings: tuple[str, ...]
     delivery_status: str
     delivery_run_id: str | None = None
+    push_operation_id: str | None = None
     pull_request_number: int | None = None
     pull_request_url: str | None = None
     merge_commit_sha: str | None = None
@@ -126,6 +127,11 @@ def qualify_spec_delivery(
             DeliveryGateStatus.WAITING_FOR_READBACK,
             "merge or remote SHA evidence is missing",
         )
+    if not evidence.push_operation_id:
+        return DeliveryGateResult(
+            DeliveryGateStatus.WAITING_FOR_READBACK,
+            "push operation evidence is missing",
+        )
     if evidence.remote_contains_merge is not True:
         return DeliveryGateResult(
             DeliveryGateStatus.WAITING_FOR_READBACK,
@@ -136,6 +142,7 @@ def qualify_spec_delivery(
         for ref in (
             *(item.commit_sha or "" for item in evidence.ticket_evidence),
             evidence.delivery_run_id or "",
+            evidence.push_operation_id or "",
             str(evidence.pull_request_number or ""),
             evidence.pull_request_url or "",
             evidence.merge_commit_sha,

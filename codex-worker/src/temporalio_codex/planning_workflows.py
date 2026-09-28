@@ -70,6 +70,11 @@ class RequirementPlanningWorkflow:
             start_to_close_timeout=timedelta(seconds=30),
         )
         self._grill = GrillRecord(questions=questions)
+        for answer in input.grill_answers:
+            if not self._record_grill_answer(answer):
+                self._status = PlanningStatus.BLOCKED
+                self._publication_reason = "invalid initial Grill answer"
+                return self._planning_result()
         await workflow.wait_condition(
             lambda: self._required_questions_answered() or self._cancelled
         )
@@ -78,12 +83,18 @@ class RequirementPlanningWorkflow:
 
         self._phase = PlanningPhase.CONFIRMATION_REQUIRED
         self._status = PlanningStatus.WAITING_FOR_INPUT
+        if input.confirmation_operation_id:
+            self._confirmed = True
+            self._confirmation_operation_id = input.confirmation_operation_id
         await workflow.wait_condition(lambda: self._confirmed or self._cancelled)
         if self._cancelled:
             return self._cancelled_result()
 
         self._phase = PlanningPhase.READY
         self._status = PlanningStatus.READY
+        if input.publication_operation_id:
+            self._publication_requested = True
+            self._publication_operation_id = input.publication_operation_id
         await workflow.wait_condition(
             lambda: self._publication_requested or self._cancelled
         )
@@ -159,6 +170,9 @@ class RequirementPlanningWorkflow:
     ) -> bool:
         if self._phase is not PlanningPhase.GRILLING:
             return False
+        return self._record_grill_answer(answer)
+
+    def _record_grill_answer(self, answer: GrillAnswer) -> bool:
         if not answer.answer.strip():
             return False
         if answer.question_number not in {

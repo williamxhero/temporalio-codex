@@ -1,9 +1,14 @@
 import shutil
 import subprocess
+import sys
 
 import pytest
 
-from temporalio_codex.delivery_models import DeliveryOperation, DeliveryPhase
+from temporalio_codex.delivery_models import (
+    DeliveryOperation,
+    DeliveryOutcome,
+    DeliveryPhase,
+)
 from temporalio_codex.git_adapter import GitCommandError, LocalGitAdapter
 
 
@@ -84,3 +89,33 @@ async def test_local_git_adapter_rejects_stale_and_dirty_candidate(tmp_path) -> 
     run_git(repository, "commit", "-m", "second")
     with pytest.raises(GitCommandError, match="different SHA|changed"):
         await adapter.execute(candidate_operation(repository, workspace, base_sha="HEAD"))
+
+
+async def test_local_git_adapter_requires_explicit_acceptance_command(tmp_path) -> None:
+    repository = make_repository(tmp_path)
+    workspace = tmp_path / "candidate"
+    adapter = LocalGitAdapter()
+    candidate = await adapter.execute(candidate_operation(repository, workspace))
+
+    missing = await adapter.execute(
+        candidate_operation(
+            repository,
+            workspace,
+            operation_id="acceptance-missing",
+            phase=DeliveryPhase.ACCEPTANCE,
+            candidate_sha=candidate.candidate_sha,
+        )
+    )
+    passed = await adapter.execute(
+        candidate_operation(
+            repository,
+            workspace,
+            operation_id="acceptance-pass",
+            phase=DeliveryPhase.ACCEPTANCE,
+            candidate_sha=candidate.candidate_sha,
+            acceptance_command=(sys.executable, "-c", "pass"),
+        )
+    )
+
+    assert missing.outcome is DeliveryOutcome.NOT_VERIFIED
+    assert passed.outcome is DeliveryOutcome.COMPLETED

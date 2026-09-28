@@ -291,7 +291,9 @@ class GhCliGateway:
             operation.candidate_sha or "",
             "check-runs",
             fields=("per_page=100",),
+            paginate=True,
         )
+        pages = payload if isinstance(payload, list) else [payload]
         return tuple(
             CheckRecord(
                 name=item.get("name", "unknown"),
@@ -299,7 +301,8 @@ class GhCliGateway:
                 status=item.get("status", "unknown"),
                 conclusion=item.get("conclusion"),
             )
-            for item in payload.get("check_runs", [])
+            for page in pages
+            for item in page.get("check_runs", [])
         )
 
     async def merge_pull_request(self, operation: DeliveryOperation) -> PullRequestRecord:
@@ -315,8 +318,16 @@ class GhCliGateway:
     async def close_issue(self, issue_number: int) -> None:
         await self._api("issues", str(issue_number), method="PATCH", fields=("state=closed",))
 
-    async def _api(self, *path: str, method: str = "GET", fields: tuple[str, ...] = ()):
+    async def _api(
+        self,
+        *path: str,
+        method: str = "GET",
+        fields: tuple[str, ...] = (),
+        paginate: bool = False,
+    ):
         args = ["gh", "api", f"repos/{self.repository}/" + "/".join(path), "--method", method]
+        if paginate:
+            args.extend(["--paginate", "--slurp"])
         for field in fields:
             args.extend(["-f", field])
         return await asyncio.to_thread(self._run, args)

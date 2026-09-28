@@ -20,6 +20,13 @@ class DeliveryOutcome(StrEnum):
     NOT_VERIFIED = "not_verified"
 
 
+class DeliveryStatus(StrEnum):
+    ACTIVE = "active"
+    WAITING_FOR_READBACK = "waiting_for_readback"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class DeliveryOperation:
     operation_id: str
@@ -31,6 +38,7 @@ class DeliveryOperation:
     candidate_branch: str | None = None
     title: str | None = None
     body: str | None = None
+    acceptance_command: tuple[str, ...] = ()
     base_sha: str | None = None
     candidate_sha: str | None = None
     acceptance_version: str | None = None
@@ -53,6 +61,38 @@ class DeliveryReceipt:
     external_state: str | None = None
     readback_required: bool = False
     evidence_refs: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class DeliveryInput:
+    repository: str
+    workspace: str
+    base_sha: str
+    target_branch: str = "main"
+    candidate_branch: str = ""
+    acceptance_version: str = "v1"
+    acceptance_command: tuple[str, ...] = ()
+    pull_request_identity: str = ""
+    title: str = ""
+    body: str = ""
+    issue_numbers: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class DeliverySnapshot:
+    workflow_id: str
+    status: DeliveryStatus
+    phase: DeliveryPhase | None
+    receipts: tuple[DeliveryReceipt, ...]
+
+
+@dataclass(frozen=True)
+class DeliveryResult:
+    workflow_id: str
+    status: DeliveryStatus
+    outcome: DeliveryOutcome
+    summary: str
+    receipts: tuple[DeliveryReceipt, ...] = ()
 
 
 def validate_operation(operation: DeliveryOperation) -> None:

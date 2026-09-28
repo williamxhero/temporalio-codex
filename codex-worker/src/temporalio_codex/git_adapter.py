@@ -73,6 +73,49 @@ class LocalGitAdapter:
         if current_sha != operation.candidate_sha:
             raise GitCommandError("candidate SHA changed after preparation")
         await self._assert_clean(workspace)
+        if operation.phase is DeliveryPhase.ACCEPTANCE:
+            if not operation.acceptance_command:
+                return DeliveryReceipt(
+                    operation_id=operation.operation_id,
+                    phase=operation.phase,
+                    outcome=DeliveryOutcome.NOT_VERIFIED,
+                    summary="acceptance command is not configured",
+                    candidate_sha=current_sha,
+                    acceptance_version=operation.acceptance_version,
+                )
+            result = await asyncio.to_thread(
+                self._run_command,
+                workspace,
+                operation.acceptance_command,
+            )
+            outcome = (
+                DeliveryOutcome.COMPLETED
+                if result.returncode == 0
+                else DeliveryOutcome.FAILED
+            )
+            summary = (
+                "acceptance command passed"
+                if result.returncode == 0
+                else "acceptance command failed"
+            )
+            return DeliveryReceipt(
+                operation_id=operation.operation_id,
+                phase=operation.phase,
+                outcome=outcome,
+                summary=summary,
+                candidate_sha=current_sha,
+                acceptance_version=operation.acceptance_version,
+                evidence_refs=(f"git:{workspace}:HEAD={current_sha}",),
+            )
+        if operation.phase is DeliveryPhase.REVIEW:
+            return DeliveryReceipt(
+                operation_id=operation.operation_id,
+                phase=operation.phase,
+                outcome=DeliveryOutcome.NOT_VERIFIED,
+                summary="independent review adapter is not configured",
+                candidate_sha=current_sha,
+                acceptance_version=operation.acceptance_version,
+            )
         return DeliveryReceipt(
             operation_id=operation.operation_id,
             phase=operation.phase,
@@ -104,3 +147,14 @@ class LocalGitAdapter:
             detail = result.stderr.strip().splitlines()
             raise GitCommandError(detail[-1][:500] if detail else "git command failed")
         return result.stdout.strip()
+
+    @staticmethod
+    def _run_command(cwd: Path, args: tuple[str, ...]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            list(args),
+            cwd=cwd,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=1800,
+        )

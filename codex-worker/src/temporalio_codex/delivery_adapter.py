@@ -47,6 +47,9 @@ class FakeDeliveryAdapter:
         candidate_sha = operation.candidate_sha
         if operation.phase is DeliveryPhase.CANDIDATE:
             candidate_sha = candidate_sha or f"candidate-{operation.operation_id}"
+        pull_request_number = operation.pull_request_number
+        if operation.phase is DeliveryPhase.PULL_REQUEST:
+            pull_request_number = pull_request_number or 1
         return DeliveryReceipt(
             operation_id=operation.operation_id,
             phase=operation.phase,
@@ -54,6 +57,6 @@ class FakeDeliveryAdapter:
             summary=f"fake {operation.phase.value} completed",
             candidate_sha=candidate_sha,
             acceptance_version=operation.acceptance_version,
-            pull_request_number=operation.pull_request_number,
+            pull_request_number=pull_request_number,
             merged_sha=(candidate_sha if operation.phase is DeliveryPhase.MERGE else None),
         )

@@ -19,6 +19,8 @@ class TicketPlan:
     key: str
     spec_key: str
     blockers: tuple[str, ...] = ()
+    title: str = ""
+    acceptance_criteria: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

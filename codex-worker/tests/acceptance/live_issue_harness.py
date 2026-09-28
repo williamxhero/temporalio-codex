@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import secrets
 import subprocess
 import tempfile
@@ -14,6 +15,15 @@ from pathlib import Path
 class LiveIssueManifest:
     marker: str
     repository: str
+    run_id: str
+    build_id: str
+    scenario: str
+    command: str
+    operating_system: str
+    evidence_kind: str = "live_github"
+    expected_resources: tuple[str, ...] = ("issue", "comment")
+    cleanup_plan: tuple[str, ...] = ("close marker-matched issue", "verify CLOSED readback")
+    evidence_refs: tuple[str, ...] = ()
     issue_number: int | None = None
     comment_id: int | None = None
     issue_url: str | None = None
@@ -39,7 +49,15 @@ def run_issue_round_trip(
     )
     directory.mkdir(parents=True, exist_ok=True)
     manifest_path = directory / f"{marker}.json"
-    manifest = LiveIssueManifest(marker=marker, repository=repository)
+    manifest = LiveIssueManifest(
+        marker=marker,
+        repository=repository,
+        run_id=marker,
+        build_id=os.environ.get("TC07_BUILD_ID", "working-tree"),
+        scenario="authenticated GitHub Issue and comment round trip",
+        command="uv run pytest tests/acceptance/test_live_issue.py -m live -vv",
+        operating_system=platform.platform(),
+    )
     _write_manifest(manifest_path, manifest)
 
     title = f"[TC-07 LIVE] {marker} acceptance probe"
@@ -51,17 +69,26 @@ def run_issue_round_trip(
     try:
         created = _gh_issue_create(repository, title, body)
         manifest = LiveIssueManifest(
-            marker=marker,
-            repository=repository,
-            issue_number=created,
-            status="issue_created",
+            **{
+                **asdict(manifest),
+                "issue_number": created,
+                "status": "issue_created",
+            }
         )
         _write_manifest(manifest_path, manifest)
         issue = _gh_issue_view(repository, created)
         if marker not in issue["body"]:
             raise RuntimeError("Issue readback does not contain the run marker")
+        manifest = LiveIssueManifest(
+            **{
+                **asdict(manifest),
+                "issue_url": issue["url"],
+                "evidence_refs": (issue["url"],),
+            }
+        )
+        _write_manifest(manifest_path, manifest)
         comment_body = f"<!-- tc07-live:{marker} -->\nReadback verified for `{marker}`."
-        comment_id = _gh_comment(repository, created, comment_body)
+        comment_id = _gh_comment(repository, created, comment_body, marker)
         comment = _gh_comment_view(repository, created, comment_id)
         if marker not in comment["body"]:
             raise RuntimeError("comment readback does not contain the run marker")
@@ -69,7 +96,7 @@ def run_issue_round_trip(
             **{
                 **asdict(manifest),
                 "comment_id": comment_id,
-                "issue_url": issue["url"],
+                "evidence_refs": (*manifest.evidence_refs, f"comment:{comment_id}"),
                 "status": "verified",
             }
         )
@@ -121,14 +148,24 @@ def _gh_issue_view(repository: str, number: int) -> dict:
     return json.loads(_run(["gh", "issue", "view", str(number), "--repo", repository, "--json", "number,body,state,url"]))
 
 
-def _gh_comment(repository: str, number: int, body: str) -> int:
+def _gh_comment(repository: str, number: int, body: str, marker: str) -> int:
     body_file = _body_file(body)
     try:
         _run(["gh", "issue", "comment", str(number), "--repo", repository, "--body-file", str(body_file)])
     finally:
         body_file.unlink(missing_ok=True)
-    comments = json.loads(_run(["gh", "api", f"repos/{repository}/issues/{number}/comments", "--paginate"]))
-    return int(comments[-1]["id"])
+    comments = json.loads(
+        _run(["gh", "api", f"repos/{repository}/issues/{number}/comments", "--paginate"])
+    )
+    marker = f"<!-- tc07-live:{marker} -->"
+    matches = [
+        comment
+        for comment in comments
+        if marker in (comment.get("body") or "")
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("live comment was not uniquely readable")
+    return int(matches[0]["id"])
 
 
 def _gh_comment_view(repository: str, number: int, comment_id: int) -> dict:

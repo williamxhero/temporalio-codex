@@ -23,6 +23,10 @@ deterministic fake GitHub boundary:
 uv run pytest tests/acceptance -m "not live" -vv
 ```
 
+The deterministic flow publishes each SPEC and its tickets through the fake
+Issue gateway, reads back Parent and blocker relationships, then runs the
+ticket scheduler before implementation and delivery.
+
 The authenticated live probe creates a marked issue and comment in
 `williamxhero/skills`, reads both back, and closes the issue during cleanup.
 It is opt-in so normal test runs remain offline:

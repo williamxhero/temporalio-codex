@@ -8,7 +8,7 @@ from temporalio_codex.planning_models import PlanningInput
 from temporalio_codex.planning_models import GrillAnswer, SourceOrigin
 from temporalio_codex.spec_issue_adapter import SpecDraft
 from temporalio_codex.summary_adapter import SummaryPublicationInput
-from temporalio_codex.ticket_scheduler import SchedulerInput
+from temporalio_codex.ticket_scheduler import SchedulerInput, validate_scheduler_graph
 
 
 class WholeFlowPhase(StrEnum):
@@ -17,6 +17,7 @@ class WholeFlowPhase(StrEnum):
     CODEX = "codex"
     DELIVERY = "delivery"
     SUMMARY = "summary"
+    BLOCKED = "blocked"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -116,3 +117,74 @@ class WholeFlowResult:
     delivery_results: tuple[dict, ...] = ()
     summary: dict | None = None
     reason: str = ""
+
+
+def topological_spec_keys(input: SchedulerInput) -> tuple[str, ...]:
+    dependencies = {spec.key: set(spec.dependencies) for spec in input.specs}
+    remaining = set(dependencies)
+    ordered: list[str] = []
+    while remaining:
+        ready = sorted(
+            key
+            for key in remaining
+            if dependencies[key].isdisjoint(remaining)
+        )
+        if not ready:
+            return ()
+        ordered.extend(ready)
+        remaining.difference_update(ready)
+    return tuple(ordered)
+
+
+def validate_whole_flow_input(input: WholeFlowInput) -> tuple[str, ...]:
+    errors = list(validate_scheduler_graph(input.scheduler))
+    if errors:
+        return tuple(dict.fromkeys(errors))
+
+    expected_specs = topological_spec_keys(input.scheduler)
+    planning_keys = tuple(draft.key for draft in input.planning.specs)
+    codex_keys = tuple(plan.spec_key for plan in input.codex)
+    delivery_keys = tuple(plan.spec_key for plan in input.deliveries)
+    expected_set = set(expected_specs)
+    draft_by_key = {draft.key: draft for draft in input.planning.specs}
+    scheduler_dependencies = {
+        spec.key: set(spec.dependencies) for spec in input.scheduler.specs
+    }
+
+    if set(planning_keys) != expected_set or len(planning_keys) != len(expected_specs):
+        errors.append("planning SPECs do not match the scheduler graph")
+    elif any(
+        set(draft_by_key[key].dependencies) != scheduler_dependencies[key]
+        for key in expected_specs
+    ):
+        errors.append("planning dependencies do not match the scheduler graph")
+    if set(codex_keys) != expected_set or len(codex_keys) != len(expected_specs):
+        errors.append("Codex plans do not cover each SPEC exactly once")
+    if set(delivery_keys) != expected_set or len(delivery_keys) != len(expected_specs):
+        errors.append("delivery plans do not cover each SPEC exactly once")
+    if codex_keys != expected_specs:
+        errors.append("Codex plans must follow dependency order")
+    if delivery_keys != expected_specs:
+        errors.append("delivery plans must follow dependency order")
+    spec_order = {key: index for index, key in enumerate(expected_specs)}
+    dependency_closure: dict[str, set[str]] = {}
+    for key in expected_specs:
+        dependencies = set(scheduler_dependencies[key])
+        for dependency in tuple(dependencies):
+            dependencies.update(dependency_closure.get(dependency, set()))
+        dependency_closure[key] = dependencies
+    ticket_by_key = {ticket.key: ticket for ticket in input.scheduler.tickets}
+    for ticket in input.scheduler.tickets:
+        for blocker_key in ticket.blockers:
+            blocker = ticket_by_key.get(blocker_key)
+            if blocker is None or blocker.spec_key == ticket.spec_key:
+                continue
+            if (
+                spec_order.get(blocker.spec_key, -1)
+                >= spec_order.get(ticket.spec_key, 0)
+                or blocker.spec_key not in dependency_closure[ticket.spec_key]
+            ):
+                errors.append(
+                    f"ticket {ticket.key} has a blocker in a later or unrelated SPEC"
+                )
+    return tuple(dict.fromkeys(errors))

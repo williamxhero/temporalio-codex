@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
@@ -16,7 +17,9 @@ from temporalio_codex.codex_adapter import FakeCodexAdapter
 from temporalio_codex.delivery_adapter import FakeDeliveryAdapter
 from temporalio_codex.delivery_models import DeliveryInput, DeliveryPhase
 from temporalio_codex.planning_activities import (
+    configure_ticket_issue_gateway,
     configure_spec_issue_gateway,
+    publish_ticket_issues,
     prepare_grill,
     publish_spec_issues,
 )
@@ -26,6 +29,7 @@ from temporalio_codex.planning_models import (
     SourceOrigin,
 )
 from temporalio_codex.spec_issue_adapter import FakeSpecIssueGateway, SpecDraft
+from temporalio_codex.ticket_issue_adapter import FakeTicketIssueGateway
 from temporalio_codex.summary_activities import (
     configure_summary_gateway,
     publish_delivery_summary,
@@ -43,6 +47,7 @@ from temporalio_codex.whole_flow_models import (
     WholeFlowPhase,
     WholeFlowStatus,
     PlanningPayload,
+    validate_whole_flow_input,
 )
 from temporalio_codex.whole_flow_workflows import RequirementDeliveryWorkflow
 from temporalio_codex.workflows import CodexRunWorkflow
@@ -140,6 +145,7 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows() -> None
     configure_codex_adapter(FakeCodexAdapter({}))
     configure_delivery_adapters(FakeDeliveryAdapter(), FakeDeliveryAdapter())
     configure_spec_issue_gateway(FakeSpecIssueGateway())
+    configure_ticket_issue_gateway(FakeTicketIssueGateway())
     configure_summary_gateway(FakeSummaryCommentGateway())
     try:
         async with await WorkflowEnvironment.start_time_skipping() as environment:
@@ -162,6 +168,7 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows() -> None
                     delivery_github_stage,
                     prepare_grill,
                     publish_spec_issues,
+                    publish_ticket_issues,
                     publish_delivery_summary,
                 ],
             ):
@@ -182,6 +189,14 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows() -> None
         assert snapshot.completed_specs == ("foundation", "follow-up")
         assert result.delivery_results
         assert all(
+            run["ticket_publication"]["status"] == "verified"
+            for run in result.scheduler["runs"]
+        )
+        assert all(
+            len(run["ticket_publication"]["issues"]) > 0
+            for run in result.scheduler["runs"]
+        )
+        assert all(
             any(receipt["phase"] == DeliveryPhase.PUSH for receipt in item["receipts"])
             for item in result.delivery_results
         )
@@ -191,11 +206,13 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows() -> None
         configure_codex_adapter(None)
         configure_delivery_adapters(None, None)
         configure_spec_issue_gateway(None)
+        configure_ticket_issue_gateway(None)
         configure_summary_gateway(None)
 
 
 async def test_historical_chat_is_accepted_without_persisting_inline_source() -> None:
     configure_spec_issue_gateway(FakeSpecIssueGateway())
+    configure_ticket_issue_gateway(FakeTicketIssueGateway())
     try:
         async with await WorkflowEnvironment.start_time_skipping() as environment:
             async with Worker(
@@ -222,3 +239,32 @@ async def test_historical_chat_is_accepted_without_persisting_inline_source() ->
         assert result.source.source_reference != "the approved chat decision"
     finally:
         configure_spec_issue_gateway(None)
+        configure_ticket_issue_gateway(None)
+
+
+def test_whole_flow_rejects_future_cross_spec_blocker_before_starting_children() -> None:
+    input = whole_flow_input()
+    scheduler = SchedulerInput(
+        specs=input.scheduler.specs,
+        tickets=(
+            TicketPlan("foundation-a", "foundation", ("follow-up-a",)),
+            TicketPlan("foundation-b", "foundation"),
+            TicketPlan("follow-up-a", "follow-up"),
+        ),
+        completion_operations=input.scheduler.completion_operations,
+    )
+    errors = validate_whole_flow_input(
+        WholeFlowInput(
+            planning=input.planning,
+            scheduler=scheduler,
+            codex=input.codex,
+            deliveries=input.deliveries,
+            summary=input.summary,
+        )
+    )
+
+    assert any("later or unrelated" in error for error in errors)
+
+
+def test_acceptance_directory_has_no_local_spec_mirror() -> None:
+    assert not (Path(__file__).parents[3] / "docs" / "specs").exists()

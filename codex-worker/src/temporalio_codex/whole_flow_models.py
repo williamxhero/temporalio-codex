@@ -12,6 +12,7 @@ from temporalio_codex.ticket_scheduler import SchedulerInput, validate_scheduler
 
 
 class WholeFlowPhase(StrEnum):
+    INTAKE = "intake"
     PLANNING = "planning"
     TICKETS = "tickets"
     CODEX = "codex"
@@ -20,6 +21,7 @@ class WholeFlowPhase(StrEnum):
     BLOCKED = "blocked"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class WholeFlowStatus(StrEnum):
@@ -28,6 +30,7 @@ class WholeFlowStatus(StrEnum):
     FAILED = "failed"
     NOT_VERIFIED = "not_verified"
     COMPLETED = "completed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,9 @@ class WholeFlowInput:
     codex: tuple[SpecCodexPlan, ...]
     deliveries: tuple[SpecDeliveryPlan, ...]
     summary: SummaryPublicationInput
+    entry_contract_version: str | None = None
+    entry_launch_key: str | None = None
+    entry_input_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +109,13 @@ class WholeFlowSnapshot:
     phase: WholeFlowPhase
     status: WholeFlowStatus
     completed_specs: tuple[str, ...] = ()
+    active_spec: str | None = None
+    active_ticket: str | None = None
+    next_action: str = ""
+    evidence_refs: tuple[str, ...] = ()
+    entry_contract_version: str | None = None
+    entry_launch_key: str | None = None
+    entry_input_identity: str | None = None
     reason: str = ""
 
 
@@ -188,3 +201,18 @@ def validate_whole_flow_input(input: WholeFlowInput) -> tuple[str, ...]:
                     f"ticket {ticket.key} has a blocker in a later or unrelated SPEC"
                 )
     return tuple(dict.fromkeys(errors))
+
+
+def validate_delivery_evidence(result: dict) -> tuple[str, ...]:
+    """Return completion-gate errors for the delivery child result."""
+    if result.get("status") != "completed":
+        return ("delivery child did not report completed",)
+    receipts = result.get("receipts") or ()
+    if not receipts:
+        return ("delivery completed without receipts",)
+    push_receipts = [receipt for receipt in receipts if receipt.get("phase") == "push"]
+    if not push_receipts:
+        return ("delivery completed without push evidence",)
+    if not any(receipt.get("remote_contains_merge") is True for receipt in push_receipts):
+        return ("push evidence does not verify the expected remote merge",)
+    return ()

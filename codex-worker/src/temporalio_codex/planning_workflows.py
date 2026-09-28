@@ -38,6 +38,7 @@ class RequirementPlanningWorkflow:
         self._publication_reason = ""
         self._publication_resolution: SpecPublicationResult | None = None
         self._cancelled = False
+        self._paused = False
 
     @workflow.query(name="get_planning_status")
     def get_status(self) -> PlanningSnapshot:
@@ -76,7 +77,8 @@ class RequirementPlanningWorkflow:
                 self._publication_reason = "invalid initial Grill answer"
                 return self._planning_result()
         await workflow.wait_condition(
-            lambda: self._required_questions_answered() or self._cancelled
+            lambda: (self._required_questions_answered() and not self._paused)
+            or self._cancelled
         )
         if self._cancelled:
             return self._cancelled_result()
@@ -86,7 +88,9 @@ class RequirementPlanningWorkflow:
         if input.confirmation_operation_id:
             self._confirmed = True
             self._confirmation_operation_id = input.confirmation_operation_id
-        await workflow.wait_condition(lambda: self._confirmed or self._cancelled)
+        await workflow.wait_condition(
+            lambda: (self._confirmed and not self._paused) or self._cancelled
+        )
         if self._cancelled:
             return self._cancelled_result()
 
@@ -96,7 +100,7 @@ class RequirementPlanningWorkflow:
             self._publication_requested = True
             self._publication_operation_id = input.publication_operation_id
         await workflow.wait_condition(
-            lambda: self._publication_requested or self._cancelled
+            lambda: (self._publication_requested and not self._paused) or self._cancelled
         )
         if self._cancelled:
             return self._cancelled_result()
@@ -171,6 +175,19 @@ class RequirementPlanningWorkflow:
         if self._phase is not PlanningPhase.GRILLING:
             return False
         return self._record_grill_answer(answer)
+
+    @workflow.signal(name="answer_grill_signal")
+    async def answer_grill_signal(self, answer: GrillAnswer) -> None:
+        self._record_grill_answer(answer)
+
+    @workflow.signal(name="pause_planning")
+    async def pause_planning(self) -> None:
+        if self._status not in (PlanningStatus.COMPLETED, PlanningStatus.CANCELLED):
+            self._paused = True
+
+    @workflow.signal(name="resume_planning")
+    async def resume_planning(self) -> None:
+        self._paused = False
 
     def _record_grill_answer(self, answer: GrillAnswer) -> bool:
         if not answer.answer.strip():

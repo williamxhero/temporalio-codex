@@ -54,7 +54,7 @@ def test_wheel_installs_outside_checkout_and_exposes_cli_entrypoints(tmp_path) -
         + str(install_dir)
         + "'); "
         "entry_points = {entry.name for entry in m.distribution('temporalio-codex-worker').entry_points}; "
-        "assert {'temporalio-codex-run', 'temporalio-codex-worker', 'temporalio-codex-qualify'} <= entry_points"
+        "assert {'temporalio-codex-run', 'temporalio-codex-worker', 'temporalio-codex-qualify', 'temporalio-codex-delivery'} <= entry_points"
     )
     imported = _run([sys.executable, "-c", probe], cwd=tmp_path, env=environment)
     assert imported.returncode == 0, imported.stderr
@@ -63,6 +63,7 @@ def test_wheel_installs_outside_checkout_and_exposes_cli_entrypoints(tmp_path) -
         ("temporalio_codex.client", "main"),
         ("temporalio_codex.worker", "main"),
         ("temporalio_codex.qualification", "main"),
+        ("temporalio_codex.entry", "main"),
     ):
         command = (
             "import sys; "

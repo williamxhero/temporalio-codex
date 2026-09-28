@@ -15,6 +15,13 @@ class CodexOutcome(StrEnum):
     UNKNOWN = "unknown"
 
 
+class CodexFailure(StrEnum):
+    REJECTED = "rejected"
+    TIMEOUT = "timeout"
+    STREAM_DISCONNECTED = "stream_disconnected"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class CodexOperation:
     operation_id: str
@@ -35,6 +42,7 @@ class CodexCapabilities:
     sdk_version: str
     can_interrupt_owned_turn: bool
     can_resume_thread: bool
+    can_interrupt_historical_turn: bool = False
 
 
 @dataclass(frozen=True)
@@ -45,6 +53,7 @@ class CodexObservation:
     thread_id: str | None = None
     turn_id: str | None = None
     summary: str = ""
+    failure: CodexFailure | None = None
     evidence_refs: tuple[str, ...] = ()
     pending_question: str | None = None
     readback_required: bool = False

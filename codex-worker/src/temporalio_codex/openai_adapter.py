@@ -1,9 +1,11 @@
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from temporalio_codex.codex_models import (
     CodexCapabilities,
+    CodexFailure,
     CodexObservation,
     CodexOperation,
     CodexOutcome,
@@ -37,6 +39,8 @@ class OpenAICodexAdapter:
             return existing
 
         codex = None
+        thread_id = operation.thread_id
+        turn_id = None
         capabilities = CodexCapabilities(
             sdk_version=self.sdk_version,
             can_interrupt_owned_turn=True,
@@ -45,6 +49,7 @@ class OpenAICodexAdapter:
         try:
             codex = self.factory()
             thread = await self._get_thread(codex, operation)
+            thread_id = getattr(thread, "id", None) or thread_id
             turn_handle = thread.turn(
                 operation.prompt,
                 approval_mode=self._approval_mode(operation.approval_policy),
@@ -53,22 +58,35 @@ class OpenAICodexAdapter:
                 model=operation.model,
                 sandbox=self._sandbox(operation.allowed_scope),
             )
+            turn_id = getattr(turn_handle, "id", None)
             self._owned_turns[operation.operation_id] = (codex, turn_handle)
             result = await turn_handle.run()
             observation = self._observation_from_result(
                 operation,
                 result,
                 capabilities,
-                thread_id=getattr(thread, "id", None) or operation.thread_id,
+                thread_id=thread_id,
             )
         except Exception as error:
+            failure = self._classify_exception(error)
             observation = CodexObservation(
                 operation_id=operation.operation_id,
                 role=operation.role,
-                outcome=CodexOutcome.UNKNOWN,
-                thread_id=operation.thread_id,
-                summary=f"Codex outcome is unknown: {type(error).__name__}",
-                readback_required=True,
+                outcome=(
+                    CodexOutcome.FAILED
+                    if failure is CodexFailure.REJECTED
+                    else CodexOutcome.UNKNOWN
+                ),
+                thread_id=thread_id,
+                turn_id=turn_id,
+                summary=self._failure_summary(failure),
+                failure=failure,
+                readback_required=failure
+                in (
+                    CodexFailure.TIMEOUT,
+                    CodexFailure.STREAM_DISCONNECTED,
+                    CodexFailure.UNKNOWN,
+                ),
                 capabilities=capabilities,
             )
         finally:
@@ -123,14 +141,42 @@ class OpenAICodexAdapter:
     @staticmethod
     def _observation_from_result(operation, result, capabilities, thread_id):
         status = getattr(result.status, "value", str(result.status))
+        turn_id = getattr(result, "id", None)
         if status == "completed":
             return CodexObservation(
                 operation_id=operation.operation_id,
                 role=operation.role,
                 outcome=CodexOutcome.COMPLETED,
                 thread_id=thread_id,
-                turn_id=result.id,
+                turn_id=turn_id,
                 summary=result.final_response or "",
+                capabilities=capabilities,
+            )
+        if status in {
+            "pending_input",
+            "requires_input",
+            "input_required",
+            "waiting_for_input",
+        }:
+            question = getattr(result, "pending_question", None)
+            return CodexObservation(
+                operation_id=operation.operation_id,
+                role=operation.role,
+                outcome=CodexOutcome.PENDING_INPUT,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                summary="Codex is waiting for business input",
+                pending_question=OpenAICodexAdapter._bounded_question(question),
+                capabilities=capabilities,
+            )
+        if status == "failed":
+            return CodexObservation(
+                operation_id=operation.operation_id,
+                role=operation.role,
+                outcome=CodexOutcome.FAILED,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                summary="Codex turn failed",
                 capabilities=capabilities,
             )
         return CodexObservation(
@@ -138,10 +184,52 @@ class OpenAICodexAdapter:
             role=operation.role,
             outcome=CodexOutcome.FAILED,
             thread_id=thread_id,
-            turn_id=result.id,
-            summary=f"Codex turn ended with status: {status}",
+            turn_id=turn_id,
+            summary="Codex returned an unrecognized turn status",
+            failure=CodexFailure.UNKNOWN,
+            readback_required=True,
             capabilities=capabilities,
         )
+
+    @staticmethod
+    def _classify_exception(error: Exception) -> CodexFailure:
+        error_name = type(error).__name__
+        if error_name in {
+            "InvalidParamsError",
+            "InvalidRequestError",
+            "MethodNotFoundError",
+            "PermissionDeniedError",
+            "RejectedError",
+        }:
+            return CodexFailure.REJECTED
+        if isinstance(error, (asyncio.TimeoutError, TimeoutError)) or error_name in {
+            "TimeoutError",
+            "DeadlineExceededError",
+        }:
+            return CodexFailure.TIMEOUT
+        if isinstance(error, (ConnectionError, EOFError)) or error_name in {
+            "TransportClosedError",
+            "StreamDisconnectedError",
+        }:
+            return CodexFailure.STREAM_DISCONNECTED
+        return CodexFailure.UNKNOWN
+
+    @staticmethod
+    def _failure_summary(failure: CodexFailure) -> str:
+        return {
+            CodexFailure.REJECTED: "Codex request was rejected",
+            CodexFailure.TIMEOUT: "Codex request timed out; readback is required",
+            CodexFailure.STREAM_DISCONNECTED: (
+                "Codex stream disconnected; readback is required"
+            ),
+            CodexFailure.UNKNOWN: "Codex outcome is unknown; readback is required",
+        }[failure]
+
+    @staticmethod
+    def _bounded_question(question: Any) -> str:
+        if not isinstance(question, str) or not question.strip():
+            return "Codex requires additional business input"
+        return question.strip()[:1000]
 
     @staticmethod
     async def _close(codex: AsyncCodex) -> None:

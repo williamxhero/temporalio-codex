@@ -1,9 +1,15 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from temporalio_codex.codex_models import CodexOperation, CodexRole, CodexOutcome
+from temporalio_codex.codex_models import (
+    CodexFailure,
+    CodexOperation,
+    CodexRole,
+    CodexOutcome,
+)
 from temporalio_codex.openai_adapter import OpenAICodexAdapter
 
 
@@ -23,7 +29,7 @@ def operation() -> CodexOperation:
 
 
 def adapter_for(result):
-    turn = SimpleNamespace(run=AsyncMock(return_value=result))
+    turn = SimpleNamespace(id="turn-1", run=AsyncMock(return_value=result))
     thread = MagicMock(id="thread-1")
     thread.turn.return_value = turn
     codex = SimpleNamespace(
@@ -54,7 +60,9 @@ async def test_production_adapter_maps_completed_turn_without_live_call() -> Non
 
 
 async def test_unknown_sdk_error_requires_readback_and_is_cached() -> None:
-    turn = SimpleNamespace(run=AsyncMock(side_effect=RuntimeError("disconnect")))
+    turn = SimpleNamespace(
+        id="turn-1", run=AsyncMock(side_effect=RuntimeError("disconnect"))
+    )
     thread = MagicMock(id="thread-1")
     thread.turn.return_value = turn
     codex = SimpleNamespace(
@@ -67,9 +75,64 @@ async def test_unknown_sdk_error_requires_readback_and_is_cached() -> None:
     second = await adapter.execute(operation())
 
     assert first.outcome is CodexOutcome.UNKNOWN
+    assert first.failure is CodexFailure.UNKNOWN
+    assert first.thread_id == "thread-1"
+    assert first.turn_id == "turn-1"
     assert first.readback_required is True
     assert second == first
     assert codex.thread_start.await_count == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "failure"),
+    [
+        (RuntimeError("secret-provider-detail"), CodexFailure.UNKNOWN),
+        (asyncio.TimeoutError(), CodexFailure.TIMEOUT),
+        (ConnectionError("private provider detail"), CodexFailure.STREAM_DISCONNECTED),
+    ],
+)
+async def test_sdk_failures_have_stable_bounded_classifications(error, failure) -> None:
+    turn = SimpleNamespace(id="turn-1", run=AsyncMock(side_effect=error))
+    thread = MagicMock(id="thread-1")
+    thread.turn.return_value = turn
+    codex = SimpleNamespace(thread_start=AsyncMock(return_value=thread), close=AsyncMock())
+    adapter = OpenAICodexAdapter(lambda: codex, "0.155.1")
+
+    observation = await adapter.execute(operation())
+
+    assert observation.failure is failure
+    assert "secret-provider-detail" not in observation.summary
+    assert "private provider detail" not in observation.summary
+    assert len(observation.summary) <= 1000
+
+
+async def test_rejected_call_is_failed_without_readback() -> None:
+    rejected = type("InvalidRequestError", (Exception,), {})()
+    codex = SimpleNamespace(
+        thread_start=AsyncMock(side_effect=rejected), close=AsyncMock()
+    )
+    adapter = OpenAICodexAdapter(lambda: codex, "0.155.1")
+
+    observation = await adapter.execute(operation())
+
+    assert observation.outcome is CodexOutcome.FAILED
+    assert observation.failure is CodexFailure.REJECTED
+    assert observation.readback_required is False
+
+
+async def test_pending_input_is_bounded_and_typed() -> None:
+    result = SimpleNamespace(
+        id="turn-1",
+        status=SimpleNamespace(value="requires_input"),
+        pending_question="  Which repository scope should be changed?  ",
+    )
+    adapter, _, _ = adapter_for(result)
+
+    observation = await adapter.execute(operation())
+
+    assert observation.outcome is CodexOutcome.PENDING_INPUT
+    assert observation.pending_question == "Which repository scope should be changed?"
+    assert observation.readback_required is False
 
 
 async def test_historical_interrupt_is_explicitly_unsupported() -> None:

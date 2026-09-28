@@ -3,7 +3,7 @@ from temporalio.worker import Worker
 
 from temporalio_codex.activities import foundation_stage
 from temporalio_codex.client import execute_run
-from temporalio_codex.models import StageOutcome
+from temporalio_codex.models import RunStatus, StageOutcome
 from temporalio_codex.workflows import CodexRunWorkflow
 
 
@@ -22,4 +22,5 @@ async def test_local_temporal_server_smoke() -> None:
                 task_queue="local-smoke",
             )
 
-    assert result.status is StageOutcome.COMPLETED
+    assert result.status is RunStatus.COMPLETED
+    assert result.outcome is StageOutcome.COMPLETED

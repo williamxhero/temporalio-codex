@@ -108,3 +108,16 @@ def test_failed_case_wins_over_not_verified_evidence() -> None:
     result = qualify_release(report(*statuses), failed_matrix)
 
     assert result.status is EvidenceStatus.FAIL
+
+
+def test_strict_release_gate_rejects_missing_exact_candidate_binding() -> None:
+    result = qualify_release(
+        report(*([EvidenceStatus.PASS] * len(tuple(EvidenceKind)))),
+        matrix(),
+        expected_candidate_sha="a" * 40,
+        expected_artifact_ref="wheel:candidate",
+        strict=True,
+    )
+
+    assert result.status is EvidenceStatus.BLOCKED
+    assert any("candidate_sha" in reason for reason in result.reasons)

@@ -5,7 +5,6 @@ from temporalio_codex.release_evidence import (
     ReleaseReport,
 )
 
-
 REQUIRED_ACCEPTANCE_CASES = (
     "normal_run",
     "worker_restart",
@@ -62,8 +61,16 @@ class QualificationResult:
 def qualify_release(
     report: ReleaseReport,
     matrix: AcceptanceMatrix,
+    *,
+    expected_candidate_sha: str | None = None,
+    expected_artifact_ref: str | None = None,
+    strict: bool = False,
 ) -> QualificationResult:
-    report_errors = report.validation_errors()
+    report_errors = report.validation_errors(
+        expected_candidate_sha=expected_candidate_sha,
+        expected_artifact_ref=expected_artifact_ref,
+        strict=strict,
+    )
     matrix_errors = matrix.validation_errors()
     if report_errors or matrix_errors:
         return QualificationResult(
@@ -71,7 +78,11 @@ def qualify_release(
             reasons=(*report_errors, *matrix_errors),
         )
 
-    report_status = report.qualification_status()
+    report_status = report.qualification_status(
+        expected_candidate_sha=expected_candidate_sha,
+        expected_artifact_ref=expected_artifact_ref,
+        strict=strict,
+    )
     statuses = {case.status for case in matrix.cases}
     if EvidenceStatus.FAIL in statuses or report_status is EvidenceStatus.FAIL:
         return QualificationResult(

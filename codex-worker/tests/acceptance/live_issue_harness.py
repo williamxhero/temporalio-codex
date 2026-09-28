@@ -128,6 +128,8 @@ def _require_gh() -> None:
             capture_output=True,
             check=False,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except OSError as error:
         raise LiveHarnessUnavailable("gh CLI is unavailable") from error
@@ -177,7 +179,14 @@ def _gh_close(repository: str, number: int) -> None:
 
 
 def _run(command: list[str]) -> str:
-    result = subprocess.run(command, capture_output=True, check=False, text=True)
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "GitHub command failed")
     return result.stdout.strip()

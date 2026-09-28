@@ -146,3 +146,59 @@ async def test_delivery_workflow_replays_completed_history() -> None:
         await Replayer(workflows=[DeliveryWorkflow]).replay_workflow(history)
     finally:
         configure_delivery_adapters(None, None)
+
+
+class RetryCleanupAdapter(FakeDeliveryAdapter):
+    def __init__(self):
+        super().__init__()
+        self.cleanup_attempts = 0
+
+    async def execute(self, operation):
+        if operation.phase is DeliveryPhase.CLEANUP:
+            self.cleanup_attempts += 1
+            if self.cleanup_attempts == 1:
+                return DeliveryReceipt(
+                    operation_id=operation.operation_id,
+                    phase=operation.phase,
+                    outcome=DeliveryOutcome.FAILED,
+                    summary="cleanup temporarily unavailable",
+                    candidate_sha=operation.candidate_sha,
+                    pull_request_number=operation.pull_request_number,
+                )
+        return await super().execute(operation)
+
+
+async def test_cleanup_pending_retries_cleanup_without_rerunning_merge() -> None:
+    github = RetryCleanupAdapter()
+    configure_delivery_adapters(FakeDeliveryAdapter(), github)
+    try:
+        async with await WorkflowEnvironment.start_time_skipping() as environment:
+            async with Worker(
+                environment.client,
+                task_queue="cleanup-retry",
+                workflows=[DeliveryWorkflow],
+                activities=[delivery_git_stage, delivery_github_stage],
+            ):
+                handle = await environment.client.start_workflow(
+                    DeliveryWorkflow.run,
+                    delivery_input(),
+                    id="cleanup-retry",
+                    task_queue="cleanup-retry",
+                )
+                for _ in range(100):
+                    snapshot = await handle.query(DeliveryWorkflow.get_status)
+                    if snapshot.status is DeliveryStatus.CLEANUP_PENDING:
+                        break
+                    await asyncio.sleep(0.01)
+                assert snapshot.status is DeliveryStatus.CLEANUP_PENDING
+                assert await handle.execute_update(
+                    DeliveryWorkflow.retry_cleanup,
+                    result_type=bool,
+                )
+                result = await handle.result()
+        assert result.status is DeliveryStatus.COMPLETED
+        assert github.cleanup_attempts == 2
+        phases = [receipt.phase for receipt in result.receipts]
+        assert phases.count(DeliveryPhase.MERGE) == 1
+    finally:
+        configure_delivery_adapters(None, None)

@@ -23,6 +23,7 @@ class DeliveryOutcome(StrEnum):
 class DeliveryStatus(StrEnum):
     ACTIVE = "active"
     WAITING_FOR_READBACK = "waiting_for_readback"
+    CLEANUP_PENDING = "cleanup_pending"
     COMPLETED = "completed"
     FAILED = "failed"
 

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "temporalio-codex-worker"
+version = "0.1.0"
+description = "External Temporal Worker for durable Codex delivery"
+requires-python = ">=3.11"
+dependencies = [
+    "temporalio>=1.15,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<2",
+]
+
+[project.scripts]
+temporalio-codex-run = "temporalio_codex.client:main"
+temporalio-codex-worker = "temporalio_codex.worker:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

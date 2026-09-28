@@ -5,7 +5,7 @@ from temporalio.worker import Worker
 
 from temporalio_codex.activities import foundation_stage
 from temporalio_codex.client import execute_run
-from temporalio_codex.models import RunInput, StageOutcome
+from temporalio_codex.models import RunInput, RunStatus, StageOutcome
 from temporalio_codex.workflows import CodexRunWorkflow
 
 
@@ -24,7 +24,8 @@ async def test_foundation_workflow_uses_public_input_and_result_seams() -> None:
                 task_queue="foundation-test",
             )
 
-    assert result.status is StageOutcome.COMPLETED
+    assert result.status is RunStatus.COMPLETED
+    assert result.outcome is StageOutcome.COMPLETED
     assert result.workflow_id == "foundation-test-run"
     assert result.stage == "foundation"
     assert result.summary == "Accepted requirement: build a durable Codex flow"
@@ -51,3 +52,26 @@ async def test_client_rejects_duplicate_workflow_id() -> None:
                     workflow_id="stable-run",
                     task_queue="identity-test",
                 )
+
+
+async def test_status_query_returns_public_run_snapshot() -> None:
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="query-test",
+            workflows=[CodexRunWorkflow],
+            activities=[foundation_stage],
+        ):
+            handle = await environment.client.start_workflow(
+                CodexRunWorkflow.run,
+                RunInput(requirement="query the run status"),
+                id="query-test-run",
+                task_queue="query-test",
+            )
+            result = await handle.result()
+            snapshot = await handle.query(CodexRunWorkflow.get_status)
+
+    assert result.status is RunStatus.COMPLETED
+    assert snapshot.workflow_id == "query-test-run"
+    assert snapshot.status is RunStatus.COMPLETED
+    assert snapshot.completed_stages == ("foundation",)

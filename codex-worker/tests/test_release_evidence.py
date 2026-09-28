@@ -88,3 +88,16 @@ def test_validation_rejects_missing_kinds_and_fake_live_label() -> None:
         )
     with pytest.raises(ValueError, match="live origin"):
         complete_report(fake_live).validate((EvidenceKind.LIVE_GITHUB,))
+
+
+def test_validation_rejects_duplicate_evidence_and_missing_metadata() -> None:
+    duplicate = complete_report(
+        evidence(EvidenceKind.DETERMINISTIC),
+        evidence(EvidenceKind.DETERMINISTIC),
+    )
+    missing_metadata = evidence(EvidenceKind.DETERMINISTIC, build_id=None)
+
+    with pytest.raises(ValueError, match="duplicate evidence kind"):
+        duplicate.validate((EvidenceKind.DETERMINISTIC,))
+    with pytest.raises(ValueError, match="build_id"):
+        complete_report(missing_metadata).validate((EvidenceKind.DETERMINISTIC,))

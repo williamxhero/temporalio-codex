@@ -59,7 +59,7 @@ class ReleaseEvidence:
                 ("operating_system", self.operating_system),
                 ("command", self.command),
             )
-            if not value.strip()
+            if not value or not value.strip()
         ]
         if self.kind in LIVE_KINDS:
             if self.origin is not EvidenceOrigin.LIVE:
@@ -94,6 +94,14 @@ class ReleaseReport:
         if not self.build_id.strip():
             errors.append("report build_id is required")
         present = {item.kind for item in self.evidence}
+        counts: dict[EvidenceKind, int] = {}
+        for item in self.evidence:
+            counts[item.kind] = counts.get(item.kind, 0) + 1
+        errors.extend(
+            f"duplicate evidence kind: {kind.value}"
+            for kind, count in counts.items()
+            if count > 1
+        )
         errors.extend(
             f"missing required evidence: {kind.value}"
             for kind in required_kinds

@@ -39,7 +39,6 @@ def test_wheel_installs_outside_checkout_and_exposes_cli_entrypoints(tmp_path) -
             "install",
             "--target",
             str(install_dir),
-            "--no-deps",
             str(wheels[0]),
         ],
         cwd=tmp_path,

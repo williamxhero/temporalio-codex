@@ -10,3 +10,7 @@ with `uv run temporalio-codex-worker`. Submit a run from another terminal with
 
 The client derives a stable Workflow ID from the requirement when
 `--workflow-id` is omitted. Reusing a completed ID is rejected explicitly.
+
+The Worker package is independent from the Go Server module. From the
+repository root, run `go test ./...` for the Server check and then run the
+Worker checks from this directory.

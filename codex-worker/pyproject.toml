@@ -16,6 +16,9 @@ dev = [
     "pytest>=8,<9",
     "pytest-asyncio>=0.24,<2",
 ]
+codex = [
+    "openai-codex==0.155.1",
+]
 
 [project.scripts]
 temporalio-codex-run = "temporalio_codex.client:main"

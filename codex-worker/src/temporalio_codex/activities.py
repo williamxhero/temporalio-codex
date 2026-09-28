@@ -1,3 +1,6 @@
+import asyncio
+from contextlib import suppress
+
 from temporalio import activity
 
 from temporalio_codex.codex_adapter import CodexAdapter
@@ -8,7 +11,12 @@ from temporalio_codex.codex_models import (
     CodexOperation,
     CodexOutcome,
 )
-from temporalio_codex.models import StageInput, StageOutcome, StageResult
+from temporalio_codex.models import (
+    HeartbeatInput,
+    StageInput,
+    StageOutcome,
+    StageResult,
+)
 from temporalio_codex.delivery_adapter import DeliveryAdapter
 from temporalio_codex.delivery_models import (
     DeliveryOperation,
@@ -49,6 +57,22 @@ async def foundation_stage(input: StageInput) -> StageResult:
     )
 
 
+@activity.defn(name="heartbeat-stage")
+async def heartbeat_stage(input: HeartbeatInput) -> StageResult:
+    activity.heartbeat(
+        {
+            "operation_id": input.operation_id,
+            "stage": input.stage,
+            "progress": input.progress,
+        }
+    )
+    return StageResult(
+        stage=input.stage,
+        outcome=StageOutcome.COMPLETED,
+        summary="heartbeat recorded",
+    )
+
+
 @activity.defn(name="codex-stage")
 async def codex_stage(operation: CodexOperation) -> CodexObservation:
     if _codex_adapter is None:
@@ -66,7 +90,25 @@ async def codex_stage(operation: CodexOperation) -> CodexObservation:
                 can_resume_thread=operation.thread_id is not None,
             ),
         )
-    return await _codex_adapter.execute(operation)
+
+    async def heartbeat_while_running() -> None:
+        while True:
+            activity.heartbeat(
+                {
+                    "operation_id": operation.operation_id,
+                    "stage": operation.stage,
+                    "progress": "codex operation running",
+                }
+            )
+            await asyncio.sleep(10)
+
+    heartbeat_task = asyncio.create_task(heartbeat_while_running())
+    try:
+        return await _codex_adapter.execute(operation)
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
 
 
 @activity.defn(name="delivery-git-stage")

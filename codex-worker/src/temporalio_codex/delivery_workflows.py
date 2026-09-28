@@ -23,6 +23,7 @@ class DeliveryWorkflow:
         self._phase: DeliveryPhase | None = None
         self._receipts: list[DeliveryReceipt] = []
         self._readback: DeliveryReceipt | None = None
+        self._cleanup_retry_requested = False
 
     @workflow.query(name="get_delivery_status")
     def get_status(self) -> DeliverySnapshot:
@@ -113,18 +114,16 @@ class DeliveryWorkflow:
         if not await self._accept(merge):
             return self._failed()
 
-        cleanup = await self._github(
-            DeliveryOperation(
-                operation_id=f"{workflow.info().workflow_id}:cleanup",
-                run_id=workflow.info().workflow_id,
-                phase=DeliveryPhase.CLEANUP,
-                repository=input.repository,
-                candidate_sha=candidate_sha,
-                pull_request_number=pull_request.pull_request_number,
-                issue_numbers=input.issue_numbers,
-            )
+        cleanup_operation = DeliveryOperation(
+            operation_id=f"{workflow.info().workflow_id}:cleanup",
+            run_id=workflow.info().workflow_id,
+            phase=DeliveryPhase.CLEANUP,
+            repository=input.repository,
+            candidate_sha=candidate_sha,
+            pull_request_number=pull_request.pull_request_number,
+            issue_numbers=input.issue_numbers,
         )
-        if not await self._accept(cleanup):
+        if not await self._finish_cleanup(cleanup_operation):
             return self._failed()
         self._status = DeliveryStatus.COMPLETED
         self._phase = None
@@ -150,6 +149,50 @@ class DeliveryWorkflow:
             delivery_github_stage,
             operation,
             start_to_close_timeout=timedelta(seconds=30),
+        )
+
+    async def _finish_cleanup(self, operation: DeliveryOperation) -> bool:
+        while True:
+            cleanup = await self._github(operation)
+            self._receipts.append(cleanup)
+            if cleanup.outcome is DeliveryOutcome.COMPLETED:
+                return True
+            self._status = DeliveryStatus.CLEANUP_PENDING
+            await workflow.wait_condition(
+                lambda: self._cleanup_retry_requested
+                or self._readback is not None
+                or self._status is DeliveryStatus.FAILED
+            )
+            if self._status is DeliveryStatus.FAILED:
+                return False
+            readback = self._readback
+            self._readback = None
+            if readback is not None:
+                if not self._matches_readback(cleanup, readback):
+                    self._status = DeliveryStatus.FAILED
+                    return False
+                self._receipts[-1] = readback
+                return True
+            self._cleanup_retry_requested = False
+            self._status = DeliveryStatus.ACTIVE
+
+    @staticmethod
+    def _matches_readback(
+        receipt: DeliveryReceipt,
+        readback: DeliveryReceipt,
+    ) -> bool:
+        return (
+            readback.operation_id == receipt.operation_id
+            and readback.phase is receipt.phase
+            and readback.outcome is DeliveryOutcome.COMPLETED
+            and (
+                receipt.candidate_sha is None
+                or readback.candidate_sha == receipt.candidate_sha
+            )
+            and (
+                receipt.pull_request_number is None
+                or readback.pull_request_number == receipt.pull_request_number
+            )
         )
 
     async def _accept(self, receipt: DeliveryReceipt) -> bool:
@@ -206,7 +249,17 @@ class DeliveryWorkflow:
 
     @workflow.update(name="resolve_delivery_readback")
     async def resolve_delivery_readback(self, receipt: DeliveryReceipt) -> bool:
-        if self._status is not DeliveryStatus.WAITING_FOR_READBACK:
+        if self._status not in (
+            DeliveryStatus.WAITING_FOR_READBACK,
+            DeliveryStatus.CLEANUP_PENDING,
+        ):
             return False
         self._readback = receipt
+        return True
+
+    @workflow.update(name="retry_cleanup")
+    async def retry_cleanup(self) -> bool:
+        if self._status is not DeliveryStatus.CLEANUP_PENDING:
+            return False
+        self._cleanup_retry_requested = True
         return True

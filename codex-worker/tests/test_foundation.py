@@ -1,4 +1,6 @@
 import asyncio
+from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 from temporalio import activity
@@ -6,13 +8,14 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
-from temporalio_codex.activities import foundation_stage
+from temporalio_codex.activities import foundation_stage, heartbeat_stage
 from temporalio_codex.client import execute_run
 from temporalio_codex.models import (
     RunInput,
     RunStatus,
     StageDefinition,
     StageOutcome,
+    HeartbeatInput,
 )
 from temporalio_codex.workflows import CodexRunWorkflow
 
@@ -184,6 +187,85 @@ async def test_cancel_stops_later_stages() -> None:
     assert result.stage == "first"
 
 
+async def test_pause_before_next_stage_prevents_scheduling_until_resume() -> None:
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="pause-test",
+            workflows=[CodexRunWorkflow],
+            activities=[foundation_stage],
+        ):
+            handle = await environment.client.start_workflow(
+                CodexRunWorkflow.run,
+                RunInput(
+                    requirement="pause between stages",
+                    stages=(
+                        StageDefinition(key="first"),
+                        StageDefinition(key="second", requires_input=True),
+                    ),
+                ),
+                id="pause-test-run",
+                task_queue="pause-test",
+            )
+            for _ in range(100):
+                snapshot = await handle.query(CodexRunWorkflow.get_status)
+                if snapshot.completed_stages == ("first",):
+                    break
+                await asyncio.sleep(0.01)
+            assert snapshot.completed_stages == ("first",)
+            assert await handle.execute_update(CodexRunWorkflow.pause, result_type=bool)
+            paused = await handle.query(CodexRunWorkflow.get_status)
+            assert paused.status is RunStatus.PAUSED
+            await asyncio.sleep(0.05)
+            assert (await handle.query(CodexRunWorkflow.get_status)).completed_stages == (
+                "first",
+            )
+            assert await handle.execute_update(CodexRunWorkflow.resume, result_type=bool)
+            waiting = await wait_for_status(handle, RunStatus.WAITING_FOR_INPUT)
+            assert waiting.completed_stages == ("first",)
+            assert await handle.execute_update(
+                CodexRunWorkflow.submit_answer,
+                "continue",
+                result_type=bool,
+            )
+            result = await handle.result()
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.stage == "second"
+
+
+async def test_pause_resume_while_waiting_for_input_preserves_wait() -> None:
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="pause-input-test",
+            workflows=[CodexRunWorkflow],
+            activities=[foundation_stage],
+        ):
+            handle = await environment.client.start_workflow(
+                CodexRunWorkflow.run,
+                RunInput(
+                    requirement="pause while waiting",
+                    stages=(StageDefinition(key="question", requires_input=True),),
+                ),
+                id="pause-input-run",
+                task_queue="pause-input-test",
+            )
+            snapshot = await wait_for_status(handle, RunStatus.WAITING_FOR_INPUT)
+            assert await handle.execute_update(CodexRunWorkflow.pause, result_type=bool)
+            assert (await handle.query(CodexRunWorkflow.get_status)).status is RunStatus.PAUSED
+            assert await handle.execute_update(CodexRunWorkflow.resume, result_type=bool)
+            assert (await handle.query(CodexRunWorkflow.get_status)).status is RunStatus.WAITING_FOR_INPUT
+            assert await handle.execute_update(
+                CodexRunWorkflow.submit_answer,
+                "continue",
+                result_type=bool,
+            )
+            result = await handle.result()
+
+    assert result.status is RunStatus.COMPLETED
+
+
 async def test_retry_policy_classifies_failed_activity() -> None:
     async with await WorkflowEnvironment.start_time_skipping() as environment:
         async with Worker(
@@ -276,6 +358,73 @@ async def test_activity_timeout_becomes_unknown_observation() -> None:
 
     assert result.status is RunStatus.FAILED
     assert result.outcome is StageOutcome.UNKNOWN
+
+
+async def test_heartbeat_activity_records_bounded_progress() -> None:
+    with patch("temporalio.activity.heartbeat") as heartbeat:
+        result = await heartbeat_stage(
+            HeartbeatInput(
+                operation_id="heartbeat-1",
+                stage="long-external-call",
+                progress="chunk-1",
+            )
+        )
+
+    assert result.outcome is StageOutcome.COMPLETED
+    heartbeat.assert_called_once_with(
+        {
+            "operation_id": "heartbeat-1",
+            "stage": "long-external-call",
+            "progress": "chunk-1",
+        }
+    )
+    with pytest.raises(ValueError):
+        HeartbeatInput("heartbeat-2", "stage", "x" * 501)
+
+
+async def test_unknown_outcome_can_wake_on_durable_recheck_timer() -> None:
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="recheck-timer-test",
+            workflows=[CodexRunWorkflow],
+            activities=[unknown_stage],
+        ):
+            handle = await environment.client.start_workflow(
+                CodexRunWorkflow.run,
+                RunInput(
+                    requirement="wake for external recheck",
+                    stages=(
+                        StageDefinition(
+                            key="unknown",
+                            external_recheck_seconds=0.01,
+                        ),
+                    ),
+                ),
+                id="recheck-timer-run",
+                task_queue="recheck-timer-test",
+            )
+            await wait_for_status(handle, RunStatus.WAITING_FOR_EXTERNAL_OBSERVATION)
+            assert await handle.execute_update(
+                CodexRunWorkflow.resolve_external_observation,
+                False,
+                result_type=bool,
+            )
+            for _ in range(100):
+                snapshot = await handle.query(CodexRunWorkflow.get_status)
+                if snapshot.external_recheck_count == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert snapshot.external_recheck_count == 1
+            assert snapshot.status is RunStatus.WAITING_FOR_EXTERNAL_OBSERVATION
+            assert await handle.execute_update(
+                CodexRunWorkflow.resolve_external_observation,
+                True,
+                result_type=bool,
+            )
+            result = await handle.result()
+
+    assert result.status is RunStatus.COMPLETED
 
 
 async def test_workflow_history_replays() -> None:

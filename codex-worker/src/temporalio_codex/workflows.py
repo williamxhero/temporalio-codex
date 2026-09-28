@@ -34,6 +34,8 @@ class CodexRunWorkflow:
         self._answer: str | None = None
         self._external_resolution: bool | None = None
         self._stage_results: list[StageResult] = []
+        self._paused_from: RunStatus | None = None
+        self._external_recheck_count = 0
 
     @workflow.query(name="get_status")
     def get_status(self) -> RunSnapshot:
@@ -44,6 +46,7 @@ class CodexRunWorkflow:
             completed_stages=tuple(self._completed_stages),
             pending_input=self._pending_input,
             stage_results=tuple(self._stage_results),
+            external_recheck_count=self._external_recheck_count,
         )
 
     @workflow.run
@@ -60,6 +63,9 @@ class CodexRunWorkflow:
 
         stage_result: StageResult | None = None
         for stage in input.stages:
+            if self._status is RunStatus.CANCELLED:
+                return self._cancelled_result()
+            await self._wait_if_paused()
             if self._status is RunStatus.CANCELLED:
                 return self._cancelled_result()
 
@@ -91,6 +97,7 @@ class CodexRunWorkflow:
                         start_to_close_timeout=timedelta(
                             seconds=stage.start_to_close_timeout_seconds
                         ),
+                        heartbeat_timeout=timedelta(seconds=30),
                         retry_policy=RetryPolicy(
                             initial_interval=timedelta(milliseconds=10),
                             maximum_interval=timedelta(milliseconds=50),
@@ -142,14 +149,45 @@ class CodexRunWorkflow:
                         self._external_resolution = None
                         self._status = RunStatus.ACTIVE
                     else:
-                        self._status = RunStatus.FAILED
-                        return RunResult(
-                            workflow_id=workflow.info().workflow_id,
-                            status=self._status,
-                            outcome=stage_result.outcome,
-                            stage=stage_result.stage,
-                            summary=stage_result.summary,
+                        if stage.external_recheck_seconds <= 0:
+                            self._status = RunStatus.FAILED
+                            return RunResult(
+                                workflow_id=workflow.info().workflow_id,
+                                status=self._status,
+                                outcome=stage_result.outcome,
+                                stage=stage_result.stage,
+                                summary=stage_result.summary,
+                            )
+                        await workflow.sleep(
+                            timedelta(seconds=stage.external_recheck_seconds)
                         )
+                        self._external_recheck_count += 1
+                        self._external_resolution = None
+                        self._status = RunStatus.WAITING_FOR_EXTERNAL_OBSERVATION
+                        await workflow.wait_condition(
+                            lambda: self._external_resolution is not None
+                            or self._status is RunStatus.CANCELLED
+                        )
+                        if self._status is RunStatus.CANCELLED:
+                            return self._cancelled_result()
+                        if self._external_resolution:
+                            stage_result = replace(
+                                stage_result,
+                                outcome=StageOutcome.COMPLETED,
+                                summary="External outcome confirmed by readback",
+                            )
+                            self._stage_results[-1] = stage_result
+                            self._external_resolution = None
+                            self._status = RunStatus.ACTIVE
+                        else:
+                            self._status = RunStatus.FAILED
+                            return RunResult(
+                                workflow_id=workflow.info().workflow_id,
+                                status=self._status,
+                                outcome=stage_result.outcome,
+                                stage=stage_result.stage,
+                                summary=stage_result.summary,
+                            )
                 else:
                     self._status = RunStatus.FAILED
                     return RunResult(
@@ -202,6 +240,7 @@ class CodexRunWorkflow:
                 start_to_close_timeout=timedelta(
                     seconds=stage.start_to_close_timeout_seconds
                 ),
+                heartbeat_timeout=timedelta(seconds=30),
                 retry_policy=RetryPolicy(
                     initial_interval=timedelta(milliseconds=10),
                     maximum_interval=timedelta(milliseconds=50),
@@ -281,6 +320,35 @@ class CodexRunWorkflow:
     async def cancel(self) -> None:
         if self._status not in (RunStatus.COMPLETED, RunStatus.FAILED):
             self._status = RunStatus.CANCELLED
+
+    async def _wait_if_paused(self) -> None:
+        if self._status is not RunStatus.PAUSED:
+            return
+        await workflow.wait_condition(
+            lambda: self._status is not RunStatus.PAUSED
+            or self._status is RunStatus.CANCELLED
+        )
+
+    @workflow.update(name="pause")
+    async def pause(self) -> bool:
+        if self._status in (
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.PAUSED,
+        ):
+            return False
+        self._paused_from = self._status
+        self._status = RunStatus.PAUSED
+        return True
+
+    @workflow.update(name="resume")
+    async def resume(self) -> bool:
+        if self._status is not RunStatus.PAUSED:
+            return False
+        self._status = self._paused_from or RunStatus.ACTIVE
+        self._paused_from = None
+        return True
 
     @workflow.update(name="submit_answer")
     async def submit_answer(self, answer: str) -> bool:

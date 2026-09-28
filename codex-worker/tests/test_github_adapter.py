@@ -19,6 +19,18 @@ class UnavailableGateway(FakeGitHubGateway):
         raise ConnectionError("create response lost")
 
 
+class RetryCleanupGateway(FakeGitHubGateway):
+    def __init__(self):
+        super().__init__()
+        self.close_attempts = 0
+
+    async def close_issue(self, issue_number):
+        self.close_attempts += 1
+        if self.close_attempts == 1:
+            raise ConnectionError("cleanup response lost")
+        await super().close_issue(issue_number)
+
+
 def operation(phase=DeliveryPhase.PULL_REQUEST, **overrides):
     values = dict(
         operation_id="pr-1",
@@ -121,3 +133,22 @@ async def test_merge_rejects_external_head_edit() -> None:
 
     assert receipt.outcome is DeliveryOutcome.FAILED
     assert "head SHA" in receipt.summary
+
+
+async def test_cleanup_unknown_can_retry_same_operation_id() -> None:
+    gateway = RetryCleanupGateway()
+    adapter = GitHubDeliveryAdapter(gateway)
+    cleanup = operation(
+        DeliveryPhase.CLEANUP,
+        operation_id="cleanup-retry",
+        issue_numbers=(23,),
+        pull_request_number=1,
+    )
+
+    first = await adapter.execute(cleanup)
+    second = await adapter.execute(cleanup)
+
+    assert first.outcome is DeliveryOutcome.UNKNOWN
+    assert first.readback_required is True
+    assert second.outcome is DeliveryOutcome.COMPLETED
+    assert gateway.close_attempts == 2

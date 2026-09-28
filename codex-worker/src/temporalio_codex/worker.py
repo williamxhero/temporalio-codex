@@ -12,6 +12,7 @@ from temporalio_codex.activities import (
     delivery_git_stage,
     delivery_github_stage,
     foundation_stage,
+    heartbeat_stage,
 )
 from temporalio_codex.github_adapter import GhCliGateway, GitHubDeliveryAdapter
 from temporalio_codex.git_adapter import LocalGitAdapter
@@ -38,6 +39,7 @@ async def run_worker(
         workflows=[CodexRunWorkflow, DeliveryWorkflow],
         activities=[
             foundation_stage,
+            heartbeat_stage,
             codex_stage,
             delivery_git_stage,
             delivery_github_stage,

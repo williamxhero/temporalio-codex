@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -41,6 +43,9 @@ class PlanningInput:
     sensitive: bool = False
     umbrella_issue_number: int = 1
     specs: tuple[SpecDraft, ...] = ()
+    grill_answers: tuple[GrillAnswer, ...] = ()
+    confirmation_operation_id: str | None = None
+    publication_operation_id: str | None = None
 
     def __post_init__(self) -> None:
         has_text = bool(self.source_text and self.source_text.strip())

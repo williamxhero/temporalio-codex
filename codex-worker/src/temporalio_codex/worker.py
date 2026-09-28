@@ -27,10 +27,17 @@ from temporalio_codex.settings import DEFAULT_TARGET_HOST, DEFAULT_TASK_QUEUE
 from temporalio_codex.workflows import CodexRunWorkflow
 from temporalio_codex.delivery_workflows import DeliveryWorkflow
 from temporalio_codex.planning_activities import prepare_grill
-from temporalio_codex.planning_activities import configure_spec_issue_gateway, publish_spec_issues
+from temporalio_codex.planning_activities import (
+    configure_spec_issue_gateway,
+    configure_ticket_issue_gateway,
+    publish_spec_issues,
+    publish_ticket_issues,
+)
 from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
 from temporalio_codex.spec_issue_adapter import GhCliSpecIssueGateway
+from temporalio_codex.ticket_issue_adapter import GhCliTicketIssueGateway
 from temporalio_codex.ticket_workflows import TicketSchedulerWorkflow
+from temporalio_codex.whole_flow_workflows import RequirementDeliveryWorkflow
 
 
 async def run_worker(
@@ -44,6 +51,7 @@ async def run_worker(
         GitHubDeliveryAdapter(GhCliGateway(_repository_name())),
     )
     configure_spec_issue_gateway(GhCliSpecIssueGateway(_repository_name()))
+    configure_ticket_issue_gateway(GhCliTicketIssueGateway(_repository_name()))
     configure_summary_gateway(GhCliSummaryCommentGateway(_repository_name()))
     client = await Client.connect(target_host)
     async with Worker(
@@ -55,6 +63,7 @@ async def run_worker(
             RequirementPlanningWorkflow,
             TicketSchedulerWorkflow,
             DeliverySummaryWorkflow,
+            RequirementDeliveryWorkflow,
         ],
         activities=[
             foundation_stage,
@@ -64,6 +73,7 @@ async def run_worker(
             delivery_github_stage,
             prepare_grill,
             publish_spec_issues,
+            publish_ticket_issues,
             publish_delivery_summary,
         ],
     ):

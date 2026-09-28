@@ -9,6 +9,7 @@ class DeliveryPhase(StrEnum):
     CI = "ci"
     PULL_REQUEST = "pull_request"
     MERGE = "merge"
+    PUSH = "push"
     CLEANUP = "cleanup"
 
 
@@ -42,6 +43,7 @@ class DeliveryOperation:
     acceptance_command: tuple[str, ...] = ()
     base_sha: str | None = None
     candidate_sha: str | None = None
+    merge_commit_sha: str | None = None
     acceptance_version: str | None = None
     pull_request_identity: str | None = None
     pull_request_number: int | None = None
@@ -58,6 +60,8 @@ class DeliveryReceipt:
     acceptance_version: str | None = None
     pull_request_number: int | None = None
     merged_sha: str | None = None
+    remote_sha: str | None = None
+    remote_contains_merge: bool | None = None
     external_id: str | None = None
     external_state: str | None = None
     readback_required: bool = False
@@ -114,6 +118,8 @@ def validate_operation(operation: DeliveryOperation) -> None:
             raise ValueError("verification operations require candidate_sha")
     if operation.phase is DeliveryPhase.MERGE and not operation.pull_request_number:
         raise ValueError("merge operations require pull_request_number")
+    if operation.phase is DeliveryPhase.PUSH and not operation.merge_commit_sha:
+        raise ValueError("push operations require merge_commit_sha")
     if operation.phase is DeliveryPhase.PULL_REQUEST:
         if not operation.candidate_sha:
             raise ValueError("pull request operations require candidate_sha")
@@ -121,5 +127,5 @@ def validate_operation(operation: DeliveryOperation) -> None:
             raise ValueError("pull request operations require stable identity")
         if not operation.candidate_branch:
             raise ValueError("pull request operations require candidate_branch")
-    if operation.phase in {DeliveryPhase.CI, DeliveryPhase.MERGE} and not operation.pull_request_number:
+    if operation.phase in {DeliveryPhase.CI, DeliveryPhase.MERGE, DeliveryPhase.PUSH} and not operation.pull_request_number:
         raise ValueError("CI and merge operations require pull_request_number")

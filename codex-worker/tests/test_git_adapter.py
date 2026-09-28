@@ -36,6 +36,14 @@ def make_repository(tmp_path):
     return repository
 
 
+def make_bare_remote(tmp_path, repository):
+    remote = tmp_path / "remote.git"
+    run_git(tmp_path, "init", "--bare", str(remote))
+    run_git(repository, "remote", "add", "origin", str(remote))
+    run_git(repository, "push", "-u", "origin", "main")
+    return remote
+
+
 def candidate_operation(repository, workspace, **overrides):
     values = dict(
         operation_id="candidate-1",
@@ -119,3 +127,29 @@ async def test_local_git_adapter_requires_explicit_acceptance_command(tmp_path) 
 
     assert missing.outcome is DeliveryOutcome.NOT_VERIFIED
     assert passed.outcome is DeliveryOutcome.COMPLETED
+
+
+async def test_local_git_adapter_pushes_and_reads_back_origin_merge(tmp_path) -> None:
+    repository = make_repository(tmp_path)
+    make_bare_remote(tmp_path, repository)
+    workspace = tmp_path / "candidate"
+    adapter = LocalGitAdapter()
+    candidate = await adapter.execute(candidate_operation(repository, workspace))
+
+    push = await adapter.execute(
+        DeliveryOperation(
+            operation_id="push-1",
+            run_id="run-1",
+            phase=DeliveryPhase.PUSH,
+            repository=str(repository),
+            workspace=str(workspace),
+            target_branch="main",
+            candidate_sha=candidate.candidate_sha,
+            merge_commit_sha=candidate.candidate_sha,
+            pull_request_number=1,
+        )
+    )
+
+    assert push.outcome is DeliveryOutcome.COMPLETED
+    assert push.remote_contains_merge is True
+    assert push.remote_sha == candidate.candidate_sha

@@ -113,6 +113,25 @@ class DeliveryWorkflow:
         )
         if not await self._accept(merge):
             return self._failed()
+        if merge.merged_sha is None:
+            self._status = DeliveryStatus.WAITING_FOR_READBACK
+            return self._failed()
+
+        push = await self._git(
+            DeliveryOperation(
+                operation_id=f"{workflow.info().workflow_id}:push",
+                run_id=workflow.info().workflow_id,
+                phase=DeliveryPhase.PUSH,
+                repository=input.repository,
+                workspace=input.workspace,
+                target_branch=input.target_branch,
+                candidate_sha=candidate_sha,
+                merge_commit_sha=merge.merged_sha,
+                pull_request_number=pull_request.pull_request_number,
+            )
+        )
+        if not await self._accept(push):
+            return self._failed()
 
         cleanup_operation = DeliveryOperation(
             operation_id=f"{workflow.info().workflow_id}:cleanup",
@@ -193,6 +212,10 @@ class DeliveryWorkflow:
                 receipt.pull_request_number is None
                 or readback.pull_request_number == receipt.pull_request_number
             )
+            and (
+                receipt.phase is not DeliveryPhase.PUSH
+                or readback.remote_contains_merge is True
+            )
         )
 
     async def _accept(self, receipt: DeliveryReceipt) -> bool:
@@ -228,6 +251,10 @@ class DeliveryWorkflow:
             or (
                 receipt.pull_request_number is not None
                 and readback.pull_request_number != receipt.pull_request_number
+            )
+            or (
+                receipt.phase is DeliveryPhase.PUSH
+                and readback.remote_contains_merge is not True
             )
         ):
             self._status = DeliveryStatus.FAILED

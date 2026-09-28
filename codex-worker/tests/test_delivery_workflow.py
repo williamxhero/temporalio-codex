@@ -69,6 +69,7 @@ async def test_delivery_workflow_runs_all_phases_with_fake_adapters() -> None:
         DeliveryPhase.PULL_REQUEST,
         DeliveryPhase.CI,
         DeliveryPhase.MERGE,
+        DeliveryPhase.PUSH,
         DeliveryPhase.CLEANUP,
     ]
 

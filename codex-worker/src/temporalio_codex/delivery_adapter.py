@@ -50,6 +50,8 @@ class FakeDeliveryAdapter:
         pull_request_number = operation.pull_request_number
         if operation.phase is DeliveryPhase.PULL_REQUEST:
             pull_request_number = pull_request_number or 1
+        merged_sha = candidate_sha if operation.phase is DeliveryPhase.MERGE else None
+        remote_sha = operation.merge_commit_sha if operation.phase is DeliveryPhase.PUSH else None
         return DeliveryReceipt(
             operation_id=operation.operation_id,
             phase=operation.phase,
@@ -58,5 +60,7 @@ class FakeDeliveryAdapter:
             candidate_sha=candidate_sha,
             acceptance_version=operation.acceptance_version,
             pull_request_number=pull_request_number,
-            merged_sha=(candidate_sha if operation.phase is DeliveryPhase.MERGE else None),
+            merged_sha=merged_sha,
+            remote_sha=remote_sha,
+            remote_contains_merge=(True if operation.phase is DeliveryPhase.PUSH else None),
         )

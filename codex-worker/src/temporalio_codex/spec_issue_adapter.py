@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
@@ -235,12 +237,25 @@ class GhCliSpecIssueGateway:
     ) -> SpecIssueRecord:
         operation_id = f"{input.operation_id}:{draft.key}"
         body_with_operation = body + f"\nOperation identity: {operation_id}\n"
-        record = await self._api(
-            "issues",
-            method="POST",
-            fields=(f"title=[SPEC {draft.key}] {draft.title}", f"body={body_with_operation}"),
-        )
-        return self._record(record, operation_id)
+        body_path = self._write_body_file(body_with_operation)
+        try:
+            url = await asyncio.to_thread(
+                self._run_text,
+                [
+                    "gh",
+                    "issue",
+                    "create",
+                    "--repo",
+                    self.repository,
+                    "--title",
+                    f"[SPEC {draft.key}] {draft.title}",
+                    "--body-file",
+                    body_path,
+                ],
+            )
+        finally:
+            os.unlink(body_path)
+        return await self.read_issue(int(url.rsplit("/", 1)[-1]))
 
     async def add_parent(self, parent_issue_number: int, issue_id: int) -> None:
         await self._api(
@@ -297,3 +312,17 @@ class GhCliSpecIssueGateway:
         if result.returncode:
             raise RuntimeError("GitHub API request failed")
         return json.loads(result.stdout)
+
+    @staticmethod
+    def _run_text(args: list[str]) -> str:
+        result = subprocess.run(args, capture_output=True, check=False, text=True)
+        if result.returncode:
+            raise RuntimeError("GitHub SPEC issue creation failed")
+        return result.stdout.strip()
+
+    @staticmethod
+    def _write_body_file(body: str) -> str:
+        descriptor, path = tempfile.mkstemp(prefix="temporalio-codex-spec-", suffix=".txt")
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+            stream.write(body)
+        return path

@@ -11,6 +11,14 @@ from temporalio_codex.github_adapter import (
 )
 
 
+class UnavailableGateway(FakeGitHubGateway):
+    async def find_pull_request(self, operation):
+        raise ConnectionError("readback unavailable")
+
+    async def create_pull_request(self, operation):
+        raise ConnectionError("create response lost")
+
+
 def operation(phase=DeliveryPhase.PULL_REQUEST, **overrides):
     values = dict(
         operation_id="pr-1",
@@ -36,6 +44,13 @@ async def test_pull_request_adopts_after_lost_create_without_duplicate() -> None
     assert receipt.outcome is DeliveryOutcome.COMPLETED
     assert receipt.pull_request_number == 1
     assert len(gateway.pull_requests) == 1
+
+
+async def test_pull_request_unknown_when_create_and_readback_both_fail() -> None:
+    receipt = await GitHubDeliveryAdapter(UnavailableGateway()).execute(operation())
+
+    assert receipt.outcome is DeliveryOutcome.UNKNOWN
+    assert receipt.readback_required is True
 
 
 async def test_ci_waits_for_terminal_checks_and_rejects_stale_sha() -> None:

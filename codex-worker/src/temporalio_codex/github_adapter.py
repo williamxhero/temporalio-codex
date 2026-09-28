@@ -65,12 +65,24 @@ class GitHubDeliveryAdapter:
         return receipt
 
     async def _pull_request(self, operation: DeliveryOperation) -> DeliveryReceipt:
-        existing = await self.gateway.find_pull_request(operation)
+        try:
+            existing = await self.gateway.find_pull_request(operation)
+        except Exception:
+            return self._unknown(
+                operation,
+                "pull request identity readback is unknown",
+            )
         if existing is None:
             try:
                 existing = await self.gateway.create_pull_request(operation)
             except Exception:
-                existing = await self.gateway.find_pull_request(operation)
+                try:
+                    existing = await self.gateway.find_pull_request(operation)
+                except Exception:
+                    return self._unknown(
+                        operation,
+                        "pull request create and identity readback are unknown",
+                    )
                 if existing is None:
                     return self._unknown(operation, "pull request create outcome is unknown")
         if existing.head_sha != operation.candidate_sha:

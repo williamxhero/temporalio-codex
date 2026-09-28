@@ -17,6 +17,8 @@ def operation(**overrides) -> DeliveryOperation:
         repository="D:/repo",
         workspace="D:/workspace",
         base_sha="base-1",
+        pull_request_identity="operation:op-1",
+        candidate_branch="codex/op-1",
     )
     values.update(overrides)
     return DeliveryOperation(**values)

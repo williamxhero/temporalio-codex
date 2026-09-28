@@ -66,7 +66,9 @@ class LocalGitAdapter:
     async def _verify_candidate(
         self, operation: DeliveryOperation
     ) -> DeliveryReceipt:
-        workspace = Path(operation.workspace or "").resolve()
+        if not operation.workspace:
+            raise ValueError("local Git verification requires a workspace")
+        workspace = Path(operation.workspace).resolve()
         current_sha = await self._git(workspace, "rev-parse", "--verify", "HEAD^{commit}")
         if current_sha != operation.candidate_sha:
             raise GitCommandError("candidate SHA changed after preparation")

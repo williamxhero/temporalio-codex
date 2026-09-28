@@ -34,6 +34,7 @@ class StageDefinition:
     model: str = "gpt-5-codex"
     effort: str = "medium"
     thread_id: str | None = None
+    external_recheck_seconds: float = 0
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,19 @@ class StageInput:
     stage: str
     requirement: str
     answer: str | None = None
+
+
+@dataclass(frozen=True)
+class HeartbeatInput:
+    operation_id: str
+    stage: str
+    progress: str
+
+    def __post_init__(self) -> None:
+        if not self.operation_id.strip() or not self.stage.strip():
+            raise ValueError("heartbeat identity must not be empty")
+        if len(self.progress) > 500:
+            raise ValueError("heartbeat progress is too long")
 
 
 @dataclass(frozen=True)
@@ -73,6 +87,7 @@ class RunSnapshot:
     completed_stages: tuple[str, ...]
     pending_input: str | None
     stage_results: tuple[StageResult, ...]
+    external_recheck_count: int = 0
 
 
 @dataclass(frozen=True)

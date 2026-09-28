@@ -35,6 +35,7 @@ class CodexRunWorkflow:
         self._external_resolution: bool | None = None
         self._stage_results: list[StageResult] = []
         self._paused_from: RunStatus | None = None
+        self._external_recheck_count = 0
 
     @workflow.query(name="get_status")
     def get_status(self) -> RunSnapshot:
@@ -45,6 +46,7 @@ class CodexRunWorkflow:
             completed_stages=tuple(self._completed_stages),
             pending_input=self._pending_input,
             stage_results=tuple(self._stage_results),
+            external_recheck_count=self._external_recheck_count,
         )
 
     @workflow.run
@@ -146,14 +148,45 @@ class CodexRunWorkflow:
                         self._external_resolution = None
                         self._status = RunStatus.ACTIVE
                     else:
-                        self._status = RunStatus.FAILED
-                        return RunResult(
-                            workflow_id=workflow.info().workflow_id,
-                            status=self._status,
-                            outcome=stage_result.outcome,
-                            stage=stage_result.stage,
-                            summary=stage_result.summary,
+                        if stage.external_recheck_seconds <= 0:
+                            self._status = RunStatus.FAILED
+                            return RunResult(
+                                workflow_id=workflow.info().workflow_id,
+                                status=self._status,
+                                outcome=stage_result.outcome,
+                                stage=stage_result.stage,
+                                summary=stage_result.summary,
+                            )
+                        await workflow.sleep(
+                            timedelta(seconds=stage.external_recheck_seconds)
                         )
+                        self._external_recheck_count += 1
+                        self._external_resolution = None
+                        self._status = RunStatus.WAITING_FOR_EXTERNAL_OBSERVATION
+                        await workflow.wait_condition(
+                            lambda: self._external_resolution is not None
+                            or self._status is RunStatus.CANCELLED
+                        )
+                        if self._status is RunStatus.CANCELLED:
+                            return self._cancelled_result()
+                        if self._external_resolution:
+                            stage_result = replace(
+                                stage_result,
+                                outcome=StageOutcome.COMPLETED,
+                                summary="External outcome confirmed by readback",
+                            )
+                            self._stage_results[-1] = stage_result
+                            self._external_resolution = None
+                            self._status = RunStatus.ACTIVE
+                        else:
+                            self._status = RunStatus.FAILED
+                            return RunResult(
+                                workflow_id=workflow.info().workflow_id,
+                                status=self._status,
+                                outcome=stage_result.outcome,
+                                stage=stage_result.stage,
+                                summary=stage_result.summary,
+                            )
                 else:
                     self._status = RunStatus.FAILED
                     return RunResult(

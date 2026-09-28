@@ -8,7 +8,12 @@ from temporalio_codex.codex_models import (
     CodexOperation,
     CodexOutcome,
 )
-from temporalio_codex.models import StageInput, StageOutcome, StageResult
+from temporalio_codex.models import (
+    HeartbeatInput,
+    StageInput,
+    StageOutcome,
+    StageResult,
+)
 from temporalio_codex.delivery_adapter import DeliveryAdapter
 from temporalio_codex.delivery_models import (
     DeliveryOperation,
@@ -46,6 +51,22 @@ async def foundation_stage(input: StageInput) -> StageResult:
             if input.answer is None
             else f"Accepted answer for {input.stage}: {input.answer}"
         ),
+    )
+
+
+@activity.defn(name="heartbeat-stage")
+async def heartbeat_stage(input: HeartbeatInput) -> StageResult:
+    activity.heartbeat(
+        {
+            "operation_id": input.operation_id,
+            "stage": input.stage,
+            "progress": input.progress,
+        }
+    )
+    return StageResult(
+        stage=input.stage,
+        outcome=StageOutcome.COMPLETED,
+        summary="heartbeat recorded",
     )
 
 

@@ -27,6 +27,31 @@ The deterministic flow publishes each SPEC and its tickets through the fake
 Issue gateway, reads back Parent and blocker relationships, then runs the
 ticket scheduler before implementation and delivery.
 
+The TC-08.3 harness is available as an explicit command. Deterministic mode is
+credential-free and never writes to GitHub:
+
+```text
+uv run temporalio-codex-live --deterministic --manifest .tmp/tc083.json
+```
+
+The live mode requires an explicit opt-in, an authorized brief, a Runner config,
+and an explicit control root. It polls the public Runner status and validates
+durable SPEC, ticket, Codex, candidate, review, PR, checks, merge, origin,
+Issue closure and final-summary evidence. Missing capabilities are reported as
+`not_verified`; live success requires real live evidence:
+
+```text
+$env:TC083_RUN_LIVE = "1"
+uv run temporalio-codex-live --live `
+  --brief C:/path/to/authorized-brief.txt `
+  --config C:/path/to/authorized-runner.json `
+  --control-root C:/path/to/runner-control
+```
+
+The live harness does not synthesize a brief or Runner config. This prevents an
+accidental run from selecting an unauthorized repository or artifact scope.
+Bound polling with `--poll-timeout` and `--poll-interval` when needed.
+
 The authenticated live probe creates a marked issue and comment in
 `williamxhero/skills`, reads both back, and closes the issue during cleanup.
 It is opt-in so normal test runs remain offline:

@@ -155,7 +155,9 @@ async def publish_specs(
                     draft,
                     spec_issue_body(input, draft),
                 )
-            await gateway.add_parent(input.umbrella_issue_number, existing.issue_id)
+            current = await gateway.read_issue(existing.number)
+            if current.parent_issue_number != input.umbrella_issue_number:
+                await gateway.add_parent(input.umbrella_issue_number, existing.issue_id)
             readback = await gateway.read_issue(existing.number)
             if (
                 readback.operation_id != operation_id
@@ -198,7 +200,7 @@ class FakeSpecIssueGateway:
             issue_id=self.next_number + 1_000_000_000,
             title=f"[SPEC {draft.key}] {draft.title}",
             operation_id=operation_id,
-            parent_issue_number=input.umbrella_issue_number,
+            parent_issue_number=0,
         )
         self.next_number += 1
         self.issues[operation_id] = record

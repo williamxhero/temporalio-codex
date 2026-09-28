@@ -54,6 +54,9 @@ def validate_scheduler_graph(input: SchedulerInput) -> tuple[str, ...]:
     ticket_keys = [ticket.key for ticket in input.tickets]
     if not input.specs:
         errors.append("at least one SPEC is required")
+    for spec in input.specs:
+        if not any(ticket.spec_key == spec.key for ticket in input.tickets):
+            errors.append(f"SPEC {spec.key} requires at least one ticket")
     if len(set(spec_keys)) != len(spec_keys):
         errors.append("SPEC keys must be unique")
     if len(set(ticket_keys)) != len(ticket_keys):

@@ -14,6 +14,12 @@ from temporalio_codex.activities import (
     foundation_stage,
     heartbeat_stage,
 )
+from temporalio_codex.summary_activities import (
+    configure_summary_gateway,
+    publish_delivery_summary,
+)
+from temporalio_codex.summary_adapter import GhCliSummaryCommentGateway
+from temporalio_codex.summary_workflows import DeliverySummaryWorkflow
 from temporalio_codex.github_adapter import GhCliGateway, GitHubDeliveryAdapter
 from temporalio_codex.git_adapter import LocalGitAdapter
 from temporalio_codex.openai_adapter import OpenAICodexAdapter
@@ -38,6 +44,7 @@ async def run_worker(
         GitHubDeliveryAdapter(GhCliGateway(_repository_name())),
     )
     configure_spec_issue_gateway(GhCliSpecIssueGateway(_repository_name()))
+    configure_summary_gateway(GhCliSummaryCommentGateway(_repository_name()))
     client = await Client.connect(target_host)
     async with Worker(
         client,
@@ -47,6 +54,7 @@ async def run_worker(
             DeliveryWorkflow,
             RequirementPlanningWorkflow,
             TicketSchedulerWorkflow,
+            DeliverySummaryWorkflow,
         ],
         activities=[
             foundation_stage,
@@ -56,6 +64,7 @@ async def run_worker(
             delivery_github_stage,
             prepare_grill,
             publish_spec_issues,
+            publish_delivery_summary,
         ],
     ):
         await asyncio.Event().wait()

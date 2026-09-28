@@ -18,6 +18,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from temporalio_codex.spec_issue_adapter import (
         SpecPublicationInput,
+        SpecPublicationResult,
         SpecPublicationStatus,
     )
 
@@ -35,6 +36,7 @@ class RequirementPlanningWorkflow:
         self._publication_operation_id: str | None = None
         self._published_specs = ()
         self._publication_reason = ""
+        self._publication_resolution: SpecPublicationResult | None = None
         self._cancelled = False
 
     @workflow.query(name="get_planning_status")
@@ -106,6 +108,18 @@ class RequirementPlanningWorkflow:
         )
         self._published_specs = publication.issues
         self._publication_reason = publication.reason
+        if publication.status is SpecPublicationStatus.UNKNOWN:
+            self._status = PlanningStatus.UNKNOWN
+            await workflow.wait_condition(
+                lambda: self._publication_resolution is not None or self._cancelled
+            )
+            if self._cancelled:
+                return self._cancelled_result()
+            publication = self._publication_resolution
+            self._publication_resolution = None
+            assert publication is not None
+            self._published_specs = publication.issues
+            self._publication_reason = publication.reason
         if publication.status is not SpecPublicationStatus.VERIFIED:
             self._status = (
                 PlanningStatus.BLOCKED
@@ -191,6 +205,13 @@ class RequirementPlanningWorkflow:
             return operation_id == self._publication_operation_id
         self._publication_requested = True
         self._publication_operation_id = operation_id
+        return True
+
+    @workflow.update(name="resolve_spec_publication")
+    async def resolve_spec_publication(self, result: SpecPublicationResult) -> bool:
+        if self._status is not PlanningStatus.UNKNOWN:
+            return False
+        self._publication_resolution = result
         return True
 
     @workflow.signal(name="cancel_planning")

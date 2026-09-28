@@ -65,3 +65,19 @@ def test_summary_with_no_evidence_is_blocked() -> None:
 
     assert summary.status is DeliveryGateStatus.BLOCKED
     assert "no SPEC delivery evidence" in summary.reason
+
+
+def test_gate_rejects_duplicate_ticket_evidence_and_summary_mismatch() -> None:
+    evidence = complete_evidence(
+        ticket_evidence=(
+            TicketDeliveryEvidence("ticket-1", 101, "completed", "sha-1"),
+            TicketDeliveryEvidence("ticket-1", 101, "completed", "sha-1"),
+        )
+    )
+
+    result = qualify_spec_delivery(evidence, ("ticket-1",))
+    summary = build_development_summary((result,), ())
+
+    assert result.status is DeliveryGateStatus.BLOCKED
+    assert summary.status is DeliveryGateStatus.BLOCKED
+    assert "counts differ" in summary.reason

@@ -74,6 +74,11 @@ def qualify_spec_delivery(
     required_ticket_keys: tuple[str, ...],
 ) -> DeliveryGateResult:
     by_key = {item.ticket_key: item for item in evidence.ticket_evidence}
+    if len(by_key) != len(evidence.ticket_evidence):
+        return DeliveryGateResult(
+            DeliveryGateStatus.BLOCKED,
+            "duplicate ticket evidence",
+        )
     missing = [key for key in required_ticket_keys if key not in by_key]
     if missing:
         return DeliveryGateResult(
@@ -94,6 +99,11 @@ def qualify_spec_delivery(
         return DeliveryGateResult(DeliveryGateStatus.FAIL, "required tests failed")
     if evidence.tests_passed is None:
         return DeliveryGateResult(DeliveryGateStatus.BLOCKED, "test result is missing")
+    if any(item.issue_number <= 0 for item in evidence.ticket_evidence):
+        return DeliveryGateResult(
+            DeliveryGateStatus.BLOCKED,
+            "ticket evidence has an invalid issue number",
+        )
     if not evidence.review_completed:
         return DeliveryGateResult(DeliveryGateStatus.BLOCKED, "independent review is incomplete")
     if evidence.unresolved_findings:
@@ -146,7 +156,7 @@ def build_development_summary(
     results: tuple[DeliveryGateResult, ...],
     evidences: tuple[SpecDeliveryEvidence, ...],
 ) -> DevelopmentSummary:
-    if not results:
+    if not results or len(results) != len(evidences):
         return DevelopmentSummary(
             status=DeliveryGateStatus.BLOCKED,
             completed_specs=(),
@@ -155,7 +165,11 @@ def build_development_summary(
             test_summary="none",
             unverified_gates=(),
             remote_state="not verified",
-            reason="no SPEC delivery evidence",
+            reason=(
+                "no SPEC delivery evidence"
+                if not results
+                else "delivery result and evidence counts differ"
+            ),
         )
     statuses = {result.status for result in results}
     if DeliveryGateStatus.FAIL in statuses:

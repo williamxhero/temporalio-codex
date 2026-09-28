@@ -139,3 +139,6 @@ def test_scheduler_graph_rejects_unresolved_and_cycle() -> None:
             )
         )
     )
+    assert "requires at least one ticket" in " ".join(
+        validate_scheduler_graph(SchedulerInput((SpecPlan("empty"),), ()))
+    )

@@ -12,6 +12,7 @@ from temporalio_codex.summary_adapter import (
     SummaryPublicationInput,
     SummaryPublicationResult,
     SummaryPublicationStatus,
+    SummaryCommentRecord,
 )
 from temporalio_codex.summary_workflows import DeliverySummaryWorkflow
 
@@ -73,6 +74,21 @@ async def test_summary_workflow_waits_for_external_readback() -> None:
                 assert status.status is SummaryPublicationStatus.UNKNOWN
                 resolved = SummaryPublicationResult(
                     status=SummaryPublicationStatus.VERIFIED,
+                    reason="verified by external comment readback",
+                )
+                assert await handle.execute_update(
+                    DeliverySummaryWorkflow.resolve_summary_publication,
+                    resolved,
+                    result_type=bool,
+                ) is False
+                resolved = SummaryPublicationResult(
+                    status=SummaryPublicationStatus.VERIFIED,
+                    comment=SummaryCommentRecord(
+                        comment_id=1,
+                        issue_number=8,
+                        operation_id="summary-workflow:summary",
+                        body="verified body",
+                    ),
                     reason="verified by external comment readback",
                 )
                 assert await handle.execute_update(

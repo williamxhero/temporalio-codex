@@ -50,6 +50,8 @@ class DeliverySummaryWorkflow:
             return False
         if result.status is SummaryPublicationStatus.UNKNOWN:
             return False
+        if result.status is SummaryPublicationStatus.VERIFIED and result.comment is None:
+            return False
         self._result = result
         self._status = result.status
         return True

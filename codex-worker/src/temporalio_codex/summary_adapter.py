@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
@@ -228,14 +230,27 @@ class GhCliSummaryCommentGateway:
     async def create_summary_comment(
         self, input: SummaryPublicationInput, body: str
     ) -> SummaryCommentRecord:
-        record = await self._api(
-            "issues",
-            str(input.umbrella_issue_number),
-            "comments",
-            method="POST",
-            fields=(f"body={body}",),
-        )
-        return self._record(record, input, input.operation_id)
+        body_path = self._write_body_file(body)
+        try:
+            await asyncio.to_thread(
+                self._run_command,
+                [
+                    "gh",
+                    "issue",
+                    "comment",
+                    str(input.umbrella_issue_number),
+                    "--repo",
+                    self.repository,
+                    "--body-file",
+                    body_path,
+                ],
+            )
+        finally:
+            os.unlink(body_path)
+        comments = await self.find_summary_comments(input)
+        if len(comments) != 1:
+            raise RuntimeError("created summary comment was not uniquely readable")
+        return comments[0]
 
     async def read_summary_comment(
         self, input: SummaryPublicationInput, comment_id: int
@@ -274,6 +289,19 @@ class GhCliSummaryCommentGateway:
         if result.returncode:
             raise RuntimeError("GitHub API request failed")
         return json.loads(result.stdout)
+
+    @staticmethod
+    def _run_command(args: list[str]) -> None:
+        result = subprocess.run(args, capture_output=True, check=False, text=True)
+        if result.returncode:
+            raise RuntimeError("GitHub comment request failed")
+
+    @staticmethod
+    def _write_body_file(body: str) -> str:
+        descriptor, path = tempfile.mkstemp(prefix="temporalio-codex-summary-", suffix=".txt")
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+            stream.write(body)
+        return path
 
     @staticmethod
     def _record(

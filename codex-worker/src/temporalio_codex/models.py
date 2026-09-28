@@ -14,6 +14,7 @@ class StageOutcome(StrEnum):
 
 class RunStatus(StrEnum):
     ACTIVE = "active"
+    PAUSED = "paused"
     WAITING_FOR_INPUT = "waiting_for_input"
     WAITING_FOR_EXTERNAL_OBSERVATION = "waiting_for_external_observation"
     COMPLETED = "completed"

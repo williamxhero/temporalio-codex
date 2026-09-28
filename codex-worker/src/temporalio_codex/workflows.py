@@ -34,6 +34,7 @@ class CodexRunWorkflow:
         self._answer: str | None = None
         self._external_resolution: bool | None = None
         self._stage_results: list[StageResult] = []
+        self._paused_from: RunStatus | None = None
 
     @workflow.query(name="get_status")
     def get_status(self) -> RunSnapshot:
@@ -60,6 +61,9 @@ class CodexRunWorkflow:
 
         stage_result: StageResult | None = None
         for stage in input.stages:
+            if self._status is RunStatus.CANCELLED:
+                return self._cancelled_result()
+            await self._wait_if_paused()
             if self._status is RunStatus.CANCELLED:
                 return self._cancelled_result()
 
@@ -281,6 +285,35 @@ class CodexRunWorkflow:
     async def cancel(self) -> None:
         if self._status not in (RunStatus.COMPLETED, RunStatus.FAILED):
             self._status = RunStatus.CANCELLED
+
+    async def _wait_if_paused(self) -> None:
+        if self._status is not RunStatus.PAUSED:
+            return
+        await workflow.wait_condition(
+            lambda: self._status is not RunStatus.PAUSED
+            or self._status is RunStatus.CANCELLED
+        )
+
+    @workflow.update(name="pause")
+    async def pause(self) -> bool:
+        if self._status in (
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.PAUSED,
+        ):
+            return False
+        self._paused_from = self._status
+        self._status = RunStatus.PAUSED
+        return True
+
+    @workflow.update(name="resume")
+    async def resume(self) -> bool:
+        if self._status is not RunStatus.PAUSED:
+            return False
+        self._status = self._paused_from or RunStatus.ACTIVE
+        self._paused_from = None
+        return True
 
     @workflow.update(name="submit_answer")
     async def submit_answer(self, answer: str) -> bool:

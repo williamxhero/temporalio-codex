@@ -64,11 +64,17 @@ class ReleaseEvidence:
         if self.kind in LIVE_KINDS:
             if self.origin is not EvidenceOrigin.LIVE:
                 errors.append("live evidence must have live origin")
-            if not self.run_id or not self.run_id.strip():
+            if self.status is not EvidenceStatus.NOT_VERIFIED and (
+                not self.run_id or not self.run_id.strip()
+            ):
                 errors.append("live evidence requires run_id")
         elif self.origin is EvidenceOrigin.LIVE:
             errors.append("deterministic or local evidence cannot have live origin")
-        if self.kind is EvidenceKind.LIVE_CODEX_SDK and not self.sdk_versions:
+        if (
+            self.kind is EvidenceKind.LIVE_CODEX_SDK
+            and self.status is not EvidenceStatus.NOT_VERIFIED
+            and not self.sdk_versions
+        ):
             errors.append("live Codex SDK evidence requires sdk_versions")
         if self.status is EvidenceStatus.NOT_VERIFIED and not self.reason.strip():
             errors.append("not_verified evidence requires reason")

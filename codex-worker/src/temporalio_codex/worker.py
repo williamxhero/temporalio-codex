@@ -1,10 +1,16 @@
 import argparse
 import asyncio
+from importlib.metadata import PackageNotFoundError, version
 
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from temporalio_codex.activities import foundation_stage
+from temporalio_codex.activities import (
+    codex_stage,
+    configure_codex_adapter,
+    foundation_stage,
+)
+from temporalio_codex.openai_adapter import OpenAICodexAdapter
 from temporalio_codex.settings import DEFAULT_TARGET_HOST, DEFAULT_TASK_QUEUE
 from temporalio_codex.workflows import CodexRunWorkflow
 
@@ -14,14 +20,25 @@ async def run_worker(
     target_host: str = DEFAULT_TARGET_HOST,
     task_queue: str = DEFAULT_TASK_QUEUE,
 ) -> None:
+    configure_codex_adapter(_build_codex_adapter())
     client = await Client.connect(target_host)
     async with Worker(
         client,
         task_queue=task_queue,
         workflows=[CodexRunWorkflow],
-        activities=[foundation_stage],
+        activities=[foundation_stage, codex_stage],
     ):
         await asyncio.Event().wait()
+
+
+def _build_codex_adapter() -> OpenAICodexAdapter | None:
+    try:
+        from openai_codex import AsyncCodex
+
+        sdk_version = version("openai-codex")
+    except (ImportError, PackageNotFoundError):
+        return None
+    return OpenAICodexAdapter(AsyncCodex, sdk_version)
 
 
 def main() -> None:

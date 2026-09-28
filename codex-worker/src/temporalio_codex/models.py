@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from temporalio_codex.codex_models import CodexRole
+
 
 class StageOutcome(StrEnum):
     COMPLETED = "completed"
@@ -24,6 +26,13 @@ class StageDefinition:
     key: str
     requires_input: bool = False
     start_to_close_timeout_seconds: float = 30
+    role: CodexRole | None = None
+    repository: str = "."
+    allowed_scope: tuple[str, ...] = ("read_only",)
+    approval_policy: str = "deny_all"
+    model: str = "gpt-5-codex"
+    effort: str = "medium"
+    thread_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +57,11 @@ class StageResult:
     summary: str
     evidence_refs: tuple[str, ...] = ()
     pending_input: str | None = None
+    role: str | None = None
+    operation_id: str | None = None
+    thread_id: str | None = None
+    turn_id: str | None = None
+    failure: str | None = None
 
 
 @dataclass(frozen=True)

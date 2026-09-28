@@ -28,6 +28,8 @@ class FakeCodexAdapter:
             operation_id=operation.operation_id,
             role=operation.role,
             outcome=CodexOutcome.COMPLETED,
+            thread_id=f"fake-thread-{operation.operation_id}",
+            turn_id=f"fake-turn-{operation.operation_id}",
             summary="fake Codex operation completed",
             capabilities=CodexCapabilities(
                 sdk_version="fake",

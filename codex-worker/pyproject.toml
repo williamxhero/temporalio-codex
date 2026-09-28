@@ -26,6 +26,7 @@ temporalio-codex-worker = "temporalio_codex.worker:main"
 temporalio-codex-qualify = "temporalio_codex.qualification:main"
 temporalio-codex-delivery = "temporalio_codex.entry:main"
 temporalio-codex-live = "temporalio_codex.full_flow_harness:main"
+temporalio-codex-retirement = "temporalio_codex.retirement:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

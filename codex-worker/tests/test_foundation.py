@@ -169,7 +169,7 @@ async def test_cancel_stops_later_stages() -> None:
                 RunInput(
                     requirement="cancel before the second stage",
                     stages=(
-                        StageDefinition(key="first"),
+                        StageDefinition(key="first", requires_input=True),
                         StageDefinition(key="second"),
                     ),
                 ),

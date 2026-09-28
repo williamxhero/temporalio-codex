@@ -4,7 +4,7 @@ import pytest
 from temporalio import activity
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 
 from temporalio_codex.activities import foundation_stage
 from temporalio_codex.client import execute_run
@@ -276,3 +276,68 @@ async def test_activity_timeout_becomes_unknown_observation() -> None:
 
     assert result.status is RunStatus.FAILED
     assert result.outcome is StageOutcome.UNKNOWN
+
+
+async def test_workflow_history_replays() -> None:
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="replay-test",
+            workflows=[CodexRunWorkflow],
+            activities=[foundation_stage],
+        ):
+            handle = await environment.client.start_workflow(
+                CodexRunWorkflow.run,
+                RunInput(requirement="replay a completed run"),
+                id="replay-test-run",
+                task_queue="replay-test",
+            )
+            await handle.result()
+            history = await handle.fetch_history()
+
+    await Replayer(workflows=[CodexRunWorkflow]).replay_workflow(history)
+
+
+async def test_worker_restart_preserves_waiting_run() -> None:
+    async with await WorkflowEnvironment.start_local() as environment:
+        handle = await environment.client.start_workflow(
+            CodexRunWorkflow.run,
+            RunInput(
+                requirement="restart while waiting",
+                stages=(StageDefinition(key="question", requires_input=True),),
+            ),
+            id="restart-test-run",
+            task_queue="restart-test",
+        )
+
+        async with Worker(
+            environment.client,
+            task_queue="restart-test",
+            workflows=[CodexRunWorkflow],
+            activities=[foundation_stage],
+        ):
+            snapshot = await wait_for_status(handle, RunStatus.WAITING_FOR_INPUT)
+            assert snapshot.current_stage == "question"
+
+        async with Worker(
+            environment.client,
+            task_queue="restart-test",
+            workflows=[CodexRunWorkflow],
+            activities=[foundation_stage],
+        ):
+            after_restart = await handle.query(CodexRunWorkflow.get_status)
+            assert after_restart.workflow_id == "restart-test-run"
+            assert after_restart.status is RunStatus.WAITING_FOR_INPUT
+            assert after_restart.pending_input == "Input required for stage: question"
+            assert (
+                await handle.execute_update(
+                    CodexRunWorkflow.submit_answer,
+                    "continue",
+                    result_type=bool,
+                )
+                is True
+            )
+            result = await handle.result()
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.workflow_id == "restart-test-run"

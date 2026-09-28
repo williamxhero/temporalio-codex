@@ -20,6 +20,8 @@ from temporalio_codex.openai_adapter import OpenAICodexAdapter
 from temporalio_codex.settings import DEFAULT_TARGET_HOST, DEFAULT_TASK_QUEUE
 from temporalio_codex.workflows import CodexRunWorkflow
 from temporalio_codex.delivery_workflows import DeliveryWorkflow
+from temporalio_codex.planning_activities import prepare_grill
+from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
 
 
 async def run_worker(
@@ -36,13 +38,18 @@ async def run_worker(
     async with Worker(
         client,
         task_queue=task_queue,
-        workflows=[CodexRunWorkflow, DeliveryWorkflow],
+        workflows=[
+            CodexRunWorkflow,
+            DeliveryWorkflow,
+            RequirementPlanningWorkflow,
+        ],
         activities=[
             foundation_stage,
             heartbeat_stage,
             codex_stage,
             delivery_git_stage,
             delivery_github_stage,
+            prepare_grill,
         ],
     ):
         await asyncio.Event().wait()

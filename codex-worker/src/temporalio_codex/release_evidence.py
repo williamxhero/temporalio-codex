@@ -59,7 +59,7 @@ class ReleaseEvidence:
                 ("operating_system", self.operating_system),
                 ("command", self.command),
             )
-            if not value or not value.strip()
+            if not isinstance(value, str) or not value.strip()
         ]
         if self.kind in LIVE_KINDS:
             if self.origin is not EvidenceOrigin.LIVE:

@@ -57,6 +57,7 @@ def inspect_legacy_database(path: str | Path) -> LegacyInspection:
                 return LegacyInspection(
                     status="not_verified",
                     reason="legacy_runs table is absent",
+                    source_identity=source_identity,
                 )
             columns = {
                 row[1]

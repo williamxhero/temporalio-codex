@@ -9,14 +9,31 @@ from temporalio_codex.codex_models import (
     CodexOutcome,
 )
 from temporalio_codex.models import StageInput, StageOutcome, StageResult
+from temporalio_codex.delivery_adapter import DeliveryAdapter
+from temporalio_codex.delivery_models import (
+    DeliveryOperation,
+    DeliveryOutcome,
+    DeliveryReceipt,
+)
 
 
 _codex_adapter: CodexAdapter | None = None
+_delivery_git_adapter: DeliveryAdapter | None = None
+_delivery_github_adapter: DeliveryAdapter | None = None
 
 
 def configure_codex_adapter(adapter: CodexAdapter | None) -> None:
     global _codex_adapter
     _codex_adapter = adapter
+
+
+def configure_delivery_adapters(
+    git_adapter: DeliveryAdapter | None,
+    github_adapter: DeliveryAdapter | None,
+) -> None:
+    global _delivery_git_adapter, _delivery_github_adapter
+    _delivery_git_adapter = git_adapter
+    _delivery_github_adapter = github_adapter
 
 
 @activity.defn(name="foundation-stage")
@@ -50,3 +67,31 @@ async def codex_stage(operation: CodexOperation) -> CodexObservation:
             ),
         )
     return await _codex_adapter.execute(operation)
+
+
+@activity.defn(name="delivery-git-stage")
+async def delivery_git_stage(operation: DeliveryOperation) -> DeliveryReceipt:
+    if _delivery_git_adapter is None:
+        return DeliveryReceipt(
+            operation_id=operation.operation_id,
+            phase=operation.phase,
+            outcome=DeliveryOutcome.NOT_VERIFIED,
+            summary="Git adapter is unavailable",
+            candidate_sha=operation.candidate_sha,
+            readback_required=True,
+        )
+    return await _delivery_git_adapter.execute(operation)
+
+
+@activity.defn(name="delivery-github-stage")
+async def delivery_github_stage(operation: DeliveryOperation) -> DeliveryReceipt:
+    if _delivery_github_adapter is None:
+        return DeliveryReceipt(
+            operation_id=operation.operation_id,
+            phase=operation.phase,
+            outcome=DeliveryOutcome.NOT_VERIFIED,
+            summary="GitHub adapter is unavailable",
+            candidate_sha=operation.candidate_sha,
+            readback_required=True,
+        )
+    return await _delivery_github_adapter.execute(operation)

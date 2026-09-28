@@ -1,0 +1,93 @@
+import asyncio
+
+from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import Worker
+
+from acceptance.test_whole_flow import whole_flow_input
+from temporalio_codex.activities import (
+    codex_stage,
+    delivery_git_stage,
+    delivery_github_stage,
+    foundation_stage,
+    heartbeat_stage,
+)
+from temporalio_codex.planning_activities import (
+    prepare_grill,
+    publish_spec_issues,
+    publish_ticket_issues,
+)
+from temporalio_codex.summary_activities import publish_delivery_summary
+from temporalio_codex.delivery_workflows import DeliveryWorkflow
+from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
+from temporalio_codex.summary_workflows import DeliverySummaryWorkflow
+from temporalio_codex.ticket_workflows import TicketSchedulerWorkflow
+from temporalio_codex.workflows import CodexRunWorkflow
+from temporalio_codex.whole_flow_models import WholeFlowPhase, WholeFlowStatus
+from temporalio_codex.whole_flow_workflows import RequirementDeliveryWorkflow
+
+
+async def test_public_controls_preserve_identity_and_cancel_before_children() -> None:
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="entry-controls",
+            workflows=[
+                RequirementDeliveryWorkflow,
+                RequirementPlanningWorkflow,
+                TicketSchedulerWorkflow,
+                CodexRunWorkflow,
+                DeliveryWorkflow,
+                DeliverySummaryWorkflow,
+            ],
+            activities=[
+                foundation_stage,
+                heartbeat_stage,
+                codex_stage,
+                delivery_git_stage,
+                delivery_github_stage,
+                prepare_grill,
+                publish_spec_issues,
+                publish_ticket_issues,
+                publish_delivery_summary,
+            ],
+        ):
+            handle = await environment.client.start_workflow(
+                RequirementDeliveryWorkflow.run,
+                whole_flow_input(),
+                id="entry-controls-run",
+                task_queue="entry-controls",
+            )
+            paused = await handle.execute_update(
+                RequirementDeliveryWorkflow.pause,
+                result_type=bool,
+            )
+            snapshot = await handle.query(RequirementDeliveryWorkflow.get_status)
+            assert paused is True
+            assert snapshot.status is WholeFlowStatus.BLOCKED
+            assert snapshot.reason == "paused by operator"
+            assert await handle.execute_update(
+                RequirementDeliveryWorkflow.resume,
+                result_type=bool,
+            )
+            assert await handle.execute_update(
+                RequirementDeliveryWorkflow.answer,
+                ("grill:1", "approved"),
+                result_type=bool,
+            )
+            assert (
+                await handle.execute_update(
+                    RequirementDeliveryWorkflow.answer,
+                    ("grill:1", "duplicate"),
+                    result_type=bool,
+                )
+                is False
+            )
+            await handle.signal(RequirementDeliveryWorkflow.cancel)
+            result = await asyncio.wait_for(handle.result(), timeout=5)
+            final = await handle.query(RequirementDeliveryWorkflow.get_status)
+
+    assert result.status is WholeFlowStatus.CANCELLED
+    assert result.phase is WholeFlowPhase.CANCELLED
+    assert final.status is WholeFlowStatus.CANCELLED
+    assert final.completed_specs == ()
+

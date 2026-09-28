@@ -4,6 +4,7 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from temporalio_codex.planning_activities import prepare_grill
+    from temporalio_codex.planning_activities import publish_spec_issues
     from temporalio_codex.planning_models import (
         GrillAnswer,
         GrillPreparationInput,
@@ -14,6 +15,10 @@ with workflow.unsafe.imports_passed_through():
         PlanningSnapshot,
         PlanningStatus,
         SourceRecord,
+    )
+    from temporalio_codex.spec_issue_adapter import (
+        SpecPublicationInput,
+        SpecPublicationStatus,
     )
 
 
@@ -28,6 +33,8 @@ class RequirementPlanningWorkflow:
         self._confirmation_operation_id: str | None = None
         self._publication_requested = False
         self._publication_operation_id: str | None = None
+        self._published_specs = ()
+        self._publication_reason = ""
         self._cancelled = False
 
     @workflow.query(name="get_planning_status")
@@ -42,6 +49,8 @@ class RequirementPlanningWorkflow:
             confirmation_operation_id=self._confirmation_operation_id,
             publication_requested=self._publication_requested,
             publication_operation_id=self._publication_operation_id,
+            published_specs=self._published_specs,
+            publication_reason=self._publication_reason,
         )
 
     @workflow.run
@@ -78,19 +87,48 @@ class RequirementPlanningWorkflow:
         )
         if self._cancelled:
             return self._cancelled_result()
+        if not input.specs:
+            self._phase = PlanningPhase.COMPLETED
+            self._status = PlanningStatus.COMPLETED
+            return self._planning_result()
+        self._phase = PlanningPhase.READY
+        self._status = PlanningStatus.PUBLISHING
+        publication = await workflow.execute_activity(
+            publish_spec_issues,
+            SpecPublicationInput(
+                repository="williamxhero/temporalio-codex",
+                umbrella_issue_number=input.umbrella_issue_number,
+                source_identity=self._source.source_identity if self._source else "",
+                operation_id=self._publication_operation_id or "",
+                drafts=input.specs,
+            ),
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        self._published_specs = publication.issues
+        self._publication_reason = publication.reason
+        if publication.status is not SpecPublicationStatus.VERIFIED:
+            self._status = (
+                PlanningStatus.BLOCKED
+                if publication.status is SpecPublicationStatus.BLOCKED
+                else PlanningStatus.UNKNOWN
+            )
+            return self._planning_result()
         self._phase = PlanningPhase.COMPLETED
         self._status = PlanningStatus.COMPLETED
+        return self._planning_result()
+
+    def _planning_result(self) -> PlanningResult:
         assert self._source is not None
-        assert self._confirmation_operation_id is not None
-        assert self._publication_operation_id is not None
         return PlanningResult(
             workflow_id=workflow.info().workflow_id,
             status=self._status,
             phase=self._phase,
             source=self._source,
             grill=self._grill,
-            confirmation_operation_id=self._confirmation_operation_id,
-            publication_operation_id=self._publication_operation_id,
+            confirmation_operation_id=self._confirmation_operation_id or "",
+            publication_operation_id=self._publication_operation_id or "",
+            published_specs=self._published_specs,
+            publication_reason=self._publication_reason,
         )
 
     def _required_questions_answered(self) -> bool:
@@ -172,4 +210,6 @@ class RequirementPlanningWorkflow:
             grill=self._grill,
             confirmation_operation_id=self._confirmation_operation_id or "",
             publication_operation_id=self._publication_operation_id or "",
+            published_specs=self._published_specs,
+            publication_reason=self._publication_reason,
         )

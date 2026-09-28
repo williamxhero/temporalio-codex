@@ -5,7 +5,7 @@ import pytest
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from temporalio_codex.planning_activities import prepare_grill
+from temporalio_codex.planning_activities import prepare_grill, publish_spec_issues
 from temporalio_codex.planning_models import (
     GrillAnswer,
     PlanningInput,
@@ -14,6 +14,8 @@ from temporalio_codex.planning_models import (
     SourceOrigin,
 )
 from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
+from temporalio_codex.planning_activities import configure_spec_issue_gateway
+from temporalio_codex.spec_issue_adapter import FakeSpecIssueGateway, SpecDraft
 
 
 async def wait_for_phase(handle, phase: PlanningPhase):
@@ -32,6 +34,10 @@ async def start_planning(environment, run_id: str, input: PlanningInput):
         id=run_id,
         task_queue=run_id,
     )
+
+
+def configure_fake_issue_gateway() -> None:
+    configure_spec_issue_gateway(FakeSpecIssueGateway())
 
 
 async def test_text_intake_grill_confirmation_and_publication_gate() -> None:
@@ -137,6 +143,53 @@ async def test_historical_chat_uses_reference_and_assumption_is_recorded() -> No
     assert result.grill.assumptions == (
         "treat the approved decision as the requirement",
     )
+
+
+async def test_confirmed_specs_publish_after_confirmation() -> None:
+    configure_fake_issue_gateway()
+    input = PlanningInput(
+        origin=SourceOrigin.TEXT,
+        source_text="publish two specs",
+        specs=(
+            SpecDraft(
+                key="foundation",
+                title="Foundation",
+                scope="Foundation scope",
+                acceptance_criteria=("Foundation works",),
+                testing_decisions=("Test foundation",),
+            ),
+        ),
+    )
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="planning-publish",
+            workflows=[RequirementPlanningWorkflow],
+            activities=[prepare_grill, publish_spec_issues],
+        ):
+            handle = await start_planning(environment, "planning-publish", input)
+            await wait_for_phase(handle, PlanningPhase.GRILLING)
+            assert await handle.execute_update(
+                RequirementPlanningWorkflow.answer_grill,
+                GrillAnswer(1, "approved"),
+                result_type=bool,
+            )
+            await wait_for_phase(handle, PlanningPhase.CONFIRMATION_REQUIRED)
+            assert await handle.execute_update(
+                RequirementPlanningWorkflow.confirm_planning,
+                "confirm-publish",
+                result_type=bool,
+            )
+            await wait_for_phase(handle, PlanningPhase.READY)
+            assert await handle.execute_update(
+                RequirementPlanningWorkflow.request_spec_publication,
+                "publish-specs",
+                result_type=bool,
+            )
+            result = await handle.result()
+
+    assert result.status is PlanningStatus.COMPLETED
+    assert len(result.published_specs) == 1
 
 
 def test_sensitive_text_requires_reference() -> None:

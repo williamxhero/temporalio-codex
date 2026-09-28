@@ -2,6 +2,11 @@ import hashlib
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from temporalio_codex.spec_issue_adapter import (
+    SpecDraft,
+    SpecIssueRecord,
+)
+
 
 class SourceOrigin(StrEnum):
     TEXT = "text"
@@ -23,6 +28,9 @@ class PlanningStatus(StrEnum):
     READY = "ready"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
+    PUBLISHING = "publishing"
+    BLOCKED = "blocked"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -31,6 +39,8 @@ class PlanningInput:
     source_text: str | None = None
     source_reference: str | None = None
     sensitive: bool = False
+    umbrella_issue_number: int = 1
+    specs: tuple[SpecDraft, ...] = ()
 
     def __post_init__(self) -> None:
         has_text = bool(self.source_text and self.source_text.strip())
@@ -95,6 +105,8 @@ class PlanningSnapshot:
     confirmation_operation_id: str | None = None
     publication_requested: bool = False
     publication_operation_id: str | None = None
+    published_specs: tuple[SpecIssueRecord, ...] = ()
+    publication_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -106,6 +118,8 @@ class PlanningResult:
     grill: GrillRecord
     confirmation_operation_id: str
     publication_operation_id: str
+    published_specs: tuple[SpecIssueRecord, ...] = ()
+    publication_reason: str = ""
 
 
 @dataclass(frozen=True)

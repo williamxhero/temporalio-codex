@@ -63,7 +63,10 @@ def validate_operation(operation: DeliveryOperation) -> None:
         DeliveryPhase.ACCEPTANCE,
         DeliveryPhase.REVIEW,
         DeliveryPhase.CI,
-    } and not operation.candidate_sha:
-        raise ValueError("verification operations require candidate_sha")
+    }:
+        if not operation.candidate_sha:
+            raise ValueError("verification operations require candidate_sha")
+        if not operation.workspace:
+            raise ValueError("verification operations require a workspace")
     if operation.phase is DeliveryPhase.MERGE and not operation.pull_request_number:
         raise ValueError("merge operations require pull_request_number")

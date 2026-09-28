@@ -8,6 +8,9 @@ from temporalio_codex.full_flow_harness import (
     HarnessStatus,
     ManifestStore,
     ResourceRecord,
+    _authorized_config_repository,
+    _run_handoff,
+    _write_live_summary,
     default_manifest_path,
     marker_matches,
     retry_cleanup,
@@ -34,6 +37,30 @@ async def test_deterministic_harness_writes_manifest_before_external_writes(tmp_
     assert manifest.resources
     assert len(boundary.write_calls) == len(boundary.cleanup_calls)
     assert all(marker_matches(resource.marker, manifest.marker) for resource in manifest.resources)
+
+
+async def test_live_summary_readback_contains_the_verified_flow_evidence(tmp_path) -> None:
+    manifest_path = tmp_path / "run.json"
+    result = await run_deterministic_harness(
+        HarnessRunInput(repository="owner/repo"),
+        manifest_path=manifest_path,
+        boundary=DeterministicFullFlowBoundary("placeholder"),
+    )
+
+    summary_path = _write_live_summary(tmp_path / "summary", result.manifest, ("S1", "S2"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+    assert summary == {
+        "schema_version": "tc083-live-summary/v1",
+        "run_id": result.manifest.run_id,
+        "marker": result.manifest.marker,
+        "runner_repository": "owner/repo",
+        "spec_keys": ["S1", "S2"],
+        "evidence_refs": [item.reference for item in result.manifest.evidence],
+        "resource_refs": [item.identity for item in result.manifest.resources],
+        "status": "verified",
+        "limitations": [],
+    }
 
 
 async def test_deterministic_harness_adopts_lost_write_without_duplicate_resource(tmp_path) -> None:
@@ -220,7 +247,7 @@ def test_runner_evidence_rejects_wrong_pr_head_and_failed_checks(tmp_path) -> No
     status = {
         "run": {"run_id": run_id, "state": "completed"},
         "workers": [
-            {"worker_id": f"codex_sdk:{run_id}:codex_{role}:S1", "external_thread_id": f"thread-{role}", "external_turn_id": f"turn-{role}", "state": "completed"}
+            {"worker_id": f"codex_sdk:{run_id}:codex_{role}:S1", "external_thread_id": f"thread-{role}", "external_turn_id": f"turn-{role}", "backend_kind": "codex_sdk", "model": "gpt-test", "approval_mode": "deny_all", "state": "completed"}
             for role in ("planning", "implementation", "review")
         ],
     }
@@ -249,6 +276,60 @@ async def test_live_entry_requires_explicit_authorized_inputs(tmp_path) -> None:
 
     assert result.status is HarnessStatus.NOT_VERIFIED
     assert "authorized-brief" in result.reason or "required live capabilities" in result.reason
+
+
+def test_live_config_must_authorize_the_requested_repository(tmp_path) -> None:
+    config_path = tmp_path / "runner.json"
+    config_path.write_text(json.dumps({"github": {"repository": "other/repo"}}), encoding="utf-8")
+
+    authorized, detail = _authorized_config_repository(
+        HarnessRunInput(repository="owner/repo", config_path=config_path)
+    )
+
+    assert not authorized
+    assert "expected 'owner/repo'" in detail
+
+
+def test_live_handoff_requires_the_run_marker_in_the_brief(tmp_path) -> None:
+    brief_path = tmp_path / "brief.txt"
+    brief_path.write_text("authorized requirement", encoding="utf-8")
+    config_path = tmp_path / "runner.json"
+    config_path.write_text("{}", encoding="utf-8")
+
+    try:
+        _run_handoff(
+            tmp_path / "skill",
+            input=HarnessRunInput(repository="owner/repo", brief_path=brief_path, config_path=config_path),
+            run_id="live-1",
+            control_root=tmp_path / "control",
+        )
+    except ValueError as error:
+        assert "run marker" in str(error)
+    else:
+        raise AssertionError("brief without the run marker must not launch")
+
+
+def _write_worker_receipts(artifact_directory, workers) -> None:
+    filenames = {
+        "planning": "codex_planning-planning.json",
+        "implementation": "implementation-S1.json",
+        "review": "review-worker-S1-aaaaaaaaaaaa.json",
+    }
+    for role, filename in filenames.items():
+        worker = next(item for item in workers if f"codex_{role}" in item["worker_id"])
+        (artifact_directory / filename).write_text(
+            json.dumps(
+                {
+                    "status": "completed",
+                    "error": None,
+                    "thread_id": worker["external_thread_id"],
+                    "turn_id": worker["external_turn_id"],
+                    "approval_mode": "deny_all",
+                    "sdk_version": "0.155.1",
+                }
+            ),
+            encoding="utf-8",
+        )
 
 
 def test_runner_evidence_accepts_complete_live_receipts(tmp_path) -> None:
@@ -301,10 +382,38 @@ def test_runner_evidence_accepts_complete_live_receipts(tmp_path) -> None:
     status = {
         "run": {"run_id": run_id, "state": "completed"},
         "workers": [
-            {"worker_id": f"codex_sdk:{run_id}:codex_{role}:S1", "external_thread_id": f"thread-{role}", "external_turn_id": f"turn-{role}", "state": "completed"}
+            {"worker_id": f"codex_sdk:{run_id}:codex_{role}:S1", "external_thread_id": f"thread-{role}", "external_turn_id": f"turn-{role}", "backend_kind": "codex_sdk", "model": "gpt-test", "approval_mode": "deny_all", "state": "completed"}
             for role in ("planning", "implementation", "review")
         ],
     }
+    _write_worker_receipts(artifact_directory, status["workers"])
+    candidate = {
+        "schema_version": "spec-runner-candidate-receipt/v1",
+        "outcome": "verified",
+        "candidate_sha": candidate_sha,
+        "acceptance_version": "ticket-1",
+        "checks": [{"command": ["python", "-c", "pass"], "acceptance": ["A1"], "passed": True}],
+        "write_scope": {"allowed_paths": ["codex-worker"], "changed_paths": ["codex-worker/src/example.py"]},
+    }
+    (artifact_directory / "candidate-S1.json").write_text(json.dumps(candidate), encoding="utf-8")
+    (artifact_directory / f"review-S1-{candidate_sha[:12]}.json").write_text(
+        json.dumps({"approved": True, "candidate_sha": candidate_sha, "review_digest": "review-1"}), encoding="utf-8"
+    )
+    (artifact_directory / "delivery-S1.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "spec_key": "S1",
+                "state": "github_completed",
+                "checks": {"candidate_sha": candidate_sha, "ready": True},
+                "pr": {"number": 12, "url": "https://example.test/pr/12", "candidate_sha": candidate_sha},
+                "merge": {"merged": True, "sha": merge_sha, "base_sync": {"synced_sha": merge_sha}},
+                "cleanup": {"outcome": "cleaned"},
+                "issue_closure": {"complete": True, "issues": [{"number": 20, "state": "closed"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     def issue_reader(repository: str, number: int) -> dict:
         assert repository == "owner/repo"
@@ -323,6 +432,76 @@ def test_runner_evidence_accepts_complete_live_receipts(tmp_path) -> None:
     assert specs == ("S1",)
     assert len(evidence) == 1
     assert len(resources) == 3
+
+
+def test_runner_evidence_requires_cleanup_receipt_and_direct_origin_readback(tmp_path) -> None:
+    run_id = "runner-incomplete-delivery"
+    artifact_directory = tmp_path / "artifacts" / run_id
+    artifact_directory.mkdir(parents=True)
+    (artifact_directory / "spec-plan.json").write_text(
+        json.dumps({"outcome": "planned", "specs": [{"key": "S1"}]}), encoding="utf-8"
+    )
+    (artifact_directory / "ticket-plan-S1.json").write_text(
+        json.dumps({"outcome": "planned", "spec_key": "S1"}), encoding="utf-8"
+    )
+    candidate_sha = "a" * 40
+    merge_sha = "b" * 40
+    candidate = {
+        "schema_version": "spec-runner-candidate-receipt/v1",
+        "outcome": "verified",
+        "candidate_sha": candidate_sha,
+        "acceptance_version": "ticket-1",
+        "checks": [{"command": ["python", "-c", "pass"], "acceptance": ["A1"], "passed": True}],
+        "write_scope": {"allowed_paths": ["src"], "changed_paths": ["src/example.py"]},
+    }
+    (artifact_directory / "candidate-S1.json").write_text(json.dumps(candidate), encoding="utf-8")
+    (artifact_directory / f"review-S1-{candidate_sha[:12]}.json").write_text(
+        json.dumps({"approved": True, "candidate_sha": candidate_sha, "review_digest": "review-1"}), encoding="utf-8"
+    )
+    (artifact_directory / "delivery-S1.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "spec_key": "S1",
+                "state": "github_completed",
+                "checks": {"candidate_sha": candidate_sha, "ready": True},
+                "pr": {"number": 12, "url": "https://example.test/pr/12", "candidate_sha": candidate_sha},
+                "merge": {
+                    "merged": True,
+                    "sha": merge_sha,
+                    "base_sync": {"outcome": "fast_forwarded"},
+                },
+                "issue_closure": {"complete": True, "issues": [{"number": 20, "state": "closed"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    status = {
+        "run": {"run_id": run_id, "state": "completed"},
+        "workers": [
+            {
+                "worker_id": f"codex_sdk:{run_id}:codex_{role}:S1",
+                "external_thread_id": f"thread-{role}",
+                "external_turn_id": f"turn-{role}",
+                "backend_kind": "codex_sdk",
+                "state": "completed",
+            }
+            for role in ("planning", "implementation", "review")
+        ],
+    }
+    _write_worker_receipts(artifact_directory, status["workers"])
+
+    errors, evidence, _, _ = validate_runner_evidence(
+        status,
+        artifact_directory=artifact_directory,
+        runner_run_id=run_id,
+        repository="owner/repo",
+        marker="<!-- tc083:manifest-1 -->",
+    )
+
+    assert not evidence
+    assert any("origin readback S1" in error for error in errors)
+    assert any("cleanup receipt S1" in error for error in errors)
 
 
 def test_default_manifest_path_is_outside_docs_specs() -> None:

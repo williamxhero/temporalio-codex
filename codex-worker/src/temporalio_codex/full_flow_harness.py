@@ -17,6 +17,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+CODEX_SDK_VERSION = "0.155.1"
+CODEX_APPROVAL_MODE = "deny_all"
+
 
 class HarnessStatus(StrEnum):
     VERIFIED = "verified"
@@ -496,10 +499,25 @@ def _installed_skill_root() -> Path | None:
     return None
 
 
+def _authorized_config_repository(input: HarnessRunInput) -> tuple[bool, str]:
+    if input.config_path is None:
+        return False, "--config is required"
+    try:
+        document = json.loads(input.config_path.expanduser().read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return False, f"Runner config is unreadable: {error}"
+    github = document.get("github") if isinstance(document, dict) else None
+    repository = github.get("repository") if isinstance(github, dict) else None
+    if repository != input.repository:
+        return False, f"Runner config targets {repository!r}, expected {input.repository!r}"
+    return True, "Runner config repository matches the authorized repository"
+
+
 def _capabilities(input: HarnessRunInput) -> tuple[CapabilityObservation, ...]:
     gh = shutil.which("gh")
     runner = shutil.which("spec-runner")
     skill_root = _installed_skill_root()
+    repository_matches, repository_detail = _authorized_config_repository(input)
     return (
         CapabilityObservation("gh", gh is not None, gh or "gh CLI unavailable"),
         CapabilityObservation("spec-runner", runner is not None, runner or "spec-runner unavailable"),
@@ -507,6 +525,7 @@ def _capabilities(input: HarnessRunInput) -> tuple[CapabilityObservation, ...]:
         CapabilityObservation("authorized-brief", bool(input.brief_path and input.brief_path.expanduser().is_file()), "brief file" if input.brief_path and input.brief_path.expanduser().is_file() else "--brief is required"),
         CapabilityObservation("authorized-runner-config", bool(input.config_path and input.config_path.expanduser().is_file()), "Runner config" if input.config_path and input.config_path.expanduser().is_file() else "--config is required"),
         CapabilityObservation("runner-control-root", input.control_root is not None, "explicit control root" if input.control_root else "--control-root is required"),
+        CapabilityObservation("authorized-repository", repository_matches, repository_detail),
     )
 
 
@@ -574,11 +593,16 @@ def _run_handoff(
 ) -> dict[str, Any]:
     if input.brief_path is None or input.config_path is None:
         raise ValueError("live harness requires an authorized brief and Runner config")
+    brief = input.brief_path.expanduser().resolve()
+    marker = marker_for(run_id)
+    brief_text = brief.read_text(encoding="utf-8")
+    if marker not in brief_text:
+        raise ValueError("authorized brief must contain the live run marker")
     return _invoke_runner(
         skill_root,
         operation="launch",
         control_root=control_root,
-        brief_path=input.brief_path.expanduser().resolve(),
+        brief_path=brief,
         config_path=input.config_path.expanduser().resolve(),
         launch_key=run_id,
     )
@@ -604,6 +628,22 @@ def _runner_artifact_directory(control_root: Path, config_path: Path, runner_run
     if root != control_root and control_root not in root.parents:
         raise ValueError("Runner artifact root escapes control root")
     return root / runner_run_id
+
+
+def _runner_github_receipt_path(control_root: Path, config_path: Path) -> Path:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    github = config.get("github") if isinstance(config, dict) else None
+    receipt_root = github.get("receipt_root") if isinstance(github, dict) else None
+    if not isinstance(receipt_root, str) or not receipt_root:
+        raise ValueError("Runner config github.receipt_root is required")
+    relative = Path(receipt_root)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("Runner config github.receipt_root must stay below control root")
+    root = (control_root / relative).resolve()
+    control_root = control_root.resolve()
+    if root != control_root and control_root not in root.parents:
+        raise ValueError("Runner GitHub receipt root escapes control root")
+    return root / ".spec-runner-github-receipts.json"
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -640,12 +680,94 @@ def _worker_has_identity(worker: object, role: str) -> bool:
     if not isinstance(worker, dict):
         return False
     identity = str(worker.get("worker_id") or "")
+    role_marker = f":{role}"
     return (
-        f":{role}:" in identity
+        worker.get("backend_kind") == "codex_sdk"
+        and (identity.endswith(role_marker) or f"{role_marker}:" in identity)
         and bool(worker.get("external_thread_id"))
         and bool(worker.get("external_turn_id"))
         and worker.get("state") not in {"failed", "cancelled"}
     )
+
+
+def _worker_artifact_candidates(artifact_directory: Path, role: str) -> tuple[Path, ...]:
+    patterns = {
+        "codex_planning": "codex_planning-*.json",
+        "codex_implementation": "implementation-*.json",
+        "codex_review": "review-worker-*.json",
+    }
+    return tuple(sorted(artifact_directory.glob(patterns[role])))
+
+
+def _validate_worker_artifacts(artifact_directory: Path, workers: list[object]) -> tuple[str, ...]:
+    errors: list[str] = []
+    for role in ("codex_planning", "codex_implementation", "codex_review"):
+        candidates = _worker_artifact_candidates(artifact_directory, role)
+        matching = []
+        for path in candidates:
+            try:
+                payload = _read_json_object(path)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if payload.get("status") == "completed" and payload.get("error") is None:
+                matching.append(payload)
+        if not matching:
+            errors.append(f"missing completed {role} artifact")
+            continue
+        if not any(isinstance(payload.get("thread_id"), str) and payload.get("thread_id") for payload in matching):
+            errors.append(f"{role} artifact lacks thread identity")
+        if not any(isinstance(payload.get("turn_id"), str) and payload.get("turn_id") for payload in matching):
+            errors.append(f"{role} artifact lacks turn identity")
+        if not any(payload.get("approval_mode") == CODEX_APPROVAL_MODE for payload in matching):
+            errors.append(f"{role} artifact lacks the required approval mode")
+        if not any(payload.get("sdk_version") == CODEX_SDK_VERSION for payload in matching):
+            errors.append(f"{role} artifact lacks the required SDK version")
+        if not any(
+            any(
+                isinstance(worker, dict)
+                and worker.get("external_thread_id") == payload.get("thread_id")
+                and worker.get("external_turn_id") == payload.get("turn_id")
+                for worker in workers
+            )
+            and payload.get("approval_mode") == CODEX_APPROVAL_MODE
+            and payload.get("sdk_version") == CODEX_SDK_VERSION
+            for payload in matching
+        ):
+            errors.append(f"{role} artifact lacks matching worker identity")
+    return tuple(errors)
+
+
+def _validate_candidate_receipt(candidate: dict[str, Any], spec_key: str) -> tuple[str, ...]:
+    errors: list[str] = []
+    if candidate.get("schema_version") != "spec-runner-candidate-receipt/v1":
+        errors.append(f"candidate {spec_key} has no trusted receipt schema")
+    if not isinstance(candidate.get("acceptance_version"), str) or not candidate["acceptance_version"].strip():
+        errors.append(f"candidate {spec_key} has no acceptance version")
+    write_scope = candidate.get("write_scope")
+    if not isinstance(write_scope, dict):
+        errors.append(f"candidate {spec_key} has no write-scope evidence")
+    else:
+        for field in ("allowed_paths", "changed_paths"):
+            values = write_scope.get(field)
+            if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values):
+                errors.append(f"candidate {spec_key} has invalid write-scope {field}")
+    checks = candidate.get("checks")
+    if not isinstance(checks, list) or not checks:
+        errors.append(f"candidate {spec_key} has no acceptance checks")
+    else:
+        for check in checks:
+            if (
+                not isinstance(check, dict)
+                or not isinstance(check.get("command"), list)
+                or not check["command"]
+                or any(not isinstance(value, str) or not value for value in check["command"])
+                or not isinstance(check.get("acceptance"), list)
+                or not check["acceptance"]
+                or check.get("passed") is not True
+            ):
+                errors.append(f"candidate {spec_key} has an unverified acceptance check")
+                break
+    return tuple(errors)
 
 
 def _github_issue_readback(repository: str, number: int) -> dict[str, Any]:
@@ -672,6 +794,7 @@ def validate_runner_evidence(
     repository: str,
     marker: str,
     issue_reader: Any | None = None,
+    github_receipt_path: Path | None = None,
 ) -> tuple[tuple[str, ...], tuple[EvidenceRecord, ...], tuple[ResourceRecord, ...], tuple[str, ...]]:
     errors: list[str] = []
     evidence: list[EvidenceRecord] = []
@@ -688,6 +811,7 @@ def validate_runner_evidence(
     for role in ("codex_planning", "codex_implementation", "codex_review"):
         if not any(_worker_has_identity(worker, role) for worker in workers):
             errors.append(f"missing live {role} worker identity")
+    errors.extend(_validate_worker_artifacts(artifact_directory, workers))
 
     try:
         spec_plan = _read_json_object(artifact_directory / "spec-plan.json")
@@ -717,49 +841,89 @@ def validate_runner_evidence(
         if candidate.get("outcome") != "verified" or not isinstance(candidate_sha, str) or len(candidate_sha) != 40:
             errors.append(f"candidate {spec_key} is not verified")
             continue
+        errors.extend(_validate_candidate_receipt(candidate, spec_key))
         try:
             review = _read_json_object(artifact_directory / f"review-{spec_key}-{candidate_sha[:12]}.json")
             delivery = _read_json_object(artifact_directory / f"delivery-{spec_key}.json")
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
             errors.append(f"SPEC {spec_key} delivery readback failed: {error}")
             continue
-        if review.get("approved") is not True or review.get("candidate_sha") != candidate_sha:
+        if (
+            review.get("approved") is not True
+            or review.get("candidate_sha") != candidate_sha
+            or not isinstance(review.get("review_digest"), str)
+            or not review["review_digest"].strip()
+        ):
             errors.append(f"review {spec_key} does not approve its candidate")
         checks = delivery.get("checks")
         pr = delivery.get("pr")
         merge = delivery.get("merge")
+        if delivery.get("run_id") != runner_run_id or delivery.get("spec_key") != spec_key:
+            errors.append(f"delivery {spec_key} has the wrong Runner identity")
         delivery_valid = delivery.get("state") in {"spec_completed", "github_completed"}
         if not delivery_valid:
             errors.append(f"delivery {spec_key} is not complete")
         checks_valid = isinstance(checks, dict) and checks.get("candidate_sha") == candidate_sha and checks.get("ready") is True
         if not checks_valid:
             errors.append(f"checks {spec_key} do not qualify the exact candidate")
-        pr_valid = isinstance(pr, dict) and pr.get("candidate_sha") == candidate_sha and isinstance(pr.get("number"), int)
+        pr_valid = (
+            isinstance(pr, dict)
+            and pr.get("candidate_sha") == candidate_sha
+            and isinstance(pr.get("number"), int)
+            and not isinstance(pr.get("number"), bool)
+            and isinstance(pr.get("url"), str)
+            and bool(pr["url"].strip())
+        )
         if not pr_valid:
             errors.append(f"PR {spec_key} is not tied to the candidate")
-        merge_valid = isinstance(merge, dict) and merge.get("merged") is True and isinstance(merge.get("sha"), str)
+        merge_valid = (
+            isinstance(merge, dict)
+            and merge.get("merged") is True
+            and isinstance(merge.get("sha"), str)
+            and len(merge["sha"]) == 40
+        )
         if not merge_valid:
             errors.append(f"merge {spec_key} has no confirmed merge SHA")
         origin_valid = merge_valid and isinstance(merge.get("base_sync"), dict) and merge["base_sync"].get("synced_sha") == merge["sha"]
         if merge_valid and not origin_valid:
             errors.append(f"origin readback {spec_key} does not match the merge SHA")
         closure = delivery.get("issue_closure")
-        closure_valid = isinstance(closure, dict) and closure.get("complete") is True
+        closure_valid = (
+            isinstance(closure, dict)
+            and closure.get("complete") is True
+            and isinstance(closure.get("issues"), list)
+            and bool(closure["issues"])
+            and all(
+                isinstance(item, dict)
+                and isinstance(item.get("number"), int)
+                and item.get("state") == "closed"
+                for item in closure["issues"]
+            )
+        )
         if not closure_valid:
             errors.append(f"ticket Issue closure {spec_key} is incomplete")
-        if delivery_valid and checks_valid and pr_valid and merge_valid and origin_valid and closure_valid:
+        cleanup = delivery.get("cleanup")
+        cleanup_valid = isinstance(cleanup, dict) and cleanup.get("outcome") == "cleaned"
+        if not cleanup_valid:
+            errors.append(f"cleanup receipt {spec_key} is incomplete")
+        if delivery_valid and checks_valid and pr_valid and merge_valid and origin_valid and closure_valid and cleanup_valid:
             evidence.append(EvidenceRecord(
                 reference=f"runner:{runner_run_id}:{spec_key}",
                 kind=EvidenceKind.LIVE,
                 status=EvidenceStatus.VERIFIED,
                 operation_id=f"{runner_run_id}:delivery:{spec_key}",
                 phase="delivery",
-                details=(("candidate_sha", str(candidate_sha)), ("merge_sha", str(merge.get("sha")))),
+                details=(
+                    ("candidate_sha", str(candidate_sha)),
+                    ("merge_sha", str(merge.get("sha"))),
+                    ("origin_sha", str(merge["base_sync"].get("synced_sha"))),
+                    ("cleanup", str(cleanup.get("outcome"))),
+                ),
             ))
             if isinstance(pr, dict) and isinstance(pr.get("number"), int):
                 resources.append(ResourceRecord("pull-request", str(pr["number"]), marker, f"{runner_run_id}:pr:{spec_key}"))
 
-    receipt_path = artifact_directory.parent.parent / "github-receipts" / ".spec-runner-github-receipts.json"
+    receipt_path = github_receipt_path or artifact_directory.parent.parent / "github-receipts" / ".spec-runner-github-receipts.json"
     try:
         receipts = _read_json_object(receipt_path)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
@@ -885,6 +1049,7 @@ async def run_live_harness(
         if config_path is None:
             raise ValueError("live harness requires Runner config")
         artifact_directory = _runner_artifact_directory(control_root, config_path, str(observed_run_id))
+        github_receipt_path = _runner_github_receipt_path(control_root, config_path)
         errors, live_evidence, live_resources, _spec_keys = validate_runner_evidence(
             runner_status,
             artifact_directory=artifact_directory,
@@ -892,6 +1057,7 @@ async def run_live_harness(
             repository=input.repository,
             marker=manifest.marker,
             issue_reader=_github_issue_readback,
+            github_receipt_path=github_receipt_path,
         )
         evidence = tuple(
             replace(item, kind=EvidenceKind.LIVE, status=EvidenceStatus.VERIFIED)

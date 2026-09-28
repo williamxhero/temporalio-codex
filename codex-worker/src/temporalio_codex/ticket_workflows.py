@@ -92,7 +92,7 @@ class TicketSchedulerWorkflow:
             if spec.key in specs_with_tickets and spec.key not in completed_specs:
                 if set(spec.dependencies).issubset(completed_specs):
                     return spec.key
-                return None
+                continue
         return None
 
     def _completed_specs(self) -> tuple[str, ...]:

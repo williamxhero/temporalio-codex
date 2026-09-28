@@ -43,7 +43,10 @@ class DeliverySummaryWorkflow:
     async def resolve_summary_publication(
         self, result: SummaryPublicationResult
     ) -> bool:
-        if self._status is not SummaryPublicationStatus.UNKNOWN:
+        if (
+            self._result is None
+            or self._result.status is not SummaryPublicationStatus.UNKNOWN
+        ):
             return False
         if result.status is SummaryPublicationStatus.UNKNOWN:
             return False

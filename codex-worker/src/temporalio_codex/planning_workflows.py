@@ -209,7 +209,10 @@ class RequirementPlanningWorkflow:
 
     @workflow.update(name="resolve_spec_publication")
     async def resolve_spec_publication(self, result: SpecPublicationResult) -> bool:
-        if self._status is not PlanningStatus.UNKNOWN:
+        if (
+            self._status is not PlanningStatus.UNKNOWN
+            or result.status is SpecPublicationStatus.UNKNOWN
+        ):
             return False
         self._publication_resolution = result
         return True

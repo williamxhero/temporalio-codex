@@ -24,6 +24,16 @@ def scheduler_input() -> SchedulerInput:
     )
 
 
+def reverse_dependency_scheduler_input() -> SchedulerInput:
+    return SchedulerInput(
+        specs=(SpecPlan("second", ("first",)), SpecPlan("first")),
+        tickets=(
+            TicketPlan("second-a", "second"),
+            TicketPlan("first-a", "first"),
+        ),
+    )
+
+
 async def wait_for_frontier(handle, frontier):
     for _ in range(100):
         snapshot = await handle.query(TicketSchedulerWorkflow.get_status)
@@ -82,6 +92,37 @@ async def test_parallel_frontier_advances_specs_in_order() -> None:
 
     assert result.status is SchedulerStatus.COMPLETED
     assert result.completed_specs == ("first", "second")
+
+
+async def test_scheduler_orders_specs_by_dependencies_not_input_order() -> None:
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="ticket-scheduler-reverse",
+            workflows=[TicketSchedulerWorkflow],
+        ):
+            handle = await environment.client.start_workflow(
+                TicketSchedulerWorkflow.run,
+                reverse_dependency_scheduler_input(),
+                id="ticket-scheduler-reverse",
+                task_queue="ticket-scheduler-reverse",
+            )
+            snapshot = await wait_for_frontier(handle, ("first-a",))
+            assert snapshot.active_spec == "first"
+            assert await handle.execute_update(
+                TicketSchedulerWorkflow.complete_ticket,
+                args=["first-a", "reverse-first"],
+                result_type=bool,
+            )
+            await wait_for_frontier(handle, ("second-a",))
+            assert await handle.execute_update(
+                TicketSchedulerWorkflow.complete_ticket,
+                args=["second-a", "reverse-second"],
+                result_type=bool,
+            )
+            result = await handle.result()
+
+    assert result.status is SchedulerStatus.COMPLETED
 
 
 async def test_scheduler_restart_preserves_frontier() -> None:

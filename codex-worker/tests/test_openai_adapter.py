@@ -135,6 +135,21 @@ async def test_pending_input_is_bounded_and_typed() -> None:
     assert observation.readback_required is False
 
 
+async def test_unrecognized_turn_status_requires_readback() -> None:
+    result = SimpleNamespace(
+        id="turn-1",
+        status=SimpleNamespace(value="provider_added_status"),
+        final_response=None,
+    )
+    adapter, _, _ = adapter_for(result)
+
+    observation = await adapter.execute(operation())
+
+    assert observation.outcome is CodexOutcome.UNKNOWN
+    assert observation.failure is CodexFailure.UNKNOWN
+    assert observation.readback_required is True
+
+
 async def test_historical_interrupt_is_explicitly_unsupported() -> None:
     adapter = OpenAICodexAdapter(lambda: None, "0.155.1")
 

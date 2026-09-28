@@ -182,7 +182,7 @@ class OpenAICodexAdapter:
         return CodexObservation(
             operation_id=operation.operation_id,
             role=operation.role,
-            outcome=CodexOutcome.FAILED,
+            outcome=CodexOutcome.UNKNOWN,
             thread_id=thread_id,
             turn_id=turn_id,
             summary="Codex returned an unrecognized turn status",

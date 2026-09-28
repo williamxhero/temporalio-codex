@@ -10,6 +10,12 @@ class StageOutcome(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ActivityOutcome(StrEnum):
+    TRANSIENT_FAILURE = "transient_failure"
+    TIMEOUT = "timeout"
+    UNKNOWN = "unknown"
+
+
 class RunStatus(StrEnum):
     ACTIVE = "active"
     WAITING_FOR_INPUT = "waiting_for_input"
@@ -23,6 +29,7 @@ class RunStatus(StrEnum):
 class StageDefinition:
     key: str
     requires_input: bool = False
+    start_to_close_timeout_seconds: float = 30
 
 
 @dataclass(frozen=True)

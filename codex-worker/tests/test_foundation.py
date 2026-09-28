@@ -1,5 +1,8 @@
+import asyncio
+
 import pytest
-from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio import activity
+from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -12,6 +15,30 @@ from temporalio_codex.models import (
     StageOutcome,
 )
 from temporalio_codex.workflows import CodexRunWorkflow
+
+
+@activity.defn(name="foundation-stage")
+async def transient_stage(input):
+    raise ApplicationError("retry me", type="TransientFailure")
+
+
+@activity.defn(name="foundation-stage")
+async def unknown_stage(input):
+    raise ApplicationError("outcome unknown", type="UnknownExternalOutcome")
+
+
+@activity.defn(name="foundation-stage")
+async def timeout_stage(input):
+    await asyncio.sleep(1)
+
+
+async def wait_for_status(handle, expected: RunStatus):
+    for _ in range(100):
+        snapshot = await handle.query(CodexRunWorkflow.get_status)
+        if snapshot.status is expected:
+            return snapshot
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"run did not reach {expected}")
 
 
 async def test_foundation_workflow_uses_public_input_and_result_seams() -> None:
@@ -102,7 +129,7 @@ async def test_run_waits_for_answer_and_resumes_same_workflow() -> None:
             await environment.client.get_workflow_handle(
                 "answer-test-run"
             ).query(CodexRunWorkflow.get_status)
-            snapshot = await handle.query(CodexRunWorkflow.get_status)
+            snapshot = await wait_for_status(handle, RunStatus.WAITING_FOR_INPUT)
             assert snapshot.status is RunStatus.WAITING_FOR_INPUT
             assert snapshot.pending_input == "Input required for stage: question"
 
@@ -155,3 +182,97 @@ async def test_cancel_stops_later_stages() -> None:
     assert result.status is RunStatus.CANCELLED
     assert result.outcome is StageOutcome.CANCELLED
     assert result.stage == "first"
+
+
+async def test_retry_policy_classifies_failed_activity() -> None:
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="retry-test",
+            workflows=[CodexRunWorkflow],
+            activities=[transient_stage],
+        ):
+            result = await environment.client.execute_workflow(
+                CodexRunWorkflow.run,
+                RunInput(requirement="retry a transient activity"),
+                id="retry-test-run",
+                task_queue="retry-test",
+            )
+
+    assert result.status is RunStatus.FAILED
+    assert result.outcome is StageOutcome.FAILED
+    assert result.stage == "foundation"
+
+
+async def test_unknown_activity_outcome_waits_for_external_observation() -> None:
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="unknown-test",
+            workflows=[CodexRunWorkflow],
+            activities=[unknown_stage],
+        ):
+            handle = await environment.client.start_workflow(
+                CodexRunWorkflow.run,
+                RunInput(requirement="reconcile unknown activity outcome"),
+                id="unknown-test-run",
+                task_queue="unknown-test",
+            )
+            snapshot = await wait_for_status(
+                handle, RunStatus.WAITING_FOR_EXTERNAL_OBSERVATION
+            )
+
+            assert snapshot.status is RunStatus.WAITING_FOR_EXTERNAL_OBSERVATION
+            assert (
+                await handle.execute_update(
+                    CodexRunWorkflow.resolve_external_observation,
+                    True,
+                    result_type=bool,
+                )
+                is True
+            )
+            result = await handle.result()
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.outcome is StageOutcome.COMPLETED
+
+
+async def test_activity_timeout_becomes_unknown_observation() -> None:
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="timeout-test",
+            workflows=[CodexRunWorkflow],
+            activities=[timeout_stage],
+        ):
+            handle = await environment.client.start_workflow(
+                CodexRunWorkflow.run,
+                RunInput(
+                    requirement="time out an activity",
+                    stages=(
+                        StageDefinition(
+                            key="timeout",
+                            start_to_close_timeout_seconds=0.01,
+                        ),
+                    ),
+                ),
+                id="timeout-test-run",
+                task_queue="timeout-test",
+            )
+            snapshot = await wait_for_status(
+                handle, RunStatus.WAITING_FOR_EXTERNAL_OBSERVATION
+            )
+
+            assert snapshot.status is RunStatus.WAITING_FOR_EXTERNAL_OBSERVATION
+            assert (
+                await handle.execute_update(
+                    CodexRunWorkflow.resolve_external_observation,
+                    False,
+                    result_type=bool,
+                )
+                is True
+            )
+            result = await handle.result()
+
+    assert result.status is RunStatus.FAILED
+    assert result.outcome is StageOutcome.UNKNOWN

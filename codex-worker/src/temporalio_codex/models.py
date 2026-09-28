@@ -7,6 +7,7 @@ class StageOutcome(StrEnum):
     WAITING_FOR_INPUT = "waiting_for_input"
     FAILED = "failed"
     UNKNOWN = "unknown"
+    CANCELLED = "cancelled"
 
 
 class RunStatus(StrEnum):

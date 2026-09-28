@@ -46,5 +46,10 @@
 **/.venv/
 **/.ruff_cache/
 
+# Python artifacts produced by the external Codex Worker
+codex-worker/.pytest_cache/
+codex-worker/**/__pycache__/
+codex-worker/src/*.egg-info/
+
 # Ignoring AI agent files
 .agents/

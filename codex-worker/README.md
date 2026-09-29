@@ -52,6 +52,32 @@ The live harness does not synthesize a brief or Runner config. This prevents an
 accidental run from selecting an unauthorized repository or artifact scope.
 Bound polling with `--poll-timeout` and `--poll-interval` when needed.
 
+To qualify an existing GitHub workflow, pass the umbrella Issue and existing
+checkout explicitly. Live takeover performs read-only discovery first, binds
+the apply and final evidence to the discovery digest, and reuses verified
+Issue, ticket, candidate, review, PR, check, merge, closure and cleanup
+readbacks. It is also opt-in and must use a unique run marker in the brief:
+
+```text
+$env:TC083_RUN_LIVE = "1"
+uv run temporalio-codex-live --live `
+  --repository williamxhero/skills `
+  --takeover-issue 123 `
+  --takeover-workspace C:/path/to/checkout `
+  --takeover-target-ref refs/heads/main `
+  --takeover-key takeover-123 `
+  --brief C:/path/to/authorized-brief.txt `
+  --config C:/path/to/authorized-runner.json `
+  --control-root C:/path/to/runner-control `
+  --required-check CI
+```
+
+The deterministic takeover matrix runs offline with
+`uv run pytest tests/acceptance/test_takeover_matrix.py -q`. It covers fresh
+intake, partial planning, adopted tickets, mixed completed and unfinished
+SPECs, candidate and check frontiers, merge readback, dependency ordering,
+snapshot drift, discovery blockers, process restart, and cleanup-only retry.
+
 The authenticated live probe creates a marked issue and comment in
 `williamxhero/skills`, reads both back, and closes the issue during cleanup.
 It is opt-in so normal test runs remain offline:

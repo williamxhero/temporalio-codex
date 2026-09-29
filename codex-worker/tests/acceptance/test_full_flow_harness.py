@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from temporalio_codex.full_flow_harness import (
     DeterministicFullFlowBoundary,
@@ -9,7 +11,9 @@ from temporalio_codex.full_flow_harness import (
     ManifestStore,
     ResourceRecord,
     _authorized_config_repository,
+    _live_manifest,
     _run_handoff,
+    _run_takeover_handoff,
     _write_live_summary,
     default_manifest_path,
     marker_matches,
@@ -18,6 +22,7 @@ from temporalio_codex.full_flow_harness import (
     run_live_harness,
     validate_live_manifest,
     validate_runner_evidence,
+    validate_takeover_evidence,
 )
 
 
@@ -171,6 +176,81 @@ async def test_live_harness_is_not_verified_without_explicit_opt_in(tmp_path) ->
     assert result.status is HarnessStatus.NOT_VERIFIED
     assert "TC083_RUN_LIVE" in result.reason
     assert ManifestStore(manifest_path).read().status is HarnessStatus.NOT_VERIFIED
+
+
+async def test_live_takeover_defaults_to_not_opted_in(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("TC083_RUN_LIVE", raising=False)
+    result = await run_live_harness(
+        HarnessRunInput(repository="owner/repo", takeover_issue=42),
+        manifest_path=tmp_path / "live-takeover.json",
+    )
+
+    assert result.status is HarnessStatus.NOT_VERIFIED
+    assert "TC083_RUN_LIVE" in result.reason
+
+
+def test_live_manifest_identifies_takeover_scenario() -> None:
+    manifest = _live_manifest(
+        HarnessRunInput(repository="owner/repo", scenario="whole-flow", takeover_issue=42),
+        "run-1",
+        "<!-- tc083:run-1 -->",
+    )
+
+    assert manifest.scenario == "live installed implement-needs takeover whole-flow"
+
+
+def test_takeover_handoff_runs_discover_then_apply_and_adopts_nested_run_id(tmp_path) -> None:
+    run_id = "live-1"
+    brief_path = tmp_path / "brief.txt"
+    brief_path.write_text("authorized " + "<!-- tc083:live-1 -->", encoding="utf-8")
+    config_path = tmp_path / "runner.json"
+    config_path.write_text("{}", encoding="utf-8")
+    discovery_path = tmp_path / "discovery.json"
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        if "discover" in command:
+            discovery_path.write_text(
+                json.dumps({"snapshot": {"digest": "snapshot-1"}}), encoding="utf-8"
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"runner": {"run_id": "runner-1"}, "status": "started"}),
+            stderr="",
+        )
+
+    with patch("temporalio_codex.full_flow_harness._runner_prefix", return_value=["spec-runner"]), patch(
+        "temporalio_codex.full_flow_harness.subprocess.run", side_effect=run
+    ):
+        payload = _run_takeover_handoff(
+            tmp_path / "skill",
+            input=HarnessRunInput(
+                repository="owner/repo",
+                brief_path=brief_path,
+                config_path=config_path,
+                takeover_issue=42,
+                takeover_workspace=tmp_path / "workspace",
+                takeover_target_ref="refs/heads/main",
+                takeover_key="takeover-42",
+                artifact_roots=(tmp_path / "artifacts",),
+                required_checks=("ci",),
+                source_thread_id="thread-1",
+            ),
+            run_id=run_id,
+            control_root=tmp_path / "control",
+            discovery_path=discovery_path,
+        )
+
+    assert payload["run_id"] == "runner-1"
+    assert payload["discovery_snapshot_digest"] == "snapshot-1"
+    assert commands[0][1:3] == ["takeover", "discover"]
+    assert commands[1][1:3] == ["takeover", "apply"]
+    assert "--issue" in commands[0] and "42" in commands[0]
+    assert "--discovery" in commands[1] and str(discovery_path) in commands[1]
+    assert "--required-check" in commands[0] and "ci" in commands[0]
+    assert "--thread-id" in commands[0] and "thread-1" in commands[0]
 
 
 def test_live_validation_rejects_installed_or_deterministic_evidence() -> None:
@@ -502,6 +582,81 @@ def test_runner_evidence_requires_cleanup_receipt_and_direct_origin_readback(tmp
     assert not evidence
     assert any("origin readback S1" in error for error in errors)
     assert any("cleanup receipt S1" in error for error in errors)
+
+
+def test_takeover_evidence_accepts_adopted_delivery_bound_to_snapshot(tmp_path) -> None:
+    run_id = "takeover-run"
+    snapshot_digest = "snapshot-1"
+    artifact_directory = tmp_path / "artifacts"
+    artifact_directory.mkdir()
+    candidate_sha = "a" * 40
+    merge_sha = "b" * 40
+    candidate = {
+        "schema_version": "spec-runner-candidate-receipt/v1",
+        "outcome": "verified",
+        "candidate_sha": candidate_sha,
+        "acceptance_version": "ticket-plan-1",
+        "checks": [{"command": ["python", "-c", "pass"], "acceptance": ["A1"], "passed": True}],
+        "write_scope": {"allowed_paths": ["src"], "changed_paths": ["src/example.py"]},
+    }
+    review = {
+        "schema_version": "spec-runner-review-result/v1",
+        "candidate_sha": candidate_sha,
+        "acceptance_version": "ticket-plan-1",
+        "findings": [],
+        "approved": True,
+        "review_digest": "review-1",
+    }
+    (artifact_directory / "spec-plan.json").write_text(
+        json.dumps({"outcome": "planned", "takeover_snapshot_digest": snapshot_digest, "specs": [{"key": "S1"}]}),
+        encoding="utf-8",
+    )
+    (artifact_directory / "ticket-plan-S1.json").write_text(
+        json.dumps({
+            "outcome": "planned", "spec_key": "S1", "takeover_snapshot_digest": snapshot_digest,
+            "tickets": [{"key": "T1"}], "github_issues": [
+                {"number": 9, "marker": "<!-- marker-spec -->"},
+                {"number": 10, "marker": "<!-- marker-ticket -->"},
+            ],
+        }), encoding="utf-8",
+    )
+    (artifact_directory / "candidate-S1.json").write_text(json.dumps(candidate), encoding="utf-8")
+    (artifact_directory / f"review-S1-{candidate_sha[:12]}.json").write_text(json.dumps(review), encoding="utf-8")
+    (artifact_directory / "delivery-S1.json").write_text(json.dumps({
+        "run_id": run_id, "spec_key": "S1", "discovery_snapshot_digest": snapshot_digest,
+        "candidate": candidate, "review": review,
+        "checks": {"candidate_sha": candidate_sha, "ready": True},
+        "pr": {"number": 12, "candidate_sha": candidate_sha},
+        "merge": {"merged": True, "sha": merge_sha, "base_sync": {"synced_sha": merge_sha}},
+        "issue_closure": {"complete": True, "issues": [{"number": 10, "state": "closed"}]},
+        "cleanup": {"outcome": "cleaned"},
+    }), encoding="utf-8")
+    errors, evidence, resources, specs = validate_takeover_evidence(
+        {"run": {"run_id": run_id, "state": "completed"}},
+        artifact_directory=artifact_directory, runner_run_id=run_id,
+        repository="owner/repo", marker="<!-- tc083:takeover -->",
+        discovery_snapshot_digest=snapshot_digest,
+    )
+    assert errors == ()
+    assert specs == ("S1",)
+    assert len(evidence) == 1
+    assert {item.resource_type for item in resources} == {"issue", "pull-request"}
+
+
+def test_takeover_evidence_rejects_a_changed_discovery_snapshot(tmp_path) -> None:
+    artifact_directory = tmp_path / "artifacts"
+    artifact_directory.mkdir()
+    (artifact_directory / "spec-plan.json").write_text(
+        json.dumps({"outcome": "planned", "takeover_snapshot_digest": "snapshot-1", "specs": [{"key": "S1"}]}),
+        encoding="utf-8",
+    )
+    errors, _, _, _ = validate_takeover_evidence(
+        {"run": {"run_id": "run-1", "state": "completed"}},
+        artifact_directory=artifact_directory, runner_run_id="run-1",
+        repository="owner/repo", marker="<!-- tc083:takeover -->",
+        discovery_snapshot_digest="snapshot-2",
+    )
+    assert any("different discovery snapshot" in error for error in errors)
 
 
 def test_default_manifest_path_is_outside_docs_specs() -> None:

@@ -263,6 +263,13 @@ class HarnessRunInput:
     brief_path: Path | None = None
     config_path: Path | None = None
     control_root: Path | None = None
+    takeover_issue: int | None = None
+    takeover_workspace: Path | None = None
+    takeover_target_ref: str | None = None
+    takeover_key: str | None = None
+    artifact_roots: tuple[Path, ...] = ()
+    required_checks: tuple[str, ...] = ()
+    source_thread_id: str | None = None
     poll_interval_seconds: float = 2.0
     poll_timeout_seconds: float = 900.0
     phases: tuple[str, ...] = (
@@ -530,13 +537,14 @@ def _capabilities(input: HarnessRunInput) -> tuple[CapabilityObservation, ...]:
 
 
 def _live_manifest(input: HarnessRunInput, run_id: str, marker: str) -> HarnessManifest:
+    mode = "takeover " if input.takeover_issue is not None else ""
     return HarnessManifest(
         schema_version="tc083-harness/v1",
         run_id=run_id,
         marker=marker,
         build_id=input.build_id,
         repository=input.repository,
-        scenario="live installed implement-needs full-flow",
+        scenario=f"live installed implement-needs {mode}{input.scenario}",
         command=input.command,
         operating_system=platform.platform(),
         status=HarnessStatus.NOT_VERIFIED,
@@ -606,6 +614,90 @@ def _run_handoff(
         config_path=input.config_path.expanduser().resolve(),
         launch_key=run_id,
     )
+
+
+def _runner_prefix() -> list[str]:
+    executable = shutil.which("spec-runner")
+    return [executable] if executable else [sys.executable, "-m", "spec_runner.cli"]
+
+
+def _run_takeover_handoff(
+    skill_root: Path,
+    *,
+    input: HarnessRunInput,
+    run_id: str,
+    control_root: Path,
+    discovery_path: Path,
+) -> dict[str, Any]:
+    if input.brief_path is None or input.config_path is None:
+        raise ValueError("live takeover requires an authorized brief and Runner config")
+    if input.takeover_issue is None or input.takeover_workspace is None or not input.takeover_target_ref or not input.takeover_key:
+        raise ValueError("live takeover requires issue, workspace, target ref and takeover key")
+    marker = marker_for(run_id)
+    if marker not in input.brief_path.expanduser().read_text(encoding="utf-8"):
+        raise ValueError("authorized brief must contain the live run marker")
+    discovery_path.parent.mkdir(parents=True, exist_ok=True)
+    roots = input.artifact_roots or (control_root,)
+    discover = [
+        *_runner_prefix(), "takeover", "discover", "--repository", input.repository,
+        "--issue", str(input.takeover_issue), "--workspace", str(input.takeover_workspace.expanduser().resolve()),
+        "--target-ref", input.takeover_target_ref, "--control-root", str(control_root),
+        "--takeover-key", input.takeover_key, "--output", str(discovery_path),
+    ]
+    for root in roots:
+        discover.extend(["--artifact-root", str(root.expanduser().resolve())])
+    for check in input.required_checks:
+        discover.extend(["--required-check", check])
+    if input.source_thread_id:
+        discover.extend(["--thread-id", input.source_thread_id])
+    discovery_result = subprocess.run(
+        discover, capture_output=True, check=False, encoding="utf-8", errors="strict",
+    )
+    if discovery_result.returncode:
+        raise RuntimeError(discovery_result.stderr.strip() or "takeover discovery failed")
+    discovery = _read_json_object(discovery_path)
+    snapshot = discovery.get("snapshot")
+    if not isinstance(snapshot, dict) or not snapshot.get("digest"):
+        raise ValueError("takeover discovery did not return a digest-bound snapshot")
+    apply = [
+        *_runner_prefix(), "takeover", "apply", "--discovery", str(discovery_path),
+        "--control-root", str(control_root), "--takeover-key", input.takeover_key,
+        "--brief", str(input.brief_path.expanduser().resolve()),
+        "--config", str(input.config_path.expanduser().resolve()), "--launch-key", run_id,
+    ]
+    applied = subprocess.run(
+        apply, capture_output=True, check=False, encoding="utf-8", errors="strict",
+    )
+    try:
+        payload = json.loads(applied.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("takeover apply returned invalid JSON") from error
+    if not isinstance(payload, dict):
+        raise TypeError("takeover apply returned a non-object")
+    if applied.returncode:
+        raise RuntimeError(applied.stderr.strip() or "takeover apply failed")
+    observed_run_id = _durable_run_id(payload)
+    if observed_run_id:
+        payload["run_id"] = observed_run_id
+    payload["discovery_snapshot_digest"] = snapshot["digest"]
+    return payload
+
+
+def _durable_run_id(payload: dict[str, Any]) -> str | None:
+    direct = payload.get("run_id")
+    if isinstance(direct, str) and direct:
+        return direct
+    for key in ("runner", "run"):
+        value = payload.get(key)
+        if not isinstance(value, dict):
+            continue
+        nested = value.get("run_id")
+        if isinstance(nested, str) and nested:
+            return nested
+        nested_run = value.get("run")
+        if isinstance(nested_run, dict) and isinstance(nested_run.get("run_id"), str) and nested_run["run_id"]:
+            return nested_run["run_id"]
+    return None
 
 
 def _runner_state(payload: dict[str, Any]) -> str:
@@ -974,6 +1066,128 @@ def validate_runner_evidence(
     return tuple(errors), tuple(evidence), tuple(resources), tuple(spec_keys)
 
 
+def validate_takeover_evidence(
+    status: dict[str, Any],
+    *,
+    artifact_directory: Path,
+    runner_run_id: str,
+    repository: str,
+    marker: str,
+    discovery_snapshot_digest: str,
+    issue_reader: Any | None = None,
+) -> tuple[tuple[str, ...], tuple[EvidenceRecord, ...], tuple[ResourceRecord, ...], tuple[str, ...]]:
+    """Validate a live run that adopted an existing Issue graph.
+
+    Takeover intentionally allows planning or worker receipts to be absent for
+    stages proven complete by the discovery snapshot. Its durable plan,
+    ticket identities, current delivery receipts, and readbacks remain required.
+    """
+    errors: list[str] = []
+    evidence: list[EvidenceRecord] = []
+    resources: list[ResourceRecord] = []
+    run = status.get("run") if isinstance(status.get("run"), dict) else {}
+    if run.get("run_id") != runner_run_id:
+        errors.append("takeover Runner status run_id does not match the launched run")
+    if _runner_state(status) != "completed":
+        errors.append(f"takeover Runner terminal state is {_runner_state(status) or 'unknown'}")
+    try:
+        spec_plan = _read_json_object(artifact_directory / "spec-plan.json")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        errors.append(f"takeover SPEC plan readback failed: {error}")
+        spec_plan = {}
+    if spec_plan.get("outcome") != "planned":
+        errors.append("takeover SPEC plan is incomplete")
+    if spec_plan.get("takeover_snapshot_digest") != discovery_snapshot_digest:
+        errors.append("takeover SPEC plan is bound to a different discovery snapshot")
+    specs = spec_plan.get("specs")
+    if not isinstance(specs, list) or any(not isinstance(item, dict) or not item.get("key") for item in specs):
+        errors.append("takeover SPEC plan has no complete keyed graph")
+        specs = []
+    spec_keys = tuple(str(item["key"]) for item in specs)
+    for spec in specs:
+        spec_key = str(spec["key"])
+        try:
+            ticket_plan = _read_json_object(artifact_directory / f"ticket-plan-{spec_key}.json")
+            candidate = _read_json_object(artifact_directory / f"candidate-{spec_key}.json")
+            delivery = _read_json_object(artifact_directory / f"delivery-{spec_key}.json")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+            errors.append(f"takeover {spec_key} artifact readback failed: {error}")
+            continue
+        if ticket_plan.get("outcome") != "planned" or ticket_plan.get("spec_key") != spec_key:
+            errors.append(f"takeover ticket plan {spec_key} is incomplete")
+        if ticket_plan.get("takeover_snapshot_digest") != discovery_snapshot_digest:
+            errors.append(f"takeover ticket plan {spec_key} is bound to a different discovery snapshot")
+        identities = ticket_plan.get("github_issues")
+        if not isinstance(identities, list) or len(identities) != len(ticket_plan.get("tickets", ())) + 1:
+            errors.append(f"takeover Issue identities {spec_key} are incomplete")
+            identities = []
+        for identity in identities:
+            if not isinstance(identity, dict) or not isinstance(identity.get("number"), int) or not identity.get("marker"):
+                errors.append(f"takeover Issue identity {spec_key} is invalid")
+                continue
+            resources.append(ResourceRecord("issue", str(identity["number"]), marker, f"{runner_run_id}:issue:{identity['number']}"))
+            if issue_reader is not None:
+                try:
+                    issue = issue_reader(repository, int(identity["number"]))
+                except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    errors.append(f"takeover Issue #{identity['number']} readback failed: {error}")
+                    continue
+                if str(identity["marker"]) not in str(issue.get("body") or ""):
+                    errors.append(f"takeover Issue #{identity['number']} marker readback does not match")
+        candidate_sha = candidate.get("candidate_sha")
+        if candidate.get("outcome") != "verified" or not isinstance(candidate_sha, str) or len(candidate_sha) != 40:
+            errors.append(f"takeover candidate {spec_key} is not verified")
+            continue
+        errors.extend(_validate_candidate_receipt(candidate, spec_key))
+        review_path = artifact_directory / f"review-{spec_key}-{candidate_sha[:12]}.json"
+        try:
+            review = _read_json_object(review_path)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+            errors.append(f"takeover review {spec_key} readback failed: {error}")
+            continue
+        if (
+            review.get("approved") is not True
+            or review.get("candidate_sha") != candidate_sha
+            or not str(review.get("review_digest") or "")
+        ):
+            errors.append(f"takeover review {spec_key} does not approve its candidate")
+        if delivery.get("run_id") != runner_run_id or delivery.get("spec_key") != spec_key:
+            errors.append(f"takeover delivery {spec_key} has the wrong Runner identity")
+        if delivery.get("discovery_snapshot_digest") != discovery_snapshot_digest:
+            errors.append(f"takeover delivery {spec_key} is bound to a different discovery snapshot")
+        if delivery.get("candidate") != candidate:
+            errors.append(f"takeover delivery {spec_key} does not match its candidate receipt")
+        delivery_review = delivery.get("review")
+        if not isinstance(delivery_review, dict) or any(delivery_review.get(key) != review.get(key) for key in ("approved", "candidate_sha", "review_digest")):
+            errors.append(f"takeover delivery {spec_key} does not match its review receipt")
+        checks = delivery.get("checks")
+        if not isinstance(checks, dict) or checks.get("candidate_sha") != candidate_sha or checks.get("ready") is not True:
+            errors.append(f"takeover checks {spec_key} do not qualify the candidate")
+        pr = delivery.get("pr")
+        if not isinstance(pr, dict) or not isinstance(pr.get("number"), int) or pr.get("candidate_sha") != candidate_sha:
+            errors.append(f"takeover PR {spec_key} is not tied to the candidate")
+        else:
+            resources.append(ResourceRecord("pull-request", str(pr["number"]), marker, f"{runner_run_id}:pr:{spec_key}"))
+        merge = delivery.get("merge")
+        if not isinstance(merge, dict) or merge.get("merged") is not True or not isinstance(merge.get("sha"), str) or len(merge["sha"]) != 40:
+            errors.append(f"takeover merge {spec_key} has no confirmed merge SHA")
+        elif not isinstance(merge.get("base_sync"), dict) or merge["base_sync"].get("synced_sha") != merge["sha"]:
+            errors.append(f"takeover origin readback {spec_key} does not match the merge SHA")
+        closure = delivery.get("issue_closure")
+        if not isinstance(closure, dict) or closure.get("complete") is not True or not isinstance(closure.get("issues"), list) or any(item.get("state") != "closed" for item in closure["issues"] if isinstance(item, dict)):
+            errors.append(f"takeover Issue closure {spec_key} is incomplete")
+        cleanup = delivery.get("cleanup")
+        if not isinstance(cleanup, dict) or cleanup.get("outcome") != "cleaned":
+            errors.append(f"takeover cleanup {spec_key} is incomplete")
+        if not any(error.startswith(f"takeover candidate {spec_key}") for error in errors):
+            evidence.append(EvidenceRecord(
+                reference=f"takeover:{runner_run_id}:{spec_key}", kind=EvidenceKind.LIVE,
+                status=EvidenceStatus.VERIFIED, operation_id=f"{runner_run_id}:takeover:{spec_key}",
+                phase="takeover-delivery", details=(("candidate_sha", candidate_sha),),
+            ))
+    return tuple(errors), tuple(evidence), tuple(resources), spec_keys
+
+
 async def run_live_harness(
     input: HarnessRunInput,
     *,
@@ -1005,14 +1219,17 @@ async def run_live_harness(
         return HarnessRunResult(HarnessStatus.NOT_VERIFIED, manifest, str(manifest_path), reason)
     control_root = input.control_root.expanduser().resolve()
     try:
+        discovery_path = manifest_path.parent / f"{run_id}-takeover-discovery.json"
+        takeover_mode = input.takeover_issue is not None
         payload = await asyncio.to_thread(
-            _run_handoff,
+            _run_takeover_handoff if takeover_mode else _run_handoff,
             skill_root,
             input=input,
             run_id=run_id,
             control_root=control_root,
+            **({"discovery_path": discovery_path} if takeover_mode else {}),
         )
-        observed_run_id = payload.get("run_id")
+        observed_run_id = _durable_run_id(payload)
         if not observed_run_id:
             reason = "installed implement-needs did not return a durable run_id"
             manifest = replace(manifest, phase="handoff", failure_reason=reason)
@@ -1028,6 +1245,22 @@ async def run_live_harness(
             phase="handoff",
             details=(("runner_status", status),),
         )
+        if takeover_mode:
+            discovery_digest = payload.get("discovery_snapshot_digest")
+            if not isinstance(discovery_digest, str) or not discovery_digest:
+                reason = "takeover apply did not return the discovery snapshot digest"
+                manifest = replace(manifest, status=HarnessStatus.BLOCKED, phase="takeover", failure_reason=reason)
+                store.update(manifest)
+                return HarnessRunResult(manifest.status, manifest, str(manifest_path), reason)
+            manifest = _append_evidence(
+                manifest,
+                reference=f"takeover-snapshot:{discovery_digest}",
+                kind=EvidenceKind.INSTALLED,
+                status=EvidenceStatus.UNKNOWN,
+                operation_id=f"{run_id}:takeover-discovery",
+                phase="takeover",
+                details=(("snapshot_path", str(discovery_path)), ("snapshot_digest", discovery_digest)),
+            )
         deadline = time.monotonic() + input.poll_timeout_seconds
         runner_status = payload
         terminal_states = {"completed", "failed", "blocked", "needs_input", "cancelled", "paused"}
@@ -1050,18 +1283,29 @@ async def run_live_harness(
             raise ValueError("live harness requires Runner config")
         artifact_directory = _runner_artifact_directory(control_root, config_path, str(observed_run_id))
         github_receipt_path = _runner_github_receipt_path(control_root, config_path)
-        errors, live_evidence, live_resources, _spec_keys = validate_runner_evidence(
-            runner_status,
-            artifact_directory=artifact_directory,
-            runner_run_id=str(observed_run_id),
-            repository=input.repository,
-            marker=manifest.marker,
-            issue_reader=_github_issue_readback,
-            github_receipt_path=github_receipt_path,
-        )
+        if takeover_mode:
+            errors, live_evidence, live_resources, _spec_keys = validate_takeover_evidence(
+                runner_status,
+                artifact_directory=artifact_directory,
+                runner_run_id=str(observed_run_id),
+                repository=input.repository,
+                marker=manifest.marker,
+                discovery_snapshot_digest=str(payload["discovery_snapshot_digest"]),
+                issue_reader=_github_issue_readback,
+            )
+        else:
+            errors, live_evidence, live_resources, _spec_keys = validate_runner_evidence(
+                runner_status,
+                artifact_directory=artifact_directory,
+                runner_run_id=str(observed_run_id),
+                repository=input.repository,
+                marker=manifest.marker,
+                issue_reader=_github_issue_readback,
+                github_receipt_path=github_receipt_path,
+            )
         evidence = tuple(
             replace(item, kind=EvidenceKind.LIVE, status=EvidenceStatus.VERIFIED)
-            if item.operation_id == f"{run_id}:handoff"
+            if item.operation_id in {f"{run_id}:handoff", f"{run_id}:takeover-discovery"}
             else item
             for item in manifest.evidence
         )
@@ -1105,6 +1349,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--brief", type=Path, help="authorized requirement brief for live mode")
     parser.add_argument("--config", type=Path, help="authorized Spec Runner config for live mode")
     parser.add_argument("--control-root", type=Path, help="explicit Spec Runner control root for live mode")
+    parser.add_argument("--takeover-issue", type=int, help="umbrella GitHub Issue for live takeover mode")
+    parser.add_argument("--takeover-workspace", type=Path, help="existing repository workspace for live takeover mode")
+    parser.add_argument("--takeover-target-ref", help="target ref for live takeover mode")
+    parser.add_argument("--takeover-key", help="stable takeover identity")
+    parser.add_argument("--artifact-root", action="append", type=Path, default=[])
+    parser.add_argument("--required-check", action="append", default=[])
+    parser.add_argument("--source-thread-id")
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--poll-timeout", type=float, default=900.0)
     args = parser.parse_args(argv)
@@ -1116,6 +1367,13 @@ def main(argv: list[str] | None = None) -> int:
         brief_path=args.brief,
         config_path=args.config,
         control_root=args.control_root,
+        takeover_issue=args.takeover_issue,
+        takeover_workspace=args.takeover_workspace,
+        takeover_target_ref=args.takeover_target_ref,
+        takeover_key=args.takeover_key,
+        artifact_roots=tuple(args.artifact_root),
+        required_checks=tuple(args.required_check),
+        source_thread_id=args.source_thread_id,
         poll_interval_seconds=args.poll_interval,
         poll_timeout_seconds=args.poll_timeout,
     )

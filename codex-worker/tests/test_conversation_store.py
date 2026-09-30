@@ -545,3 +545,18 @@ def test_structured_context_reads_are_concise_and_file_edits_remain_edits(tmp_pa
         assert activities[0]["text"] == "full config source\nsettings"
     finally:
         store.close()
+
+
+def test_context_summary_excludes_command_separator_strings(tmp_path):
+    store = ConversationStore(tmp_path / "separator.db")
+    command = 'pwsh -Command "Get-Content C:/skills/tdd/SKILL.md; Write-Output \"`n---README---\"; Get-Content README.md"'
+    try:
+        store.append(replace(
+            event(workflow_id="workflow", scope_workflow_id="workflow", operation_id="op", kind="tool_delta", text=command + "\nfull source"),
+            detail={"method": "item/completed"},
+        ))
+        activity = store.snapshot("workflow")["conversations"][0]["turns"][0]["activities"][0]
+        assert activity["summary"] == "Read context: SKILL.md, README.md"
+        assert activity["text"] == command + "\nfull source"
+    finally:
+        store.close()

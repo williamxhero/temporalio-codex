@@ -1,0 +1,487 @@
+diff --git a/src/lib/components/workflow/workflow-chat-message.svelte b/src/lib/components/workflow/workflow-chat-message.svelte
+new file mode 100644
+index 0000000..d779461
+--- /dev/null
++++ b/src/lib/components/workflow/workflow-chat-message.svelte
+@@ -0,0 +1,110 @@
++<script lang="ts">
++  import { process, render } from '$lib/utilities/render-markdown';
++
++  let { content }: { content: string } = $props();
++  let html = $state('');
++
++  $effect(() => {
++    let active = true;
++    void process(content)
++      .then(render)
++      .then((value) => {
++        if (active) html = value;
++      });
++    return () => {
++      active = false;
++    };
++  });
++</script>
++
++<div class="chat-markdown overflow-wrap-anywhere min-w-0">{@html html}</div>
++
++<style>
++  .chat-markdown :global(p) {
++    margin: 0 0 0.75rem;
++  }
++
++  .chat-markdown :global(p:last-child) {
++    margin-bottom: 0;
++  }
++
++  .chat-markdown :global(h1),
++  .chat-markdown :global(h2),
++  .chat-markdown :global(h3) {
++    margin: 1rem 0 0.5rem;
++    font-weight: 600;
++    line-height: 1.3;
++  }
++
++  .chat-markdown :global(h1) {
++    font-size: 1.5rem;
++  }
++
++  .chat-markdown :global(h2) {
++    font-size: 1.25rem;
++  }
++
++  .chat-markdown :global(ul),
++  .chat-markdown :global(ol) {
++    margin: 0.75rem 0;
++    padding-left: 1.5rem;
++  }
++
++  .chat-markdown :global(ul) {
++    list-style: disc;
++  }
++
++  .chat-markdown :global(ol) {
++    list-style: decimal;
++  }
++
++  .chat-markdown :global(li) {
++    margin: 0.25rem 0;
++  }
++
++  .chat-markdown :global(pre) {
++    margin: 0.75rem 0;
++    overflow-x: auto;
++    border: 1px solid var(--color-border-secondary);
++    border-radius: 0.5rem;
++    background: var(--color-surface-secondary);
++    padding: 0.75rem;
++    white-space: pre;
++  }
++
++  .chat-markdown :global(code) {
++    border-radius: 0.25rem;
++    background: var(--color-surface-secondary);
++    padding: 0.1rem 0.25rem;
++    font-family: monospace;
++  }
++
++  .chat-markdown :global(pre code) {
++    background: none;
++    padding: 0;
++  }
++
++  .chat-markdown :global(a) {
++    color: var(--color-content-brand);
++    text-decoration: underline;
++  }
++
++  .chat-markdown :global(blockquote) {
++    margin: 0.75rem 0;
++    border-left: 3px solid var(--color-border-brand);
++    padding-left: 0.75rem;
++  }
++
++  .chat-markdown :global(table) {
++    display: block;
++    max-width: 100%;
++    overflow-x: auto;
++    border-collapse: collapse;
++  }
++
++  .chat-markdown :global(th),
++  .chat-markdown :global(td) {
++    border: 1px solid var(--color-border-secondary);
++    padding: 0.375rem 0.75rem;
++  }
++</style>
+diff --git a/src/lib/components/workflow/workflow-chat.svelte b/src/lib/components/workflow/workflow-chat.svelte
+new file mode 100644
+index 0000000..36199cc
+--- /dev/null
++++ b/src/lib/components/workflow/workflow-chat.svelte
+@@ -0,0 +1,207 @@
++<script lang="ts">
++  import { onMount } from 'svelte';
++
++  import { page } from '$app/state';
++
++  import { IconCodex, IconSpinner } from '$lib/io/icon';
++  import WorkflowChatMessage from '$lib/components/workflow/workflow-chat-message.svelte';
++
++  type WorkingItem = { kind: string; text: string };
++  type Turn = {
++    id: string;
++    turnId?: string;
++    input: string;
++    output: string;
++    working: WorkingItem[];
++    status: 'queued' | 'running' | 'completed' | 'failed';
++    updatedAt: number;
++  };
++  type Conversation = {
++    id: string;
++    threadId?: string;
++    stage: string;
++    role: string;
++    turns: Turn[];
++    updatedAt: number;
++  };
++  type Snapshot = { conversations: Conversation[]; cursor: number };
++
++  let conversations = $state<Conversation[]>([]);
++  let loading = $state(true);
++  let error = $state('');
++  let connected = $state(false);
++  let stream: EventSource | undefined;
++
++  const workflowId = $derived(page.params.workflow);
++  const conversationOrigin =
++    typeof window === 'undefined'
++      ? 'http://127.0.0.1:18001'
++      : `http://${window.location.hostname}:18001`;
++  const endpoint = $derived(
++    `${conversationOrigin}/api/v1/codex/conversations?workflow_id=${encodeURIComponent(workflowId)}`,
++  );
++  const streamEndpoint = $derived(
++    `${conversationOrigin}/api/v1/codex/stream?workflow_id=${encodeURIComponent(workflowId)}`,
++  );
++
++  const applySnapshot = (snapshot: Snapshot) => {
++    conversations = snapshot.conversations;
++    loading = false;
++    error = '';
++  };
++
++  const load = async () => {
++    try {
++      const response = await fetch(endpoint);
++      if (!response.ok)
++        throw new Error(`Conversation service returned ${response.status}`);
++      applySnapshot((await response.json()) as Snapshot);
++    } catch (cause) {
++      loading = false;
++      error =
++        cause instanceof Error
++          ? cause.message
++          : 'Conversation service unavailable';
++    }
++  };
++
++  onMount(() => {
++    void load();
++    stream = new EventSource(streamEndpoint);
++    stream.addEventListener('conversations', (event) => {
++      applySnapshot(JSON.parse((event as MessageEvent).data) as Snapshot);
++      connected = true;
++    });
++    stream.onerror = () => {
++      connected = false;
++    };
++    return () => stream?.close();
++  });
++</script>
++
++<section class="flex min-h-[28rem] flex-col gap-6" data-testid="workflow-chat">
++  <div class="flex items-center justify-between gap-4">
++    <div>
++      <h2 class="text-lg font-semibold text-primary">Chat</h2>
++      <p class="mt-1 text-sm text-secondary">
++        Codex conversations attached to this Workflow execution.
++      </p>
++    </div>
++    <div
++      class="flex items-center gap-2 text-xs text-secondary"
++      aria-live="polite"
++    >
++      <span
++        class={`h-2 w-2 rounded-full ${connected ? 'bg-content-static-success' : 'bg-content-tertiary'}`}
++      ></span>
++      {connected ? 'Live' : 'History'}
++    </div>
++  </div>
++
++  {#if loading}
++    <div class="flex items-center gap-2 py-12 text-sm text-secondary">
++      <IconSpinner class="h-4 w-4 animate-spin" /> Loading conversation history...
++    </div>
++  {:else if error}
++    <div
++      class="border border-primary bg-surface-secondary p-4 text-sm text-secondary"
++    >
++      {error}. Start the Codex Worker with conversation capture enabled to see
++      this tab.
++    </div>
++  {:else if conversations.length === 0}
++    <div
++      class="border border-dashed border-primary px-6 py-12 text-center text-sm text-secondary"
++    >
++      No Codex conversation has been recorded for this execution yet.
++    </div>
++  {:else}
++    <div class="flex flex-col gap-10">
++      {#each conversations as conversation (conversation.id)}
++        <article
++          class="flex flex-col gap-6"
++          data-thread-id={conversation.threadId ?? conversation.id}
++        >
++          <div class="flex items-center gap-3 border-b border-primary pb-3">
++            <span
++              class="flex h-8 w-8 items-center justify-center rounded-full bg-surface-secondary text-primary"
++            >
++              <IconCodex class="h-4 w-4" />
++            </span>
++            <div class="min-w-0">
++              <div class="font-medium text-primary">{conversation.role}</div>
++              <div class="truncate font-mono text-xs text-secondary">
++                {conversation.threadId ?? 'thread pending'} · {conversation.stage}
++              </div>
++            </div>
++          </div>
++
++          {#each conversation.turns as turn (turn.id)}
++            <div class="flex flex-col gap-5">
++              {#if turn.input}
++                <div class="flex justify-end">
++                  <div
++                    class="max-w-3xl rounded-2xl rounded-br-md bg-surface-secondary px-4 py-3 text-sm leading-6 text-primary"
++                  >
++                    <div
++                      class="mb-2 text-[11px] font-medium uppercase tracking-wide text-secondary"
++                    >
++                      Workflow input
++                    </div>
++                    <WorkflowChatMessage content={turn.input} />
++                  </div>
++                </div>
++              {/if}
++
++              {#if turn.working.length}
++                <details class="max-w-3xl text-sm text-secondary">
++                  <summary class="cursor-pointer select-none"
++                    >Working details</summary
++                  >
++                  <div
++                    class="mt-3 flex flex-col gap-3 border-l border-primary pl-4"
++                  >
++                    {#each turn.working as item}
++                      <div>
++                        <div
++                          class="mb-1 text-[11px] font-medium uppercase tracking-wide"
++                        >
++                          {item.kind}
++                        </div>
++                        <pre
++                          class="whitespace-pre-wrap font-sans leading-6">{item.text}</pre>
++                      </div>
++                    {/each}
++                  </div>
++                </details>
++              {/if}
++
++              {#if turn.output}
++                <div class="flex gap-3">
++                  <span
++                    class="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surface-secondary text-primary"
++                  >
++                    <IconCodex class="h-4 w-4" />
++                  </span>
++                  <div class="min-w-0 max-w-4xl text-sm leading-7 text-primary">
++                    <div
++                      class="mb-2 text-[11px] font-medium uppercase tracking-wide text-secondary"
++                    >
++                      Codex
++                    </div>
++                    <WorkflowChatMessage content={turn.output} />
++                    {#if turn.status === 'running'}
++                      <span
++                        class="mt-2 inline-block h-4 w-1 animate-pulse bg-content-primary"
++                      ></span>
++                    {/if}
++                  </div>
++                </div>
++              {/if}
++            </div>
++          {/each}
++        </article>
++      {/each}
++    </div>
++  {/if}
++</section>
+diff --git a/src/lib/i18n/locales/en/workflows.ts b/src/lib/i18n/locales/en/workflows.ts
+index b151c8f..892641c 100644
+--- a/src/lib/i18n/locales/en/workflows.ts
++++ b/src/lib/i18n/locales/en/workflows.ts
+@@ -141,6 +141,7 @@ export const Strings = {
+   'pause-success': 'Workflow paused',
+   'unpause-success': 'Workflow unpaused',
+   'timeline-tab': 'Timeline',
++  'chat-tab': 'Chat',
+   'hide-idle-time': 'Hide idle time',
+   'show-idle-time': 'Show idle time',
+   'hide-idle-time-segment': 'Hide {{distance}} time segment',
+diff --git a/src/lib/layouts/workflow-header.svelte b/src/lib/layouts/workflow-header.svelte
+index 387740d..a347da7 100644
+--- a/src/lib/layouts/workflow-header.svelte
++++ b/src/lib/layouts/workflow-header.svelte
+@@ -53,6 +53,7 @@
+     routeForWorkflows,
+     routeForWorkflowSearchAttributes,
+     routeForWorkflowWorkers,
++    routeForWorkflowChat,
+   } from '$lib/utilities/route-for';
+   import { isWorkflowTaskFailure } from '$lib/utilities/workflow-task-failures';
+ 
+@@ -277,6 +278,15 @@
+   />
+   <Tabs>
+     <TabList label="workflow detail">
++      <Tab
++        label={translate('workflows.chat-tab')}
++        id="chat-tab"
++        href={routeForWorkflowChat(routeParameters)}
++        active={pathMatches(
++          page.url.pathname,
++          routeForWorkflowChat(routeParameters),
++        )}
++      />
+       <Tab
+         label={translate('workflows.timeline-tab')}
+         id="timeline-tab"
+diff --git a/src/lib/utilities/route-for-base-path.test.ts b/src/lib/utilities/route-for-base-path.test.ts
+index 03ff979..74ebac0 100644
+--- a/src/lib/utilities/route-for-base-path.test.ts
++++ b/src/lib/utilities/route-for-base-path.test.ts
+@@ -59,6 +59,7 @@ import {
+   routeForWorkers,
+   routeForWorkersWithQuery,
+   routeForWorkflow,
++  routeForWorkflowChat,
+   routeForWorkflowMemo,
+   routeForWorkflowQuery,
+   routeForWorkflows,
+@@ -112,6 +113,7 @@ describe('routeFor functions should resolve the base path exactly once', () => {
+       () => routeForArchivalWorkflows(namespaceParams),
+     ],
+     ['routeForWorkflow', () => routeForWorkflow(workflowParams)],
++    ['routeForWorkflowChat', () => routeForWorkflowChat(workflowParams)],
+     ['routeForSchedules', () => routeForSchedules(namespaceParams)],
+     ['routeForScheduleCreate', () => routeForScheduleCreate(namespaceParams)],
+     ['routeForSchedule', () => routeForSchedule(scheduleParams)],
+@@ -366,6 +368,7 @@ describe('routeFor functions with prefix should resolve base + prefix correctly'
+       () => routeForArchivalWorkflows(namespaceParams),
+     ],
+     ['routeForWorkflow', () => routeForWorkflow(workflowParams)],
++    ['routeForWorkflowChat', () => routeForWorkflowChat(workflowParams)],
+     ['routeForSchedules', () => routeForSchedules(namespaceParams)],
+     ['routeForScheduleCreate', () => routeForScheduleCreate(namespaceParams)],
+     ['routeForSchedule', () => routeForSchedule(scheduleParams)],
+diff --git a/src/lib/utilities/route-for.ts b/src/lib/utilities/route-for.ts
+index c9efdf7..8f03eca 100644
+--- a/src/lib/utilities/route-for.ts
++++ b/src/lib/utilities/route-for.ts
+@@ -1,14 +1,8 @@
+-import { get } from 'svelte/store';
+-
+ import { BROWSER } from 'esm-env';
+ 
+ import { resolve } from '$app/paths';
+ import type { ResolvedPathname } from '$app/types';
+ 
+-import {
+-  eventFilterSort,
+-  workflowViewPreference,
+-} from '$lib/stores/event-view';
+ import type { EventView } from '$lib/types/events';
+ import type { Settings } from '$lib/types/global';
+ import { encodeURIForSvelte } from '$lib/utilities/encode-uri';
+@@ -396,31 +390,16 @@ export const routeForTimeline = ({
+   return toURL(path, queryParams);
+ };
+ 
++export const routeForWorkflowChat = (
++  parameters: WorkflowParameters,
++): ResolvedPathname => {
++  return `${baseRouteForWorkflow(parameters)}/chat`;
++};
++
+ export const routeForWorkflow = ({
+-  queryParams,
+   ...parameters
+ }: EventHistoryParameters & { archival?: boolean }): ResolvedPathname => {
+-  if (!BROWSER) return routeForTimeline({ ...parameters, queryParams });
+-
+-  const view = get(workflowViewPreference);
+-  const sort = get(eventFilterSort);
+-  const params: Record<string, string> = {
+-    ...(sort !== 'descending' && { sort }),
+-    ...queryParams,
+-  };
+-
+-  const hasParams = Object.keys(params).length > 0;
+-
+-  if (view === 'history') {
+-    return routeForEventHistory({
+-      ...parameters,
+-      ...(hasParams && { queryParams: params }),
+-    });
+-  }
+-  return routeForTimeline({
+-    ...parameters,
+-    ...(hasParams && { queryParams: params }),
+-  });
++  return routeForWorkflowChat(parameters);
+ };
+ 
+ export const routeForWorkers = (
+diff --git a/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts b/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts
+index eaac44d..c188f04 100644
+--- a/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts
++++ b/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts
+@@ -3,5 +3,5 @@ import { redirect } from '@sveltejs/kit';
+ import type { PageLoad } from './$types';
+ 
+ export const load: PageLoad = async function ({ url }) {
+-  redirect(302, `${url.pathname}/timeline`);
++  redirect(302, `${url.pathname}/chat`);
+ };
+diff --git a/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/chat/+page.svelte b/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/chat/+page.svelte
+new file mode 100644
+index 0000000..df87936
+--- /dev/null
++++ b/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/chat/+page.svelte
+@@ -0,0 +1,15 @@
++<script lang="ts">
++  import { page } from '$app/state';
++
++  import PageTitle from '$lib/components/page-title.svelte';
++  import WorkflowChat from '$lib/components/workflow/workflow-chat.svelte';
++  import { translate } from '$lib/i18n/translate';
++
++  const workflow = $derived(page.params.workflow);
++</script>
++
++<PageTitle
++  title={`${translate('workflows.chat-tab')} | ${workflow}`}
++  url={page.url.href}
++/>
++<WorkflowChat />

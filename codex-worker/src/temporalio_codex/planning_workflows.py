@@ -1,6 +1,9 @@
+import asyncio
 from datetime import timedelta
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     from temporalio_codex.planning_activities import prepare_grill
@@ -37,6 +40,7 @@ class RequirementPlanningWorkflow:
         self._published_specs = ()
         self._publication_reason = ""
         self._publication_resolution: SpecPublicationResult | None = None
+        self._publication_retry_requested = False
         self._cancelled = False
         self._paused = False
 
@@ -110,31 +114,52 @@ class RequirementPlanningWorkflow:
             return self._planning_result()
         self._phase = PlanningPhase.READY
         self._status = PlanningStatus.PUBLISHING
-        publication = await workflow.execute_activity(
-            publish_spec_issues,
-            SpecPublicationInput(
-                repository="williamxhero/temporalio-codex",
-                umbrella_issue_number=input.umbrella_issue_number,
-                source_identity=self._source.source_identity if self._source else "",
-                operation_id=self._publication_operation_id or "",
-                drafts=input.specs,
-            ),
-            start_to_close_timeout=timedelta(seconds=30),
-        )
-        self._published_specs = publication.issues
-        self._publication_reason = publication.reason
-        if publication.status is SpecPublicationStatus.UNKNOWN:
+        publication = await self._publish_specs(input)
+        while publication.status is SpecPublicationStatus.UNKNOWN:
             self._status = PlanningStatus.UNKNOWN
-            await workflow.wait_condition(
-                lambda: self._publication_resolution is not None or self._cancelled
-            )
+            if input.parent_workflow_id:
+                await workflow.get_external_workflow_handle(
+                    input.parent_workflow_id
+                ).signal(
+                    "planning_blocked",
+                    publication.reason or "SPEC publication readback is unknown",
+                )
+            try:
+                await workflow.wait_condition(
+                    lambda: (
+                        self._publication_resolution is not None
+                        or self._publication_retry_requested
+                        or self._cancelled
+                    ),
+                    timeout=input.publication_timeout_seconds,
+                    timeout_summary="spec-publication-readback",
+                )
+            except asyncio.TimeoutError:
+                self._status = PlanningStatus.BLOCKED
+                self._publication_reason = (
+                    "SPEC publication readback timed out after "
+                    f"{input.publication_timeout_seconds:g} seconds; "
+                    "recheck operation identities before retry"
+                )
+                if input.parent_workflow_id:
+                    await workflow.get_external_workflow_handle(
+                        input.parent_workflow_id
+                    ).signal("planning_blocked", self._publication_reason)
+                return self._planning_result()
             if self._cancelled:
                 return self._cancelled_result()
+            if self._publication_retry_requested:
+                self._publication_retry_requested = False
+                self._publication_resolution = None
+                self._status = PlanningStatus.PUBLISHING
+                publication = await self._publish_specs(input)
+                continue
             publication = self._publication_resolution
             self._publication_resolution = None
             assert publication is not None
             self._published_specs = publication.issues
             self._publication_reason = publication.reason
+            break
         if publication.status is not SpecPublicationStatus.VERIFIED:
             self._status = (
                 PlanningStatus.BLOCKED
@@ -145,6 +170,33 @@ class RequirementPlanningWorkflow:
         self._phase = PlanningPhase.COMPLETED
         self._status = PlanningStatus.COMPLETED
         return self._planning_result()
+
+    async def _publish_specs(self, input: PlanningInput) -> SpecPublicationResult:
+        try:
+            publication = await workflow.execute_activity(
+                publish_spec_issues,
+                SpecPublicationInput(
+                    repository=input.repository,
+                    umbrella_issue_number=input.umbrella_issue_number,
+                    source_identity=self._source.source_identity if self._source else "",
+                    operation_id=self._publication_operation_id or "",
+                    drafts=input.specs,
+                ),
+                start_to_close_timeout=timedelta(
+                    seconds=max(30.0, input.publication_timeout_seconds)
+                ),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        except ActivityError as error:
+            publication = SpecPublicationResult(
+                SpecPublicationStatus.UNKNOWN,
+                self._published_specs,
+                "SPEC publication activity failed; recheck operation identities before retry: "
+                f"{type(error.cause).__name__}",
+            )
+        self._published_specs = publication.issues
+        self._publication_reason = publication.reason
+        return publication
 
     def _planning_result(self) -> PlanningResult:
         assert self._source is not None
@@ -247,6 +299,28 @@ class RequirementPlanningWorkflow:
             return False
         self._publication_resolution = result
         return True
+
+    @workflow.update(name="retry_spec_publication")
+    async def retry_spec_publication(self) -> bool:
+        if self._status is not PlanningStatus.UNKNOWN:
+            return False
+        self._publication_retry_requested = True
+        return True
+
+    @workflow.signal(name="retry_spec_publication_signal")
+    async def retry_spec_publication_signal(self) -> None:
+        if self._status is PlanningStatus.UNKNOWN:
+            self._publication_retry_requested = True
+
+    @workflow.signal(name="resolve_spec_publication_signal")
+    async def resolve_spec_publication_signal(
+        self, result: SpecPublicationResult
+    ) -> None:
+        if (
+            self._status is PlanningStatus.UNKNOWN
+            and result.status is not SpecPublicationStatus.UNKNOWN
+        ):
+            self._publication_resolution = result
 
     @workflow.signal(name="cancel_planning")
     async def cancel_planning(self) -> None:

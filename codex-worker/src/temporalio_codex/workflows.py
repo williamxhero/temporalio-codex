@@ -24,6 +24,19 @@ with workflow.unsafe.imports_passed_through():
     )
 
 
+_PROJECT_SKILLS_BY_ROLE: dict[str, tuple[str, ...]] = {
+    "planning": (
+        ".claude/skills/implement-spec/SKILL.md",
+        ".claude/skills/to-tickets/SKILL.md",
+    ),
+    "implementation": (
+        ".claude/skills/implement/SKILL.md",
+        ".claude/skills/tdd/SKILL.md",
+    ),
+    "review": (".claude/skills/review/SKILL.md",),
+}
+
+
 @workflow.defn
 class CodexRunWorkflow:
     def __init__(self) -> None:
@@ -75,8 +88,9 @@ class CodexRunWorkflow:
                 self._status = RunStatus.WAITING_FOR_INPUT
                 self._pending_input = f"Input required for stage: {stage.key}"
                 await workflow.wait_condition(
-                    lambda: self._answer is not None
-                    or self._status is RunStatus.CANCELLED
+                    lambda: (
+                        self._answer is not None or self._status is RunStatus.CANCELLED
+                    )
                 )
                 if self._status is RunStatus.CANCELLED:
                     return self._cancelled_result()
@@ -134,8 +148,10 @@ class CodexRunWorkflow:
                 if stage_result.outcome is StageOutcome.UNKNOWN:
                     self._status = RunStatus.WAITING_FOR_EXTERNAL_OBSERVATION
                     await workflow.wait_condition(
-                        lambda: self._external_resolution is not None
-                        or self._status is RunStatus.CANCELLED
+                        lambda: (
+                            self._external_resolution is not None
+                            or self._status is RunStatus.CANCELLED
+                        )
                     )
                     if self._status is RunStatus.CANCELLED:
                         return self._cancelled_result()
@@ -165,8 +181,10 @@ class CodexRunWorkflow:
                         self._external_resolution = None
                         self._status = RunStatus.WAITING_FOR_EXTERNAL_OBSERVATION
                         await workflow.wait_condition(
-                            lambda: self._external_resolution is not None
-                            or self._status is RunStatus.CANCELLED
+                            lambda: (
+                                self._external_resolution is not None
+                                or self._status is RunStatus.CANCELLED
+                            )
                         )
                         if self._status is RunStatus.CANCELLED:
                             return self._cancelled_result()
@@ -236,6 +254,9 @@ class CodexRunWorkflow:
                     effort=stage.effort,
                     prompt=prompt,
                     thread_id=thread_id,
+                    parent_workflow_id=input.parent_workflow_id,
+                    workflow_run_id=workflow.info().run_id,
+                    parent_workflow_run_id=input.parent_workflow_run_id,
                 ),
                 start_to_close_timeout=timedelta(
                     seconds=stage.start_to_close_timeout_seconds
@@ -255,8 +276,7 @@ class CodexRunWorkflow:
             self._pending_input = observation.pending_question
             self._answer = None
             await workflow.wait_condition(
-                lambda: self._answer is not None
-                or self._status is RunStatus.CANCELLED
+                lambda: self._answer is not None or self._status is RunStatus.CANCELLED
             )
             if self._status is RunStatus.CANCELLED:
                 return self._stage_result_from_codex(stage, observation)
@@ -278,7 +298,17 @@ class CodexRunWorkflow:
         stage: StageDefinition,
         answer: str | None,
     ) -> str:
-        prompt = f"Role: {stage.role.value}\nRequirement: {requirement}"
+        skill_paths = _PROJECT_SKILLS_BY_ROLE.get(stage.role.value, ())
+        skill_instructions = "\n".join(f"- {path}" for path in skill_paths)
+        prompt = (
+            f"Role: {stage.role.value}\n"
+            f"Requirement: {requirement}\n"
+            "Execution policy: read and follow the required project-local skills "
+            "below from the repository root before acting. Use their default "
+            "values and continue automatically without requesting human "
+            "confirmation. Do not use global or external skill copies.\n"
+            f"Required project-local skills:\n{skill_instructions}"
+        )
         if answer is not None:
             prompt += f"\nBusiness answer: {answer}"
         return prompt
@@ -325,8 +355,10 @@ class CodexRunWorkflow:
         if self._status is not RunStatus.PAUSED:
             return
         await workflow.wait_condition(
-            lambda: self._status is not RunStatus.PAUSED
-            or self._status is RunStatus.CANCELLED
+            lambda: (
+                self._status is not RunStatus.PAUSED
+                or self._status is RunStatus.CANCELLED
+            )
         )
 
     @workflow.update(name="pause")

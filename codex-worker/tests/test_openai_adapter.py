@@ -1,4 +1,3 @@
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -7,9 +6,10 @@ import pytest
 from temporalio_codex.codex_models import (
     CodexFailure,
     CodexOperation,
-    CodexRole,
     CodexOutcome,
+    CodexRole,
 )
+from temporalio_codex.conversation_store import ConversationStore
 from temporalio_codex.openai_adapter import OpenAICodexAdapter
 
 
@@ -40,6 +40,17 @@ def adapter_for(result):
     return OpenAICodexAdapter(lambda: codex, "0.155.1"), codex, thread
 
 
+class StreamingTurn:
+    id = "turn-stream"
+
+    def __init__(self, events):
+        self.events = events
+
+    async def stream(self):
+        for event in self.events:
+            yield event
+
+
 async def test_production_adapter_maps_completed_turn_without_live_call() -> None:
     result = SimpleNamespace(
         id="turn-1",
@@ -57,6 +68,196 @@ async def test_production_adapter_maps_completed_turn_without_live_call() -> Non
     assert observation.summary == "plan complete"
     codex.thread_start.assert_awaited_once()
     thread.turn.assert_called_once()
+
+
+async def test_stream_deltas_are_persisted_as_one_conversation_turn(tmp_path) -> None:
+    completed = SimpleNamespace(
+        id="turn-stream",
+        status=SimpleNamespace(value="completed"),
+        error=None,
+    )
+    events = [
+        SimpleNamespace(
+            method="item/plan/delta",
+            payload=SimpleNamespace(
+                thread_id="thread-stream", turn_id="turn-stream", delta="outline"
+            ),
+        ),
+        SimpleNamespace(
+            method="item/agentMessage/delta",
+            payload=SimpleNamespace(
+                thread_id="thread-stream", turn_id="turn-stream", delta="hello "
+            ),
+        ),
+        SimpleNamespace(
+            method="item/reasoning/textDelta",
+            payload=SimpleNamespace(
+                thread_id="thread-stream", turn_id="turn-stream", delta="thinking"
+            ),
+        ),
+        SimpleNamespace(
+            method="item/agentMessage/delta",
+            payload=SimpleNamespace(
+                thread_id="thread-stream", turn_id="turn-stream", delta="world"
+            ),
+        ),
+        SimpleNamespace(
+            method="item/completed",
+            payload=SimpleNamespace(
+                item=SimpleNamespace(type="agentMessage", text="hello world")
+            ),
+        ),
+        SimpleNamespace(
+            method="turn/completed",
+            payload=SimpleNamespace(turn=completed),
+        ),
+    ]
+    turn = StreamingTurn(events)
+    thread = MagicMock(id="thread-stream")
+    thread.turn.return_value = turn
+    codex = SimpleNamespace(
+        thread_start=AsyncMock(return_value=thread),
+        close=AsyncMock(),
+    )
+    store = ConversationStore(tmp_path / "conversations.sqlite3")
+    try:
+        current_operation = operation()
+        current_operation = current_operation.__class__(
+            **{
+                **current_operation.__dict__,
+                "parent_workflow_id": "parent-workflow",
+            }
+        )
+        adapter = OpenAICodexAdapter(lambda: codex, "0.155.1", store)
+
+        observation = await adapter.execute(current_operation)
+        snapshot = store.snapshot("parent-workflow")
+
+        assert observation.summary == "hello world"
+        turn_snapshot = snapshot["conversations"][0]["turns"][0]
+        assert turn_snapshot["input"] == "make a plan"
+        assert turn_snapshot["output"] == "hello world"
+        assert turn_snapshot["working"] == [
+            {"kind": "plan", "text": "outline"},
+            {"kind": "reasoning", "text": "thinking"},
+        ]
+        assert turn_snapshot["status"] == "completed"
+    finally:
+        store.close()
+
+
+async def test_same_operation_id_in_different_workflow_runs_is_not_cached_or_deduplicated(
+    tmp_path,
+) -> None:
+    result = SimpleNamespace(
+        id="turn-1",
+        status=SimpleNamespace(value="completed"),
+        final_response="response",
+        error=None,
+    )
+    thread = MagicMock(id="thread-1")
+    thread.turn.side_effect = [
+        SimpleNamespace(id="turn-1", run=AsyncMock(return_value=result)),
+        SimpleNamespace(id="turn-2", run=AsyncMock(return_value=result)),
+    ]
+    codex = SimpleNamespace(
+        thread_start=AsyncMock(return_value=thread),
+        close=AsyncMock(),
+    )
+    store = ConversationStore(tmp_path / "conversations.sqlite3")
+    try:
+        adapter = OpenAICodexAdapter(lambda: codex, "0.155.1", store)
+        first = operation().__class__(
+            **{**operation().__dict__, "workflow_run_id": "workflow-run-1"}
+        )
+        second = operation().__class__(
+            **{**operation().__dict__, "workflow_run_id": "workflow-run-2"}
+        )
+
+        await adapter.execute(first)
+        await adapter.execute(second)
+
+        assert thread.turn.call_count == 2
+        assert [
+            turn["input"]
+            for conversation in store.snapshot("run-1", "workflow-run-1")[
+                "conversations"
+            ]
+            for turn in conversation["turns"]
+        ] == ["make a plan"]
+        assert [
+            turn["input"]
+            for conversation in store.snapshot("run-1", "workflow-run-2")[
+                "conversations"
+            ]
+            for turn in conversation["turns"]
+        ] == ["make a plan"]
+    finally:
+        store.close()
+
+
+async def test_existing_thread_history_is_persisted_for_workflow_chat(tmp_path) -> None:
+    result = SimpleNamespace(
+        id="turn-current",
+        status=SimpleNamespace(value="completed"),
+        final_response="current response",
+        error=None,
+    )
+    historical_user = SimpleNamespace(
+        root=SimpleNamespace(
+            id="item-user",
+            type="userMessage",
+            content=[SimpleNamespace(root=SimpleNamespace(type="text", text="old prompt"))],
+        )
+    )
+    historical_agent = SimpleNamespace(
+        root=SimpleNamespace(
+            id="item-agent",
+            type="agentMessage",
+            text="old response",
+        )
+    )
+    thread = MagicMock(id="thread-existing")
+    thread.read = AsyncMock(
+        return_value=SimpleNamespace(
+            thread=SimpleNamespace(
+                turns=[
+                    SimpleNamespace(
+                        id="turn-old",
+                        items=[historical_user, historical_agent],
+                    )
+                ]
+            )
+        )
+    )
+    thread.turn.return_value = SimpleNamespace(
+        id="turn-current",
+        run=AsyncMock(return_value=result),
+    )
+    codex = SimpleNamespace(
+        thread_resume=AsyncMock(return_value=thread),
+        close=AsyncMock(),
+    )
+    store = ConversationStore(tmp_path / "conversations.sqlite3")
+    try:
+        current_operation = operation().__class__(
+            **{
+                **operation().__dict__,
+                "thread_id": "thread-existing",
+                "run_id": "workflow",
+            }
+        )
+        adapter = OpenAICodexAdapter(lambda: codex, "0.155.1", store)
+
+        await adapter.execute(current_operation)
+        snapshot = store.snapshot("workflow")
+        turns = snapshot["conversations"][0]["turns"]
+
+        assert [turn["input"] for turn in turns] == ["old prompt", "make a plan"]
+        assert [turn["output"] for turn in turns] == ["old response", "current response"]
+        thread.read.assert_awaited_once_with(include_turns=True)
+    finally:
+        store.close()
 
 
 async def test_unknown_sdk_error_requires_readback_and_is_cached() -> None:
@@ -87,7 +288,7 @@ async def test_unknown_sdk_error_requires_readback_and_is_cached() -> None:
     ("error", "failure"),
     [
         (RuntimeError("secret-provider-detail"), CodexFailure.UNKNOWN),
-        (asyncio.TimeoutError(), CodexFailure.TIMEOUT),
+        (TimeoutError(), CodexFailure.TIMEOUT),
         (ConnectionError("private provider detail"), CodexFailure.STREAM_DISCONNECTED),
     ],
 )

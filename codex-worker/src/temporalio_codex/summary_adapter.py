@@ -285,14 +285,18 @@ class GhCliSummaryCommentGateway:
 
     @staticmethod
     def _run(args: list[str]):
-        result = subprocess.run(args, capture_output=True, check=False, text=True)
+        result = subprocess.run(
+            args, capture_output=True, check=False, text=True, encoding="utf-8"
+        )
         if result.returncode:
             raise RuntimeError("GitHub API request failed")
         return json.loads(result.stdout)
 
     @staticmethod
     def _run_command(args: list[str]) -> None:
-        result = subprocess.run(args, capture_output=True, check=False, text=True)
+        result = subprocess.run(
+            args, capture_output=True, check=False, text=True, encoding="utf-8"
+        )
         if result.returncode:
             raise RuntimeError("GitHub comment request failed")
 

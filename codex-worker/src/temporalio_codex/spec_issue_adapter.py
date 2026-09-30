@@ -308,14 +308,18 @@ class GhCliSpecIssueGateway:
 
     @staticmethod
     def _run(args: list[str]):
-        result = subprocess.run(args, capture_output=True, check=False, text=True)
+        result = subprocess.run(
+            args, capture_output=True, check=False, text=True, encoding="utf-8"
+        )
         if result.returncode:
             raise RuntimeError("GitHub API request failed")
         return json.loads(result.stdout)
 
     @staticmethod
     def _run_text(args: list[str]) -> str:
-        result = subprocess.run(args, capture_output=True, check=False, text=True)
+        result = subprocess.run(
+            args, capture_output=True, check=False, text=True, encoding="utf-8"
+        )
         if result.returncode:
             raise RuntimeError("GitHub SPEC issue creation failed")
         return result.stdout.strip()

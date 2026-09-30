@@ -43,6 +43,8 @@ class RunInput:
     stages: tuple[StageDefinition, ...] = field(
         default_factory=lambda: (StageDefinition(key="foundation"),)
     )
+    parent_workflow_id: str | None = None
+    parent_workflow_run_id: str | None = None
 
 
 @dataclass(frozen=True)

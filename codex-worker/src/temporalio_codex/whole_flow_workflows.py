@@ -26,6 +26,7 @@ with workflow.unsafe.imports_passed_through():
         TicketPublicationInput,
         TicketPublicationStatus,
     )
+    from temporalio_codex.spec_issue_adapter import SpecPublicationResult, SpecPublicationStatus
     from temporalio_codex.workflows import CodexRunWorkflow
 
 
@@ -125,6 +126,55 @@ class RequirementDeliveryWorkflow:
         self._reason = ""
         return True
 
+    @workflow.signal(name="planning_blocked")
+    async def planning_blocked(self, reason: str) -> None:
+        self._phase = WholeFlowPhase.BLOCKED
+        self._status = WholeFlowStatus.NOT_VERIFIED
+        self._reason = reason
+        self._next_action = "recheck SPEC publication identities or retry publication"
+
+    @workflow.signal(name="planning_resumed")
+    async def planning_resumed(self) -> None:
+        if self._phase is WholeFlowPhase.BLOCKED:
+            self._phase = WholeFlowPhase.PLANNING
+        self._status = WholeFlowStatus.ACTIVE
+        self._reason = ""
+        self._next_action = "complete Grill and publish SPEC Issues"
+
+    @workflow.update(name="retry_spec_publication")
+    async def retry_spec_publication(self) -> bool:
+        if (
+            self._phase not in (WholeFlowPhase.PLANNING, WholeFlowPhase.BLOCKED)
+            or self._active_child_id != f"{workflow.info().workflow_id}:planning"
+            or self._paused
+        ):
+            return False
+        await workflow.get_external_workflow_handle(self._active_child_id).signal(
+            "retry_spec_publication_signal"
+        )
+        self._phase = WholeFlowPhase.PLANNING
+        self._status = WholeFlowStatus.ACTIVE
+        self._reason = ""
+        self._next_action = "complete Grill and publish SPEC Issues"
+        return True
+
+    @workflow.update(name="resolve_spec_publication")
+    async def resolve_spec_publication(self, result: SpecPublicationResult) -> bool:
+        if (
+            self._phase not in (WholeFlowPhase.PLANNING, WholeFlowPhase.BLOCKED)
+            or self._active_child_id != f"{workflow.info().workflow_id}:planning"
+            or self._paused
+            or result.status is SpecPublicationStatus.UNKNOWN
+        ):
+            return False
+        await workflow.get_external_workflow_handle(self._active_child_id).signal(
+            "resolve_spec_publication_signal", result
+        )
+        self._phase = WholeFlowPhase.PLANNING
+        self._status = WholeFlowStatus.ACTIVE
+        self._reason = ""
+        return True
+
     @workflow.signal(name="cancel")
     async def cancel(self) -> None:
         if self._status not in (WholeFlowStatus.COMPLETED, WholeFlowStatus.FAILED, WholeFlowStatus.CANCELLED):
@@ -158,7 +208,11 @@ class RequirementDeliveryWorkflow:
         try:
             planning = await workflow.execute_child_workflow(
                 "RequirementPlanningWorkflow",
-                input.planning.to_input(),
+                input.planning.to_input(
+                    repository=input.repository,
+                    parent_workflow_id=workflow.info().workflow_id,
+                    parent_workflow_run_id=workflow.info().run_id,
+                ),
                 id=self._active_child_id,
                 result_type=dict,
             )
@@ -169,7 +223,22 @@ class RequirementDeliveryWorkflow:
         finally:
             self._active_child_id = None
         if planning.get("status") != "completed":
-            return self._failed("planning did not complete", planning=planning)
+            reason = planning.get("publication_reason") or "planning did not complete"
+            self._phase = WholeFlowPhase.BLOCKED
+            self._status = (
+                WholeFlowStatus.NOT_VERIFIED
+                if planning.get("status") == "unknown"
+                else WholeFlowStatus.BLOCKED
+            )
+            self._reason = reason
+            self._next_action = "recheck SPEC publication identities or retry publication"
+            return WholeFlowResult(
+                workflow_id=workflow.info().workflow_id,
+                phase=self._phase,
+                status=self._status,
+                planning=planning,
+                reason=reason,
+            )
         self._evidence_refs.extend(
             f"spec-issue:{record['number']}" for record in planning.get("published_specs", ())
         )
@@ -228,7 +297,7 @@ class RequirementDeliveryWorkflow:
             ticket_publication = await workflow.execute_activity(
                 publish_ticket_issues,
                 TicketPublicationInput(
-                    repository="williamxhero/temporalio-codex",
+                    repository=input.repository,
                     operation_id=f"{workflow.info().workflow_id}:tickets:{spec_key}",
                     spec_issue_number=spec_issue_number,
                     blocker_issue_numbers=tuple(
@@ -289,7 +358,10 @@ class RequirementDeliveryWorkflow:
             try:
                 result = await workflow.execute_child_workflow(
                     "CodexRunWorkflow",
-                    plan.to_run_input(),
+                    plan.to_run_input(
+                        parent_workflow_id=workflow.info().workflow_id,
+                        parent_workflow_run_id=workflow.info().run_id,
+                    ),
                     id=self._active_child_id,
                     result_type=dict,
                 )

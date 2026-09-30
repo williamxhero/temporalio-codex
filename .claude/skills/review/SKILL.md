@@ -1,6 +1,7 @@
 ---
 name: review
 description: Review code for common issues. Use when reviewing PRs, suggesting code changes, or when user asks to review code.
+disable-model-invocation: false
 allowed-tools: Read, Grep, Glob
 ---
 

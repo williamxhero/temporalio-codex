@@ -35,6 +35,9 @@ class CodexOperation:
     effort: str
     prompt: str
     thread_id: str | None = None
+    parent_workflow_id: str | None = None
+    workflow_run_id: str | None = None
+    parent_workflow_run_id: str | None = None
 
 
 @dataclass(frozen=True)

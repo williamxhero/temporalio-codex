@@ -43,7 +43,12 @@ class SpecCodexPlan:
     model: str = "gpt-5-codex"
     effort: str = "low"
 
-    def to_run_input(self) -> RunInput:
+    def to_run_input(
+        self,
+        *,
+        parent_workflow_id: str | None = None,
+        parent_workflow_run_id: str | None = None,
+    ) -> RunInput:
         stages = tuple(
             StageDefinition(
                 key=role.value,
@@ -56,7 +61,12 @@ class SpecCodexPlan:
             )
             for role in (CodexRole.PLANNING, CodexRole.IMPLEMENTATION, CodexRole.REVIEW)
         )
-        return RunInput(requirement=self.requirement, stages=stages)
+        return RunInput(
+            requirement=self.requirement,
+            stages=stages,
+            parent_workflow_id=parent_workflow_id,
+            parent_workflow_run_id=parent_workflow_run_id,
+        )
 
 
 @dataclass(frozen=True)
@@ -70,10 +80,18 @@ class PlanningPayload:
     grill_answers: tuple[GrillAnswer, ...] = ()
     confirmation_operation_id: str | None = None
     publication_operation_id: str | None = None
+    publication_timeout_seconds: float = 300.0
 
-    def to_input(self) -> PlanningInput:
+    def to_input(
+        self,
+        *,
+        repository: str = "williamxhero/temporalio-codex",
+        parent_workflow_id: str | None = None,
+        parent_workflow_run_id: str | None = None,
+    ) -> PlanningInput:
         return PlanningInput(
             origin=self.origin,
+            repository=repository,
             source_text=self.source_text,
             source_reference=self.source_reference,
             sensitive=self.sensitive,
@@ -82,6 +100,9 @@ class PlanningPayload:
             grill_answers=self.grill_answers,
             confirmation_operation_id=self.confirmation_operation_id,
             publication_operation_id=self.publication_operation_id,
+            publication_timeout_seconds=self.publication_timeout_seconds,
+            parent_workflow_id=parent_workflow_id,
+            parent_workflow_run_id=parent_workflow_run_id,
         )
 
 
@@ -98,6 +119,7 @@ class WholeFlowInput:
     codex: tuple[SpecCodexPlan, ...]
     deliveries: tuple[SpecDeliveryPlan, ...]
     summary: SummaryPublicationInput
+    repository: str = "williamxhero/temporalio-codex"
     entry_contract_version: str | None = None
     entry_launch_key: str | None = None
     entry_input_identity: str | None = None

@@ -93,3 +93,21 @@ the evidence survives the pytest temporary directory lifecycle.
 The Worker package is independent from the Go Server module. From the
 repository root, run `go test ./...` for the Server check and then run the
 Worker checks from this directory.
+
+For an existing `RequirementDeliveryWorkflow`, inspect publication recovery
+through the delivery entrypoint:
+
+```text
+uv run temporalio-codex-delivery diagnose --run-id <run-id> --details
+uv run temporalio-codex-delivery extend-publication --run-id <run-id> --publication-timeout-seconds 300
+uv run temporalio-codex-delivery retry-publication --run-id <run-id>
+```
+
+`extend-publication` changes only the pending SPEC publication activity's
+start-to-close timeout and verifies the server readback. It checks the active
+planning child's parent and exact execution identity, and cannot shorten the
+timeout. Use it when a historical activity still carries an insufficient
+timeout; changing worker source cannot update that scheduled command.
+`retry-publication` is for publication awaiting readback. Check existing GitHub
+operation identities first; retries adopt existing issues. Never start a new
+top-level run to recover a partially published plan.

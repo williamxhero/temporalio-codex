@@ -4,12 +4,13 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
+    from temporalio_codex.execution_status import report_progress
+    from temporalio_codex.summary_activities import publish_delivery_summary
     from temporalio_codex.summary_adapter import (
         SummaryPublicationInput,
         SummaryPublicationResult,
         SummaryPublicationStatus,
     )
-    from temporalio_codex.summary_activities import publish_delivery_summary
 
 
 @workflow.defn
@@ -21,6 +22,9 @@ class DeliverySummaryWorkflow:
     @workflow.run
     async def run(self, input: SummaryPublicationInput) -> SummaryPublicationResult:
         for attempt in range(3 if input.automatic else 1):
+            await report_progress(phase="summary", next_action="publish and verify summary",
+                                  retry_count=attempt, timeout_seconds=30,
+                                  deadline=(workflow.now() + timedelta(seconds=30)).isoformat())
             result = await workflow.execute_activity(
                 publish_delivery_summary,
                 input,
@@ -32,6 +36,13 @@ class DeliverySummaryWorkflow:
             if result.status is not SummaryPublicationStatus.UNKNOWN:
                 break
             if input.automatic and attempt < 2:
+                await report_progress(
+                    phase="summary", status="retrying", retry_count=attempt + 1,
+                    pending_reason="summary publication outcome requires readback",
+                    next_action="reconcile summary publication",
+                    deadline=(workflow.now() + timedelta(seconds=2**attempt)).isoformat(),
+                    last_error=result.reason,
+                )
                 await workflow.sleep(timedelta(seconds=2**attempt))
         self._result = result
         self._status = result.status

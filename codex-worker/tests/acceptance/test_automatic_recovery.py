@@ -1,6 +1,10 @@
 import asyncio
+import json
+import subprocess
+import sys
 from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -16,11 +20,13 @@ from temporalio_codex.activities import (
     foundation_stage,
     heartbeat_stage,
 )
+from temporalio_codex.candidate_activities import capture_codex_candidate
 from temporalio_codex.conversation_store import ConversationEvent, ConversationStore
 from temporalio_codex.delivery_adapter import FakeDeliveryAdapter
 from temporalio_codex.delivery_models import DeliveryOutcome, DeliveryPhase, DeliveryReceipt
 from temporalio_codex.delivery_workflows import DeliveryWorkflow
 from temporalio_codex.openai_adapter import OpenAICodexAdapter
+from temporalio_codex.git_adapter import LocalGitAdapter
 from temporalio_codex.planning_activities import (
     configure_spec_issue_gateway,
     configure_ticket_issue_gateway,
@@ -114,16 +120,28 @@ class InstrumentedAsyncSdk:
 
             async def turn(self, prompt, **kwargs):
                 sdk.prompts.append(prompt)
-                return Turn()
+                return Turn(prompt, Path(kwargs["cwd"]))
 
         class Turn:
             id = f"turn-{ordinal}"
 
+            def __init__(self, prompt, workspace):
+                self.prompt = prompt
+                self.workspace = workspace
+
             async def stream(self):
+                if self.prompt.startswith("Role: implementation"):
+                    ticket = self.prompt.split("Ready ticket: ", 1)[1].splitlines()[0]
+                    (self.workspace / f"{ticket}-implemented.txt").write_text("implemented\n", encoding="utf-8")
+                    subprocess.run(["git", "-C", str(self.workspace), "add", "."], check=True)
+                    subprocess.run(["git", "-C", str(self.workspace), "commit", "-m", f"implement {ticket}"], check=True, capture_output=True)
+                output = "governed change completed"
+                if self.prompt.startswith("Role: review"):
+                    output = json.dumps({"candidate_sha": subprocess.run(["git", "-C", str(self.workspace), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip(), "verdict": "approved", "findings": []})
                 for method, payload in (
                     ("item/agentMessage/delta", SimpleNamespace(delta="partial ")),
                     ("item/completed", SimpleNamespace(item=SimpleNamespace(
-                        type="agentMessage", text="governed change completed"
+                        type="agentMessage", text=output
                     ))),
                     ("turn/completed", SimpleNamespace(turn=SimpleNamespace(
                         id=self.id, status=SimpleNamespace(value="completed"), error=None
@@ -168,11 +186,29 @@ async def test_whole_flow_restarts_worker_reopens_store_and_replays_all_children
 
     github.execute = delayed_ci
     configure_codex_adapter(OpenAICodexAdapter(lambda: sdk, "0.155.1", store))
-    configure_delivery_adapters(FakeDeliveryAdapter(), github)
+    configure_delivery_adapters(LocalGitAdapter(), github)
     configure_spec_issue_gateway(FakeSpecIssueGateway())
     configure_ticket_issue_gateway(FakeTicketIssueGateway())
     configure_summary_gateway(FakeSummaryCommentGateway())
     input = whole_flow_input()
+    def git(cwd, *args):
+        return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
+    plans = []
+    for plan in input.deliveries:
+        repository = tmp_path / plan.spec_key
+        repository.mkdir()
+        git(repository, "init", "-b", "main")
+        git(repository, "config", "user.name", "Acceptance")
+        git(repository, "config", "user.email", "acceptance@example.invalid")
+        (repository / "README").write_text("base\n", encoding="utf-8")
+        git(repository, "add", "README")
+        git(repository, "commit", "-m", "base")
+        remote = tmp_path / f"{plan.spec_key}.git"
+        git(tmp_path, "init", "--bare", str(remote))
+        git(repository, "remote", "add", "origin", str(remote))
+        git(repository, "push", "origin", "main")
+        plans.append(replace(plan, delivery=replace(plan.delivery, repository=str(repository), workspace=str(tmp_path / f"{plan.spec_key}-candidate"), base_sha=git(repository, "rev-parse", "HEAD"), acceptance_command=(sys.executable, "-c", "from pathlib import Path; assert list(Path('.').glob('*-implemented.txt'))"))))
+    input = replace(input, deliveries=tuple(plans))
     input = replace(input, deliveries=tuple(
         replace(plan, delivery=replace(plan.delivery, readback_backoff_seconds=1))
         for plan in input.deliveries
@@ -181,7 +217,7 @@ async def test_whole_flow_restarts_worker_reopens_store_and_replays_all_children
         async with await WorkflowEnvironment.start_time_skipping() as environment:
             queue = "automatic-worker-restart"
             worker_options = dict(
-                task_queue=queue, workflows=workflows, activities=activities,
+                task_queue=queue, workflows=workflows, activities=(*activities, capture_codex_candidate),
                 graceful_shutdown_timeout=timedelta(seconds=5),
                 max_cached_workflows=0,
             )
@@ -235,7 +271,8 @@ async def test_whole_flow_restarts_worker_reopens_store_and_replays_all_children
             turns = [turn for c in parent["conversations"] for turn in c["turns"]]
             assert len(turns) == 9
             assert all(turn["status"] == "completed" for turn in turns)
-            assert all(turn["input"] and turn["output"] == "governed change completed" for turn in turns)
+            assert all(turn["input"] for turn in turns)
+            assert all("candidate_sha" in turn["output"] or "governed change completed" in turn["output"] for turn in turns)
             codex_histories = [h for h in histories if h.events[0].workflow_execution_started_event_attributes.workflow_type.name == "CodexRunWorkflow"]
             assert len(codex_histories) == 3
             for history in codex_histories:

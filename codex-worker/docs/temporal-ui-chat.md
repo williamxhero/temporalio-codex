@@ -42,8 +42,8 @@ to a different listener on Windows.
 - Red gate: the planning/default Chat browser test failed against the previous UI.
 - Desktop browser gate: all three tests passed (default/planning scope, recovery,
   and route change to another Run ID).
-- Mobile default/planning and interruption/recovery tests passed at 320 x 800.
-  Synthetic run-navigation coverage is desktop only.
+- Mobile browser gate: all three tests passed at 320 x 800, including Run ID
+  navigation. The synthetic navigation link is placed above fixed mobile chrome.
 - Prettier passed for changed UI, build script, and browser tests.
 - Svelte check: zero errors, 59 existing warnings in unrelated components.
 - Production staged build passed. Served HTML exactly matched staged HTML;

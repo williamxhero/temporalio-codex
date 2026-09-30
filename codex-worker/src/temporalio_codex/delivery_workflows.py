@@ -1,6 +1,7 @@
 from datetime import timedelta
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from temporalio_codex.activities import delivery_git_stage, delivery_github_stage
@@ -24,6 +25,9 @@ class DeliveryWorkflow:
         self._receipts: list[DeliveryReceipt] = []
         self._readback: DeliveryReceipt | None = None
         self._cleanup_retry_requested = False
+        self._automatic = False
+        self._readback_max_attempts = 60
+        self._readback_backoff_seconds = 5.0
 
     @workflow.query(name="get_delivery_status")
     def get_status(self) -> DeliverySnapshot:
@@ -36,6 +40,17 @@ class DeliveryWorkflow:
 
     @workflow.run
     async def run(self, input: DeliveryInput) -> DeliveryResult:
+        self._automatic = input.automatic
+        self._readback_max_attempts = input.readback_max_attempts
+        self._readback_backoff_seconds = input.readback_backoff_seconds
+        if self._readback_max_attempts < 1 or self._readback_backoff_seconds < 0:
+            self._status = DeliveryStatus.FAILED
+            return DeliveryResult(
+                workflow_id=workflow.info().workflow_id,
+                status=self._status,
+                outcome=DeliveryOutcome.FAILED,
+                summary="Invalid bounded delivery readback policy",
+            )
         candidate = await self._git(
             DeliveryOperation(
                 operation_id=f"{workflow.info().workflow_id}:candidate",
@@ -160,15 +175,23 @@ class DeliveryWorkflow:
             delivery_git_stage,
             operation,
             start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=3),
         )
 
     async def _github(self, operation: DeliveryOperation) -> DeliveryReceipt:
         self._phase = operation.phase
-        return await workflow.execute_activity(
-            delivery_github_stage,
-            operation,
-            start_to_close_timeout=timedelta(seconds=30),
-        )
+        for attempt in range(self._readback_max_attempts):
+            receipt = await workflow.execute_activity(
+                delivery_github_stage,
+                operation,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            if not self._automatic or receipt.outcome is not DeliveryOutcome.WAITING:
+                return receipt
+            if attempt < self._readback_max_attempts - 1:
+                await workflow.sleep(timedelta(seconds=self._readback_backoff_seconds))
+        return receipt
 
     async def _finish_cleanup(self, operation: DeliveryOperation) -> bool:
         while True:
@@ -176,11 +199,16 @@ class DeliveryWorkflow:
             self._receipts.append(cleanup)
             if cleanup.outcome is DeliveryOutcome.COMPLETED:
                 return True
+            if self._automatic:
+                self._status = DeliveryStatus.FAILED
+                return False
             self._status = DeliveryStatus.CLEANUP_PENDING
             await workflow.wait_condition(
-                lambda: self._cleanup_retry_requested
-                or self._readback is not None
-                or self._status is DeliveryStatus.FAILED
+                lambda: (
+                    self._cleanup_retry_requested
+                    or self._readback is not None
+                    or self._status is DeliveryStatus.FAILED
+                )
             )
             if self._status is DeliveryStatus.FAILED:
                 return False
@@ -222,19 +250,25 @@ class DeliveryWorkflow:
         self._receipts.append(receipt)
         if receipt.outcome in (DeliveryOutcome.COMPLETED,):
             return True
+        if self._automatic:
+            self._status = DeliveryStatus.FAILED
+            return False
         if receipt.outcome is DeliveryOutcome.WAITING:
             self._status = DeliveryStatus.WAITING_FOR_READBACK
-        elif receipt.outcome in (
-            DeliveryOutcome.UNKNOWN,
-            DeliveryOutcome.NOT_VERIFIED,
-        ) or receipt.readback_required:
+        elif (
+            receipt.outcome
+            in (
+                DeliveryOutcome.UNKNOWN,
+                DeliveryOutcome.NOT_VERIFIED,
+            )
+            or receipt.readback_required
+        ):
             self._status = DeliveryStatus.WAITING_FOR_READBACK
         else:
             self._status = DeliveryStatus.FAILED
             return False
         await workflow.wait_condition(
-            lambda: self._readback is not None
-            or self._status is DeliveryStatus.FAILED
+            lambda: self._readback is not None or self._status is DeliveryStatus.FAILED
         )
         readback = self._readback
         self._readback = None

@@ -66,6 +66,7 @@ class SpecCodexPlan:
             stages=stages,
             parent_workflow_id=parent_workflow_id,
             parent_workflow_run_id=parent_workflow_run_id,
+            automatic=True,
         )
 
 
@@ -164,9 +165,7 @@ def topological_spec_keys(input: SchedulerInput) -> tuple[str, ...]:
     ordered: list[str] = []
     while remaining:
         ready = sorted(
-            key
-            for key in remaining
-            if dependencies[key].isdisjoint(remaining)
+            key for key in remaining if dependencies[key].isdisjoint(remaining)
         )
         if not ready:
             return ()
@@ -239,6 +238,8 @@ def validate_delivery_evidence(result: dict) -> tuple[str, ...]:
     push_receipts = [receipt for receipt in receipts if receipt.get("phase") == "push"]
     if not push_receipts:
         return ("delivery completed without push evidence",)
-    if not any(receipt.get("remote_contains_merge") is True for receipt in push_receipts):
+    if not any(
+        receipt.get("remote_contains_merge") is True for receipt in push_receipts
+    ):
         return ("push evidence does not verify the expected remote merge",)
     return ()

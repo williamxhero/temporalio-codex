@@ -20,6 +20,7 @@ class SummaryPublicationInput:
     umbrella_issue_number: int
     operation_id: str
     summary_text: str
+    automatic: bool = False
 
 
 @dataclass(frozen=True)
@@ -279,8 +280,8 @@ class GhCliSummaryCommentGateway:
         ]
         if paginate:
             args.extend(["--paginate", "--slurp"])
-        for field in fields:
-            args.extend(["-f", field])
+        for api_field in fields:
+            args.extend(["-f", api_field])
         return await asyncio.to_thread(self._run, args)
 
     @staticmethod
@@ -302,7 +303,9 @@ class GhCliSummaryCommentGateway:
 
     @staticmethod
     def _write_body_file(body: str) -> str:
-        descriptor, path = tempfile.mkstemp(prefix="temporalio-codex-summary-", suffix=".txt")
+        descriptor, path = tempfile.mkstemp(
+            prefix="temporalio-codex-summary-", suffix=".txt"
+        )
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
             stream.write(body)
         return path

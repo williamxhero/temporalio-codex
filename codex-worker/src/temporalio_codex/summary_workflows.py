@@ -1,6 +1,7 @@
 from datetime import timedelta
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from temporalio_codex.summary_adapter import (
@@ -19,17 +20,27 @@ class DeliverySummaryWorkflow:
 
     @workflow.run
     async def run(self, input: SummaryPublicationInput) -> SummaryPublicationResult:
-        result = await workflow.execute_activity(
-            publish_delivery_summary,
-            input,
-            start_to_close_timeout=timedelta(seconds=30),
-        )
+        for attempt in range(3 if input.automatic else 1):
+            result = await workflow.execute_activity(
+                publish_delivery_summary,
+                input,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            self._result = result
+            self._status = result.status
+            if result.status is not SummaryPublicationStatus.UNKNOWN:
+                break
+            if input.automatic and attempt < 2:
+                await workflow.sleep(timedelta(seconds=2**attempt))
         self._result = result
         self._status = result.status
-        if result.status is SummaryPublicationStatus.UNKNOWN:
+        if result.status is SummaryPublicationStatus.UNKNOWN and not input.automatic:
             await workflow.wait_condition(
-                lambda: self._result is not None
-                and self._result.status is not SummaryPublicationStatus.UNKNOWN
+                lambda: (
+                    self._result is not None
+                    and self._result.status is not SummaryPublicationStatus.UNKNOWN
+                )
             )
             result = self._result
             assert result is not None
@@ -50,7 +61,10 @@ class DeliverySummaryWorkflow:
             return False
         if result.status is SummaryPublicationStatus.UNKNOWN:
             return False
-        if result.status is SummaryPublicationStatus.VERIFIED and result.comment is None:
+        if (
+            result.status is SummaryPublicationStatus.VERIFIED
+            and result.comment is None
+        ):
             return False
         self._result = result
         self._status = result.status

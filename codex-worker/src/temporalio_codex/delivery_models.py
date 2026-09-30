@@ -81,6 +81,9 @@ class DeliveryInput:
     title: str = ""
     body: str = ""
     issue_numbers: tuple[int, ...] = ()
+    automatic: bool = False
+    readback_max_attempts: int = 60
+    readback_backoff_seconds: float = 5
 
 
 @dataclass(frozen=True)
@@ -127,5 +130,8 @@ def validate_operation(operation: DeliveryOperation) -> None:
             raise ValueError("pull request operations require stable identity")
         if not operation.candidate_branch:
             raise ValueError("pull request operations require candidate_branch")
-    if operation.phase in {DeliveryPhase.CI, DeliveryPhase.MERGE, DeliveryPhase.PUSH} and not operation.pull_request_number:
+    if (
+        operation.phase in {DeliveryPhase.CI, DeliveryPhase.MERGE, DeliveryPhase.PUSH}
+        and not operation.pull_request_number
+    ):
         raise ValueError("CI and merge operations require pull_request_number")

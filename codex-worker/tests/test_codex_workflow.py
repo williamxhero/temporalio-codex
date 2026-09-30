@@ -1,4 +1,7 @@
 import asyncio
+from dataclasses import replace
+
+import pytest
 
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
@@ -47,7 +50,11 @@ async def execute_with_fake(run_id: str, stages, observations=None):
         ):
             handle = await environment.client.start_workflow(
                 CodexRunWorkflow.run,
-                RunInput(requirement="deliver a governed change", stages=stages),
+                RunInput(
+                    requirement="deliver a governed change",
+                    stages=stages,
+                    automatic=True,
+                ),
                 id=run_id,
                 task_queue=run_id,
             )
@@ -144,6 +151,7 @@ async def test_pending_codex_input_resumes_after_answer_update() -> None:
                 CodexRunWorkflow.run,
                 RunInput(
                     requirement="resume a pending Codex stage",
+                    automatic=False,
                     stages=(codex_stage_definition(CodexRole.PLANNING),),
                 ),
                 id=run_id,
@@ -202,6 +210,7 @@ async def test_unknown_codex_observation_waits_for_readback() -> None:
                 CodexRunWorkflow.run,
                 RunInput(
                     requirement="read back an uncertain Codex turn",
+                    automatic=False,
                     stages=(codex_stage_definition(CodexRole.PLANNING),),
                 ),
                 id=run_id,
@@ -249,3 +258,55 @@ async def test_live_qualification_accepts_fake_evidence_without_claiming_provide
     assert result.status == "verified"
     assert result.thread_id == "thread-live-test"
     assert result.turn_id == "turn-live-test"
+
+
+@pytest.mark.parametrize("outcome", [CodexOutcome.UNKNOWN, CodexOutcome.PENDING_INPUT])
+async def test_automatic_codex_unresolved_outcome_finishes_without_updates(
+    outcome,
+) -> None:
+    run_id = f"automatic-{outcome.value}"
+    operation_id = f"{run_id}:planning:planning"
+    observation = CodexObservation(
+        operation_id=operation_id,
+        role=CodexRole.PLANNING,
+        outcome=outcome,
+        thread_id="thread-pending",
+        pending_question="Missing authorization?",
+        summary="outcome unresolved",
+    )
+    result, snapshot = await execute_with_fake(
+        run_id,
+        (codex_stage_definition(CodexRole.PLANNING),),
+        {
+            operation_id: observation,
+            f"{operation_id}:answer-1": replace(
+                observation, operation_id=f"{operation_id}:answer-1"
+            ),
+        },
+    )
+    assert result.status is RunStatus.FAILED
+    assert snapshot.completed_stages == ()
+    if outcome is CodexOutcome.PENDING_INPUT:
+        assert snapshot.stage_results[-1].failure == "automatic_input_unresolved"
+    else:
+        assert result.outcome is StageOutcome.UNKNOWN
+
+
+async def test_automatic_codex_input_resumes_with_context_without_updates() -> None:
+    run_id = "automatic-context"
+    operation_id = f"{run_id}:planning:planning"
+    result, snapshot = await execute_with_fake(
+        run_id,
+        (replace(codex_stage_definition(CodexRole.PLANNING), requires_input=True),),
+        {
+            operation_id: CodexObservation(
+                operation_id=operation_id,
+                role=CodexRole.PLANNING,
+                outcome=CodexOutcome.PENDING_INPUT,
+                thread_id="thread-context",
+                pending_question="Which scope?",
+            )
+        },
+    )
+    assert result.status is RunStatus.COMPLETED
+    assert snapshot.stage_results[-1].operation_id == f"{operation_id}:answer-1"

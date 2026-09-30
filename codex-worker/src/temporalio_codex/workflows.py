@@ -84,7 +84,18 @@ class CodexRunWorkflow:
 
             self._current_stage = stage.key
             answer: str | None = None
-            if stage.requires_input:
+            if stage.requires_input and input.automatic:
+                answer = input.requirement.strip()
+                if not answer:
+                    self._status = RunStatus.FAILED
+                    return RunResult(
+                        workflow_id=workflow.info().workflow_id,
+                        status=self._status,
+                        outcome=StageOutcome.FAILED,
+                        stage=stage.key,
+                        summary="Required stage input cannot be derived from an empty requirement",
+                    )
+            elif stage.requires_input:
                 self._status = RunStatus.WAITING_FOR_INPUT
                 self._pending_input = f"Input required for stage: {stage.key}"
                 await workflow.wait_condition(
@@ -145,7 +156,16 @@ class CodexRunWorkflow:
             if self._status is RunStatus.CANCELLED:
                 return self._cancelled_result()
             if stage_result.outcome is not StageOutcome.COMPLETED:
-                if stage_result.outcome is StageOutcome.UNKNOWN:
+                if input.automatic:
+                    self._status = RunStatus.FAILED
+                    return RunResult(
+                        workflow_id=workflow.info().workflow_id,
+                        status=self._status,
+                        outcome=stage_result.outcome,
+                        stage=stage_result.stage,
+                        summary=stage_result.summary,
+                    )
+                elif stage_result.outcome is StageOutcome.UNKNOWN:
                     self._status = RunStatus.WAITING_FOR_EXTERNAL_OBSERVATION
                     await workflow.wait_condition(
                         lambda: (
@@ -265,25 +285,50 @@ class CodexRunWorkflow:
                 retry_policy=RetryPolicy(
                     initial_interval=timedelta(milliseconds=10),
                     maximum_interval=timedelta(milliseconds=50),
-                    maximum_attempts=3,
+                    # A timeout cannot prove that the SDK turn was not started.
+                    maximum_attempts=1 if input.automatic else 3,
                     non_retryable_error_types=["UnknownExternalOutcome"],
                 ),
             )
             if observation.outcome is not CodexOutcome.PENDING_INPUT:
                 return self._stage_result_from_codex(stage, observation)
 
-            self._status = RunStatus.WAITING_FOR_INPUT
-            self._pending_input = observation.pending_question
-            self._answer = None
-            await workflow.wait_condition(
-                lambda: self._answer is not None or self._status is RunStatus.CANCELLED
-            )
-            if self._status is RunStatus.CANCELLED:
-                return self._stage_result_from_codex(stage, observation)
-            answer = self._answer
-            self._answer = None
-            self._pending_input = None
-            self._status = RunStatus.ACTIVE
+            if input.automatic:
+                if (
+                    answer_number >= input.automatic_input_max_attempts
+                    or not input.requirement.strip()
+                    or not observation.thread_id
+                ):
+                    return replace(
+                        self._stage_result_from_codex(stage, observation),
+                        outcome=StageOutcome.FAILED,
+                        summary="Automatic input exhausted or cannot safely resume the pending turn: "
+                        + (observation.pending_question or observation.summary),
+                        failure="automatic_input_unresolved",
+                    )
+                answer = (
+                    f"Question: {observation.pending_question or observation.summary}\n"
+                    f"Authorized requirement: {input.requirement}\n"
+                    f"Allowed scope: {', '.join(stage.allowed_scope)}\n"
+                    "Derive the answer only from this context and project defaults. "
+                    "Do not invent authorization or credentials. If the answer cannot "
+                    "be safely derived, return a failed result with a reason."
+                )
+            else:
+                self._status = RunStatus.WAITING_FOR_INPUT
+                self._pending_input = observation.pending_question
+                self._answer = None
+                await workflow.wait_condition(
+                    lambda: (
+                        self._answer is not None or self._status is RunStatus.CANCELLED
+                    )
+                )
+                if self._status is RunStatus.CANCELLED:
+                    return self._stage_result_from_codex(stage, observation)
+                answer = self._answer
+                self._answer = None
+                self._pending_input = None
+                self._status = RunStatus.ACTIVE
             answer_number += 1
             operation_id = (
                 f"{workflow.info().workflow_id}:{stage.key}:{stage.role.value}"

@@ -1,5 +1,10 @@
 import asyncio
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
@@ -13,9 +18,14 @@ from temporalio_codex.activities import (
     foundation_stage,
     heartbeat_stage,
 )
-from temporalio_codex.codex_adapter import FakeCodexAdapter
+from temporalio_codex.openai_adapter import OpenAICodexAdapter
 from temporalio_codex.delivery_adapter import FakeDeliveryAdapter
-from temporalio_codex.delivery_models import DeliveryInput, DeliveryPhase
+from temporalio_codex.delivery_models import (
+    DeliveryInput,
+    DeliveryPhase,
+    DeliveryOutcome,
+    DeliveryReceipt,
+)
 from temporalio_codex.planning_activities import (
     configure_ticket_issue_gateway,
     configure_spec_issue_gateway,
@@ -25,7 +35,6 @@ from temporalio_codex.planning_activities import (
 )
 from temporalio_codex.planning_models import (
     GrillAnswer,
-    PlanningInput,
     SourceOrigin,
 )
 from temporalio_codex.spec_issue_adapter import FakeSpecIssueGateway, SpecDraft
@@ -99,9 +108,6 @@ def whole_flow_input() -> WholeFlowInput:
             source_text="deliver a governed change",
             umbrella_issue_number=43,
             specs=drafts,
-            grill_answers=(GrillAnswer(1, "deliver a governed change"),),
-            confirmation_operation_id="acceptance:confirm",
-            publication_operation_id="acceptance:publish",
         ),
         scheduler=SchedulerInput(
             specs=(
@@ -111,7 +117,9 @@ def whole_flow_input() -> WholeFlowInput:
             tickets=(
                 TicketPlan("foundation-a", "foundation"),
                 TicketPlan("foundation-b", "foundation"),
-                TicketPlan("follow-up-a", "follow-up", ("foundation-a", "foundation-b")),
+                TicketPlan(
+                    "follow-up-a", "follow-up", ("foundation-a", "foundation-b")
+                ),
             ),
             completion_operations=(),
         ),
@@ -125,7 +133,14 @@ def whole_flow_input() -> WholeFlowInput:
             for key in ("foundation", "follow-up")
         ),
         deliveries=tuple(
-            SpecDeliveryPlan(key, delivery_input(key))
+            SpecDeliveryPlan(
+                key,
+                replace(
+                    delivery_input(key),
+                    readback_max_attempts=3,
+                    readback_backoff_seconds=0.01,
+                ),
+            )
             for key in ("foundation", "follow-up")
         ),
         summary=SummaryPublicationInput(
@@ -137,12 +152,66 @@ def whole_flow_input() -> WholeFlowInput:
     )
 
 
-async def test_two_spec_whole_flow_runs_through_public_child_workflows() -> None:
-    configure_codex_adapter(FakeCodexAdapter({}))
-    configure_delivery_adapters(FakeDeliveryAdapter(), FakeDeliveryAdapter())
+@pytest.mark.parametrize(
+    "failure_phase",
+    [None, DeliveryPhase.CLEANUP, DeliveryPhase.CI, "summary", "ci-transient"],
+)
+async def test_two_spec_whole_flow_runs_through_public_child_workflows(
+    failure_phase,
+) -> None:
+    sdk_result = SimpleNamespace(
+        id="turn-acceptance",
+        status=SimpleNamespace(value="completed"),
+        final_response="governed change completed",
+        error=None,
+    )
+    turn = SimpleNamespace(id="turn-acceptance", run=AsyncMock(return_value=sdk_result))
+    thread = MagicMock(id="thread-acceptance")
+    thread.turn.return_value = turn
+    sdk = SimpleNamespace(
+        thread_start=AsyncMock(return_value=thread),
+        thread_resume=AsyncMock(return_value=thread),
+        close=AsyncMock(),
+    )
+    configure_codex_adapter(OpenAICodexAdapter(lambda: sdk, "0.155.1"))
+    receipts = {}
+    if isinstance(failure_phase, DeliveryPhase):
+        operation_id = (
+            f"whole-flow-acceptance:delivery:foundation:{failure_phase.value}"
+        )
+        receipts[operation_id] = DeliveryReceipt(
+            operation_id=operation_id,
+            phase=failure_phase,
+            outcome=DeliveryOutcome.WAITING
+            if failure_phase is DeliveryPhase.CI
+            else DeliveryOutcome.UNKNOWN,
+            summary="injected unresolved external result",
+        )
+    github_adapter = FakeDeliveryAdapter(receipts)
+    if failure_phase == "ci-transient":
+        execute = github_adapter.execute
+        ci_calls = 0
+
+        async def transient_ci(operation):
+            nonlocal ci_calls
+            if operation.phase is DeliveryPhase.CI:
+                ci_calls += 1
+                if ci_calls < 3:
+                    return DeliveryReceipt(
+                        operation_id=operation.operation_id,
+                        phase=operation.phase,
+                        outcome=DeliveryOutcome.WAITING,
+                        summary="CI still running",
+                    )
+            return await execute(operation)
+
+        github_adapter.execute = transient_ci
+    configure_delivery_adapters(FakeDeliveryAdapter(), github_adapter)
     configure_spec_issue_gateway(FakeSpecIssueGateway())
     configure_ticket_issue_gateway(FakeTicketIssueGateway())
-    configure_summary_gateway(FakeSummaryCommentGateway())
+    configure_summary_gateway(
+        FakeSummaryCommentGateway(fail_find=failure_phase == "summary")
+    )
     try:
         async with await WorkflowEnvironment.start_time_skipping() as environment:
             async with Worker(
@@ -177,9 +246,16 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows() -> None
                 try:
                     result = await asyncio.wait_for(handle.result(), timeout=5)
                 except asyncio.TimeoutError as error:
-                    snapshot = await handle.query(RequirementDeliveryWorkflow.get_status)
+                    snapshot = await handle.query(
+                        RequirementDeliveryWorkflow.get_status
+                    )
                     raise AssertionError(f"whole flow stalled at {snapshot}") from error
                 snapshot = await handle.query(RequirementDeliveryWorkflow.get_status)
+        if failure_phase not in (None, "ci-transient"):
+            assert result.status == WholeFlowStatus.FAILED
+            assert result.reason
+            assert snapshot.status == WholeFlowStatus.FAILED
+            return
         assert result.status == WholeFlowStatus.COMPLETED
         assert result.phase == WholeFlowPhase.COMPLETED
         assert snapshot.completed_specs == ("foundation", "follow-up")
@@ -198,6 +274,25 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows() -> None
         )
         assert result.summary is not None
         assert result.summary["comment"] is not None
+        assert sdk.thread_start.await_count == 9
+        assert thread.turn.call_count == 9
+        prompts = [call.args[0] for call in thread.turn.call_args_list]
+        for ticket_key in ("foundation-a", "foundation-b", "follow-up-a"):
+            ticket_prompts = [
+                prompt
+                for prompt in prompts
+                if f"Ready ticket: {ticket_key}\n" in prompt
+            ]
+            assert len(ticket_prompts) == 3
+        assert prompts[0].startswith("Role: planning")
+        assert ".claude/skills/implement-spec/SKILL.md" in prompts[0]
+        assert ".claude/skills/to-tickets/SKILL.md" in prompts[0]
+        assert ".claude/skills/implement/SKILL.md" in prompts[1]
+        assert ".claude/skills/tdd/SKILL.md" in prompts[1]
+        assert ".claude/skills/review/SKILL.md" in prompts[2]
+        assert all(
+            "without requesting human confirmation" in prompt for prompt in prompts
+        )
     finally:
         configure_codex_adapter(None)
         configure_delivery_adapters(None, None)
@@ -238,7 +333,9 @@ async def test_historical_chat_is_accepted_without_persisting_inline_source() ->
         configure_ticket_issue_gateway(None)
 
 
-def test_whole_flow_rejects_future_cross_spec_blocker_before_starting_children() -> None:
+def test_whole_flow_rejects_future_cross_spec_blocker_before_starting_children() -> (
+    None
+):
     input = whole_flow_input()
     scheduler = SchedulerInput(
         specs=input.scheduler.specs,

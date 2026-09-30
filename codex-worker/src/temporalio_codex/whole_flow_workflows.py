@@ -1,17 +1,12 @@
-from dataclasses import asdict, replace, replace
+from dataclasses import asdict, replace
 from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from temporalio_codex.delivery_workflows import DeliveryWorkflow
     from temporalio_codex.planning_activities import publish_ticket_issues
-    from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
-    from temporalio_codex.summary_workflows import DeliverySummaryWorkflow
-    from temporalio_codex.ticket_workflows import TicketSchedulerWorkflow
     from temporalio_codex.whole_flow_models import (
-        SpecCodexPlan,
         WholeFlowInput,
         WholeFlowPhase,
         WholeFlowResult,
@@ -27,8 +22,10 @@ with workflow.unsafe.imports_passed_through():
         TicketPublicationInput,
         TicketPublicationStatus,
     )
-    from temporalio_codex.spec_issue_adapter import SpecPublicationResult, SpecPublicationStatus
-    from temporalio_codex.workflows import CodexRunWorkflow
+    from temporalio_codex.spec_issue_adapter import (
+        SpecPublicationResult,
+        SpecPublicationStatus,
+    )
 
 
 @workflow.defn
@@ -69,7 +66,11 @@ class RequirementDeliveryWorkflow:
 
     @workflow.update(name="pause")
     async def pause(self) -> bool:
-        if self._status in (WholeFlowStatus.COMPLETED, WholeFlowStatus.FAILED, WholeFlowStatus.CANCELLED):
+        if self._status in (
+            WholeFlowStatus.COMPLETED,
+            WholeFlowStatus.FAILED,
+            WholeFlowStatus.CANCELLED,
+        ):
             return False
         if self._paused:
             return True
@@ -77,9 +78,9 @@ class RequirementDeliveryWorkflow:
         self._status = WholeFlowStatus.BLOCKED
         self._reason = "paused by operator"
         if self._active_child_id and self._phase is WholeFlowPhase.PLANNING:
-            await workflow.get_external_workflow_handle(
-                self._active_child_id
-            ).signal("pause_planning")
+            await workflow.get_external_workflow_handle(self._active_child_id).signal(
+                "pause_planning"
+            )
         return True
 
     @workflow.update(name="resume")
@@ -90,18 +91,23 @@ class RequirementDeliveryWorkflow:
         self._status = WholeFlowStatus.ACTIVE
         self._reason = ""
         if self._active_child_id and self._phase is WholeFlowPhase.PLANNING:
-            await workflow.get_external_workflow_handle(
-                self._active_child_id
-            ).signal("resume_planning")
+            await workflow.get_external_workflow_handle(self._active_child_id).signal(
+                "resume_planning"
+            )
         return True
 
     @workflow.update(name="answer")
     async def answer(self, answer: tuple[str, str]) -> bool:
         question_id, value = answer
-        if not question_id.strip() or not value.strip() or self._status in (
-            WholeFlowStatus.COMPLETED,
-            WholeFlowStatus.FAILED,
-            WholeFlowStatus.CANCELLED,
+        if (
+            not question_id.strip()
+            or not value.strip()
+            or self._status
+            in (
+                WholeFlowStatus.COMPLETED,
+                WholeFlowStatus.FAILED,
+                WholeFlowStatus.CANCELLED,
+            )
         ):
             return False
         if (
@@ -116,9 +122,7 @@ class RequirementDeliveryWorkflow:
             return False
         if self._phase is not WholeFlowPhase.PLANNING:
             return False
-        await workflow.get_external_workflow_handle(
-            self._active_child_id
-        ).signal(
+        await workflow.get_external_workflow_handle(self._active_child_id).signal(
             "answer_grill_signal",
             GrillAnswer(question_number=question_number, answer=value),
         )
@@ -178,7 +182,11 @@ class RequirementDeliveryWorkflow:
 
     @workflow.signal(name="cancel")
     async def cancel(self) -> None:
-        if self._status not in (WholeFlowStatus.COMPLETED, WholeFlowStatus.FAILED, WholeFlowStatus.CANCELLED):
+        if self._status not in (
+            WholeFlowStatus.COMPLETED,
+            WholeFlowStatus.FAILED,
+            WholeFlowStatus.CANCELLED,
+        ):
             self._cancelled = True
             self._status = WholeFlowStatus.CANCELLED
             self._phase = WholeFlowPhase.CANCELLED
@@ -217,10 +225,10 @@ class RequirementDeliveryWorkflow:
                 id=self._active_child_id,
                 result_type=dict,
             )
-        except Exception:
+        except Exception as error:
             if self._cancelled:
                 return self._cancelled_result()
-            raise
+            return self._failed(f"planning child failed: {error}")
         finally:
             self._active_child_id = None
         if planning.get("status") != "completed":
@@ -232,7 +240,9 @@ class RequirementDeliveryWorkflow:
                 else WholeFlowStatus.BLOCKED
             )
             self._reason = reason
-            self._next_action = "recheck SPEC publication identities or retry publication"
+            self._next_action = (
+                "recheck SPEC publication identities or retry publication"
+            )
             return WholeFlowResult(
                 workflow_id=workflow.info().workflow_id,
                 phase=self._phase,
@@ -241,7 +251,8 @@ class RequirementDeliveryWorkflow:
                 reason=reason,
             )
         self._evidence_refs.extend(
-            f"spec-issue:{record['number']}" for record in planning.get("published_specs", ())
+            f"spec-issue:{record['number']}"
+            for record in planning.get("published_specs", ())
         )
 
         expected_specs = topological_spec_keys(input.scheduler)
@@ -260,7 +271,9 @@ class RequirementDeliveryWorkflow:
 
         for spec_key in expected_specs:
             if not await self._wait_if_paused():
-                return self._cancelled_result(planning, scheduler_runs, codex_results, delivery_results)
+                return self._cancelled_result(
+                    planning, scheduler_runs, codex_results, delivery_results
+                )
             self._active_spec = spec_key
             self._next_action = f"publish tickets for {spec_key}"
             self._phase = WholeFlowPhase.TICKETS
@@ -343,7 +356,8 @@ class RequirementDeliveryWorkflow:
                     break
                 if attempt < max_attempts:
                     await workflow.sleep(
-                        input.planning.publication_retry_backoff_seconds * (2 ** (attempt - 1))
+                        input.planning.publication_retry_backoff_seconds
+                        * (2 ** (attempt - 1))
                     )
             assert ticket_publication is not None
             if ticket_publication.status is not TicketPublicationStatus.VERIFIED:
@@ -369,23 +383,26 @@ class RequirementDeliveryWorkflow:
                     id=self._active_child_id,
                     result_type=dict,
                 )
-            except Exception:
+            except Exception as error:
                 if self._cancelled:
                     return self._cancelled_result(
                         planning, scheduler_runs, codex_results, delivery_results
                     )
-                raise
+                return self._failed(
+                    f"ticket scheduling child failed: {error}", planning
+                )
             finally:
                 self._active_child_id = None
             scheduler_runs.append(
                 {**scheduler_run, "ticket_publication": asdict(ticket_publication)}
             )
-            if (
-                scheduler_run.get("status") != "completed"
-                or tuple(scheduler_run.get("completed_specs", ())) != (spec_key,)
-            ):
+            if scheduler_run.get("status") != "completed" or tuple(
+                scheduler_run.get("completed_specs", ())
+            ) != (spec_key,):
                 scheduler = {"status": "failed", "runs": scheduler_runs}
-                return self._failed("ticket scheduling did not complete", planning, scheduler)
+                return self._failed(
+                    "ticket scheduling did not complete", planning, scheduler
+                )
 
             automatic_results = tuple(scheduler_run.get("codex_results", ()))
             if automatic_results:
@@ -394,9 +411,13 @@ class RequirementDeliveryWorkflow:
                 codex_results.extend(automatic_results)
             else:
                 self._phase = WholeFlowPhase.CODEX
-                self._next_action = f"run planning, implementation and review for {spec_key}"
+                self._next_action = (
+                    f"run planning, implementation and review for {spec_key}"
+                )
                 plan = codex_by_spec[spec_key]
-                self._active_child_id = f"{workflow.info().workflow_id}:codex:{plan.spec_key}"
+                self._active_child_id = (
+                    f"{workflow.info().workflow_id}:codex:{plan.spec_key}"
+                )
                 try:
                     result = await workflow.execute_child_workflow(
                         "CodexRunWorkflow",
@@ -407,36 +428,49 @@ class RequirementDeliveryWorkflow:
                         id=self._active_child_id,
                         result_type=dict,
                     )
-                except Exception:
+                except Exception as error:
                     if self._cancelled:
                         return self._cancelled_result(
                             planning, scheduler_runs, codex_results, delivery_results
                         )
-                    raise
+                    return self._failed(f"Codex child failed: {error}", planning)
                 finally:
                     self._active_child_id = None
                 codex_results.append(result)
                 if result.get("status") != "completed":
                     scheduler = {"status": "completed", "runs": scheduler_runs}
-                    return self._failed("Codex implementation or review did not complete", planning, scheduler, tuple(codex_results))
+                    return self._failed(
+                        "Codex implementation or review did not complete",
+                        planning,
+                        scheduler,
+                        tuple(codex_results),
+                    )
 
             self._phase = WholeFlowPhase.DELIVERY
             self._next_action = f"deliver and read back {spec_key}"
             plan = delivery_by_spec[spec_key]
-            self._active_child_id = f"{workflow.info().workflow_id}:delivery:{plan.spec_key}"
+            self._active_child_id = (
+                f"{workflow.info().workflow_id}:delivery:{plan.spec_key}"
+            )
             try:
                 result = await workflow.execute_child_workflow(
                     "DeliveryWorkflow",
-                    plan.delivery,
+                    replace(plan.delivery, automatic=True),
                     id=self._active_child_id,
                     result_type=dict,
                 )
-            except Exception:
+            except Exception as error:
                 if self._cancelled:
                     return self._cancelled_result(
                         planning, scheduler_runs, codex_results, delivery_results
                     )
-                raise
+                return self._failed(
+                    f"delivery child failed: {error}",
+                    planning,
+                    {"runs": scheduler_runs},
+                    tuple(codex_results),
+                    tuple(delivery_results),
+                )
             finally:
                 self._active_child_id = None
             delivery_results.append(result)
@@ -473,20 +507,33 @@ class RequirementDeliveryWorkflow:
         try:
             summary = await workflow.execute_child_workflow(
                 "DeliverySummaryWorkflow",
-                input.summary,
+                replace(input.summary, automatic=True),
                 id=self._active_child_id,
                 result_type=dict,
             )
-        except Exception:
+        except Exception as error:
             if self._cancelled:
                 return self._cancelled_result(
                     planning, scheduler, codex_results, delivery_results
                 )
-            raise
+            return self._failed(
+                f"summary child failed: {error}",
+                planning,
+                scheduler,
+                tuple(codex_results),
+                tuple(delivery_results),
+            )
         finally:
             self._active_child_id = None
         if summary.get("status") != "verified":
-            return self._failed("final summary was not verified", planning, scheduler, tuple(codex_results), tuple(delivery_results), summary)
+            return self._failed(
+                "final summary was not verified",
+                planning,
+                scheduler,
+                tuple(codex_results),
+                tuple(delivery_results),
+                summary,
+            )
         self._phase = WholeFlowPhase.COMPLETED
         if summary.get("comment"):
             self._evidence_refs.append(

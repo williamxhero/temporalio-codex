@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -108,14 +109,16 @@ class ConversationStore:
             "CREATE INDEX IF NOT EXISTS idx_codex_execution ON codex_conversation_events(namespace,workflow_id,workflow_run_id,sequence)"
         )
         self._connection.commit()
-        self._connection.execute("""
+        self._connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS codex_operation_ledger (
                 namespace TEXT NOT NULL, workflow_id TEXT NOT NULL,
                 workflow_run_id TEXT NOT NULL, operation_id TEXT NOT NULL,
                 thread_id TEXT, turn_id TEXT, observation_json TEXT, fingerprint TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY(namespace, workflow_id, workflow_run_id, operation_id)
             )
-        """)
+        """
+        )
         ledger_columns = {
             row[1]
             for row in self._connection.execute(
@@ -265,6 +268,7 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     conversations: dict[str, dict[str, Any]] = {}
     operation_groups: dict[tuple, str] = {}
     turns: dict[tuple, dict[str, Any]] = {}
+    final_turns: set[tuple] = set()
 
     for row in rows:
         operation_id = str(row["operation_id"])
@@ -316,6 +320,7 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
                 "input": "",
                 "output": "",
                 "working": [],
+                "activities": [],
                 "status": "queued",
                 "updatedAt": row["created_at"],
             }
@@ -339,6 +344,7 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         elif kind == "assistant_final":
             if text:
                 turn["output"] = text
+                final_turns.add(operation_key)
             turn["status"] = "completed"
         elif kind in {"reasoning_delta", "plan_delta", "tool_delta"} and text:
             working_kind = {
@@ -350,6 +356,16 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
                 turn["working"].append({"kind": working_kind, "text": text})
             else:
                 turn["working"][-1]["text"] += text
+            _append_activity(
+                turn["activities"],
+                _activity_for_event(
+                    kind,
+                    text,
+                    _detail_from_row(row),
+                    event_id=row["event_id"],
+                    sequence=row["sequence"],
+                ),
+            )
         elif kind == "turn_started":
             turn["status"] = "running"
         elif kind == "turn_completed":
@@ -358,10 +374,364 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
             turn["status"] = "failed"
             if text and not turn["output"]:
                 turn["output"] = text
+            if text:
+                _append_activity(
+                    turn["activities"],
+                    _activity_for_event(
+                        kind,
+                        text,
+                        _detail_from_row(row),
+                        event_id=row["event_id"],
+                        sequence=row["sequence"],
+                    ),
+                )
         elif kind == "history_error":
             turn["status"] = "failed"
 
+    for operation_key, turn in turns.items():
+        for activity in turn["activities"]:
+            _normalize_activity(activity)
+        turn["displayOutput"], turn["verificationMarkers"] = _display_output(
+            turn["output"]
+        )
+        if turn["status"] == "failed" and operation_key not in final_turns:
+            errors = [a for a in turn["activities"] if a["category"] == "error"]
+            sdk_errors = [
+                a for a in errors if a.get("detail", {}).get("method") == "error"
+            ]
+            errors = sdk_errors or errors
+            turn["displayOutput"] = (
+                errors[-1]["summary"] if errors else _error_cause(turn["output"])
+            )
     return list(conversations.values())
+
+
+_TEST_COMMAND = re.compile(
+    r"(?:^|\s)(?:pytest|uv\s+run\s+pytest|python(?:\d+(?:\.\d+)*)?\s+-m\s+pytest)(?:\s|$)",
+    re.IGNORECASE,
+)
+_FILE_TEXT = re.compile(
+    r"(?:^|\s)(?:read|write|edit|open|create|delete)\s+[^\s]+\.[A-Za-z0-9]+",
+    re.IGNORECASE,
+)
+
+
+def _detail_from_row(row: sqlite3.Row) -> dict[str, Any] | None:
+    try:
+        value = json.loads(row["detail_json"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _activity_for_event(
+    kind: str,
+    text: str,
+    detail: dict[str, Any] | None,
+    *,
+    event_id: str | None,
+    sequence: int,
+) -> dict[str, Any]:
+    detail = detail or None
+    raw_command = detail.get("command") if detail else None
+    command = raw_command.strip() if isinstance(raw_command, str) else ""
+    if kind in {"error", "history_error", "turn_failed"}:
+        category = "error"
+    elif kind == "plan_delta":
+        category = "plan"
+    elif kind == "reasoning_delta":
+        category = "reasoning"
+    elif detail and detail.get("probe") is True:
+        category = "verification"
+    elif kind == "tool_delta":
+        method = str(detail.get("method", "")).lower() if detail else ""
+        item_type = str(detail.get("item_type", "")).lower() if detail else ""
+        if detail and (
+            any(key in detail for key in ("path", "file", "file_path"))
+            or item_type == "filechange"
+        ):
+            category = "file"
+        elif "test" in item_type or _TEST_COMMAND.search(
+            command or text.splitlines()[0]
+        ):
+            category = "test"
+        elif (
+            "command" in item_type
+            or "command" in method
+            or "process" in method
+            or command
+        ):
+            category = "command"
+        elif _FILE_TEXT.search(text):
+            category = "file"
+        elif (
+            "verify" in text.splitlines()[0].lower()
+            or "probe" in text.splitlines()[0].lower()
+        ):
+            category = "verification"
+        else:
+            category = "tool"
+    else:
+        category = kind.removesuffix("_delta") or "activity"
+
+    activity: dict[str, Any] = {
+        "id": event_id or f"event:{sequence}",
+        "category": category,
+        "summary": (
+            _error_cause(text)
+            if category == "error"
+            else (
+                _activity_summary(command or text.splitlines()[0])
+                if kind == "tool_delta"
+                else _activity_summary(text)
+            )
+        ),
+        "text": text,
+    }
+    if detail:
+        activity["detail"] = detail
+    return activity
+
+
+def _append_activity(
+    activities: list[dict[str, Any]], activity: dict[str, Any]
+) -> None:
+    detail = activity.get("detail")
+    item_id = detail.get("item_id") if isinstance(detail, dict) else None
+    method = detail.get("method", "") if isinstance(detail, dict) else ""
+    if method == "turn/plan/updated":
+        for existing in reversed(activities):
+            existing_detail = existing.get("detail")
+            if (
+                isinstance(existing_detail, dict)
+                and existing_detail.get("method") == method
+            ):
+                existing.update(
+                    {key: value for key, value in activity.items() if key != "id"}
+                )
+                return
+        activities.append(activity)
+        return
+    if not item_id and activities and isinstance(detail, dict):
+        previous = activities[-1]
+        previous_detail = previous.get("detail", {})
+        if (
+            isinstance(previous_detail, dict)
+            and not previous_detail.get("item_id")
+            and not any(
+                key in previous_detail for key in ("exit_code", "probe", "command")
+            )
+            and not detail.get("probe")
+        ):
+            previous_method = previous_detail.get("method", "")
+            if previous_method in _OUTPUT_DELTA_METHODS and method == previous_method:
+                previous["text"] += activity["text"]
+                return
+            if (
+                previous_method in _OUTPUT_DELTA_METHODS
+                and method == "item/completed"
+                and _is_command_completion(activity, detail)
+            ):
+                previous.update(
+                    {key: value for key, value in activity.items() if key != "id"}
+                )
+                return
+    if item_id:
+        for existing in reversed(activities):
+            existing_detail = existing.get("detail")
+            if (
+                isinstance(existing_detail, dict)
+                and existing_detail.get("item_id") == item_id
+            ):
+                if detail.get("method") == "item/completed":
+                    existing.update(
+                        {key: value for key, value in activity.items() if key != "id"}
+                    )
+                else:
+                    existing["text"] += activity["text"]
+                    existing["summary"] = _activity_summary(
+                        existing["text"].splitlines()[0]
+                    )
+                return
+    if (
+        activities
+        and activity["category"] in {"plan", "reasoning"}
+        and activities[-1]["category"] == activity["category"]
+        and not item_id
+        and not (
+            isinstance(activities[-1].get("detail"), dict)
+            and activities[-1]["detail"].get("method") == "turn/plan/updated"
+        )
+    ):
+        activities[-1]["text"] += activity["text"]
+        activities[-1]["summary"] = _activity_summary(activities[-1]["text"])
+        if "detail" in activity:
+            previous_detail = activities[-1].get("detail")
+            if previous_detail is None:
+                activities[-1]["detail"] = activity["detail"]
+            elif previous_detail != activity["detail"]:
+                details = (
+                    previous_detail
+                    if isinstance(previous_detail, list)
+                    else [previous_detail]
+                )
+                details.append(activity["detail"])
+                activities[-1]["detail"] = details
+        return
+    activities.append(activity)
+
+
+def _is_command_completion(activity: dict[str, Any], detail: dict[str, Any]) -> bool:
+    item_type = detail.get("item_type")
+    if item_type:
+        return item_type == "commandExecution"
+    if activity["category"] in {"command", "test"}:
+        return True
+    command = _command_text(detail, activity["text"])
+    return bool(
+        _READ_COMMAND.search(command)
+        or re.match(
+            r"^(?:pwsh|powershell|bash|sh|cmd|git|uv|python(?:\d+(?:\.\d+)*)?|npm|pnpm|yarn|go|make|rg|ls)(?:\s|$)",
+            command,
+            re.IGNORECASE,
+        )
+    )
+
+
+_OUTPUT_DELTA_METHODS = {
+    "item/commandExecution/outputDelta",
+    "command/exec/outputDelta",
+    "process/outputDelta",
+}
+_CONTEXT_PATH = re.compile(
+    r"(?<![\w.-])(?:[A-Za-z]:)?(?:[^\s\"'`;|]*[\\/])?(?:SKILL\.md|AGENTS\.md|CLAUDE\.md|README(?:\.[\w-]+)?|[\w.-]*(?:policy|config)[\w.-]*\.(?:md|json|ya?ml|toml|ini))(?=$|[\s\"'`;|])",
+    re.IGNORECASE,
+)
+_READ_COMMAND = re.compile(
+    r"(?:^|[\s\"';])(?:Get-Content|cat|type|read|open|sed|head|tail)(?:\s|$)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_activity(activity: dict[str, Any]) -> None:
+    detail = activity.get("detail", {})
+    if not isinstance(detail, dict):
+        detail = {}
+    text = activity["text"]
+    command = _command_text(detail, text)
+    paths = _CONTEXT_PATH.findall(command) if _READ_COMMAND.search(command) else []
+    path = detail.get("path") or detail.get("file") or detail.get("file_path")
+    if (
+        isinstance(path, str)
+        and _READ_COMMAND.search(command)
+        and _CONTEXT_PATH.fullmatch(path)
+    ):
+        paths.append(path)
+    if paths:
+        names = list(
+            dict.fromkeys(path.replace("\\", "/").rsplit("/", 1)[-1] for path in paths)
+        )
+        activity["category"] = "context"
+        activity["summary"] = _activity_summary(
+            "Read context: "
+            + ", ".join(names[:3])
+            + (f" (+{len(names) - 3} more)" if len(names) > 3 else "")
+        )
+    elif (
+        activity["category"] == "command"
+        and detail.get("method") in _OUTPUT_DELTA_METHODS
+        and not detail.get("command")
+    ):
+        activity["summary"] = "Command output"
+    elif activity["category"] in {"command", "test"}:
+        result = []
+        if activity["category"] == "test":
+            output = detail.get("aggregated_output", text)
+            if isinstance(output, str):
+                for line in reversed(output.splitlines()):
+                    counts = re.findall(
+                        r"\b\d+ (?:passed|failed|skipped|errors?|xfailed|xpassed|deselected)\b",
+                        line,
+                    )
+                    if counts:
+                        result.append(", ".join(counts))
+                        break
+        exit_code = detail.get("exit_code")
+        if type(exit_code) is int:
+            result.append(
+                f"{'Passed' if exit_code == 0 else 'Failed'} (exit {exit_code})"
+            )
+        elif isinstance(detail.get("status"), str) and detail["status"].strip():
+            result.append(_activity_summary(detail["status"].strip(), 40))
+        suffix = _activity_summary(" | " + " | ".join(result), 120) if result else ""
+        if suffix:
+            suffix = " " + suffix
+        activity["summary"] = (
+            _activity_summary(command or "Command", 160 - len(suffix)) + suffix
+        )
+    elif activity["category"] == "file" and detail.get("item_type") == "fileChange":
+        paths = detail.get("paths", [])
+        if isinstance(paths, list):
+            paths = [path for path in paths if isinstance(path, str) and path]
+            names = [
+                _activity_summary(
+                    (
+                        path
+                        if len(path) <= 36
+                        else path.replace("\\", "/").rsplit("/", 1)[-1]
+                    ),
+                    36,
+                )
+                for path in paths[:3]
+            ]
+            activity["summary"] = (
+                f"Files changed ({len(paths)}): "
+                + ", ".join(names)
+                + (f" (+{len(paths) - 3} more)" if len(paths) > 3 else "")
+            )
+
+
+def _command_text(detail: dict[str, Any], text: str) -> str:
+    command = detail.get("command")
+    if isinstance(command, str) and command.strip():
+        return command.strip()
+    return next((line.strip() for line in text.splitlines() if line.strip()), "")
+
+
+def _display_output(output: str) -> tuple[str, list[str]]:
+    lines = []
+    markers = []
+    fence = ""
+    for line in output.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            delimiter = stripped[:3]
+            if not fence:
+                fence = delimiter
+            elif fence == delimiter:
+                fence = ""
+        if not fence and stripped in {"SDK_PROBE_OK", "`SDK_PROBE_OK`"}:
+            if "SDK_PROBE_OK" not in markers:
+                markers.append("SDK_PROBE_OK")
+            continue
+        lines.append(line)
+    return ("".join(lines).strip() if markers else output), markers
+
+
+def _activity_summary(text: str, limit: int = 160) -> str:
+    summary = " ".join(text.split())
+    if len(summary) <= limit:
+        return summary
+    return summary[: limit - 3].rstrip() + "..."
+
+
+def _error_cause(text: str) -> str:
+    return _activity_summary(
+        next(
+            (line.strip() for line in text.splitlines() if line.strip()),
+            "Codex turn failed",
+        )
+    )
 
 
 def iso_timestamp(value: float) -> str:

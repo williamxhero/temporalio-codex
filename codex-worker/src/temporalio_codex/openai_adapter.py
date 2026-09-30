@@ -130,9 +130,11 @@ class OpenAICodexAdapter:
             turn_id = observation.turn_id or turn_id
             self._emit(
                 operation,
-                "assistant_final"
-                if observation.outcome is CodexOutcome.COMPLETED
-                else "error",
+                (
+                    "assistant_final"
+                    if observation.outcome is CodexOutcome.COMPLETED
+                    else "error"
+                ),
                 observation.summary,
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -140,9 +142,11 @@ class OpenAICodexAdapter:
             )
             self._emit(
                 operation,
-                "turn_completed"
-                if observation.outcome is CodexOutcome.COMPLETED
-                else "turn_failed",
+                (
+                    "turn_completed"
+                    if observation.outcome is CodexOutcome.COMPLETED
+                    else "turn_failed"
+                ),
                 thread_id=thread_id,
                 turn_id=turn_id,
                 event_id=f"operation:{operation.operation_id}:turn-completed:{turn_id}",
@@ -275,17 +279,36 @@ class OpenAICodexAdapter:
                     text,
                     thread_id=thread_id,
                     turn_id=turn_id,
-                    detail={"method": method},
+                    detail={
+                        "method": method,
+                        "item_id": getattr(getattr(item, "root", item), "id", None),
+                        **_history_item_detail(item),
+                    },
+                    event_id=getattr(item, "id", None) or getattr(event, "id", None),
                 )
             return
         if method == "error":
+            error = getattr(payload, "error", None)
+            detail = {"method": method}
+            for name in ("message", "additional_details"):
+                value = getattr(error, name, None)
+                if isinstance(value, str):
+                    detail[name] = value
+            retry = getattr(payload, "will_retry", None)
+            if isinstance(retry, bool):
+                detail["will_retry"] = retry
+            info = getattr(error, "codex_error_info", None)
+            info = getattr(info, "root", info)
+            error_type = getattr(info, "value", getattr(info, "type", None))
+            if isinstance(error_type, str):
+                detail["error_type"] = error_type
             self._emit(
                 operation,
                 "error",
-                "Codex SDK reported an error",
+                detail.get("message") or "Codex SDK reported an error",
                 thread_id=thread_id,
                 turn_id=turn_id,
-                detail={"method": method},
+                detail=detail,
             )
             return
         if method == "item/agentMessage/delta":
@@ -311,7 +334,7 @@ class OpenAICodexAdapter:
             str(text),
             thread_id=thread_id,
             turn_id=turn_id,
-            detail={"method": method},
+            detail={"method": method, "item_id": getattr(payload, "item_id", None)},
             event_id=getattr(event, "id", None),
         )
 
@@ -405,7 +428,11 @@ class OpenAICodexAdapter:
                         text,
                         thread_id=thread_id,
                         turn_id=turn_id,
-                        detail={"source": "thread_read"},
+                        detail={
+                            "source": "thread_read",
+                            "item_id": item_id,
+                            **_history_item_detail(item),
+                        },
                         event_operation_id=history_operation_id,
                         event_id=(
                             f"history:{operation.run_id}:{operation.workflow_run_id}:"
@@ -416,11 +443,15 @@ class OpenAICodexAdapter:
                 status = getattr(status, "value", status)
                 self._emit(
                     operation,
-                    "turn_completed"
-                    if status == "completed"
-                    else "turn_failed"
-                    if status in {"failed", "interrupted"}
-                    else "turn_started",
+                    (
+                        "turn_completed"
+                        if status == "completed"
+                        else (
+                            "turn_failed"
+                            if status in {"failed", "interrupted"}
+                            else "turn_started"
+                        )
+                    ),
                     thread_id=thread_id,
                     turn_id=turn_id,
                     detail={"source": "thread_read"},
@@ -621,7 +652,74 @@ def _history_item(item: Any) -> tuple[str | None, str]:
         command = str(getattr(value, "command", "") or "")
         output = str(getattr(value, "aggregated_output", "") or "")
         return "tool_delta", "\n".join(part for part in (command, output) if part)
+    if item_type == "fileChange":
+        paths = [
+            str(getattr(change, "path", "") or "")
+            for change in (getattr(value, "changes", ()) or ())
+        ]
+        return "tool_delta", "Files changed: " + ", ".join(
+            path for path in paths if path
+        )
+    if item_type == "mcpToolCall":
+        server = str(getattr(value, "server", "") or "")
+        tool = str(getattr(value, "tool", "") or "")
+        return "tool_delta", ".".join(part for part in (server, tool) if part)
     return None, ""
+
+
+def _history_item_detail(item: Any) -> dict[str, Any]:
+    value = getattr(item, "root", item)
+    item_type = getattr(value, "type", None)
+    detail: dict[str, Any] = {}
+    if item_type:
+        detail["item_type"] = str(item_type)
+    for field_name in (
+        "command",
+        "aggregated_output",
+        "path",
+        "file",
+        "file_path",
+        "exit_code",
+        "status",
+        "server",
+        "tool",
+    ):
+        field_value = getattr(value, field_name, None)
+        scalar = getattr(field_value, "value", field_value)
+        if scalar is not None and isinstance(scalar, (str, int, float, bool)):
+            detail[field_name] = scalar
+    if item_type == "fileChange":
+        detail["paths"] = [
+            str(getattr(change, "path", "") or "")
+            for change in (getattr(value, "changes", ()) or ())
+        ]
+        detail["changes"] = []
+        for change in getattr(value, "changes", ()) or ():
+            change_detail = {}
+            for field_name in ("path", "diff", "kind"):
+                field_value = getattr(change, field_name, None)
+                if field_value is None:
+                    continue
+                model_dump = getattr(field_value, "model_dump", None)
+                change_detail[field_name] = (
+                    model_dump(mode="json", by_alias=True)
+                    if callable(model_dump)
+                    else getattr(
+                        field_value, "value", getattr(field_value, "type", field_value)
+                    )
+                )
+            detail["changes"].append(change_detail)
+    if item_type == "mcpToolCall":
+        for field_name in ("arguments", "result", "error"):
+            field_value = getattr(value, field_name, None)
+            if field_value is not None:
+                model_dump = getattr(field_value, "model_dump", None)
+                detail[field_name] = (
+                    model_dump(mode="json", by_alias=True)
+                    if callable(model_dump)
+                    else field_value
+                )
+    return detail
 
 
 def _history_user_text(content: Any) -> str:

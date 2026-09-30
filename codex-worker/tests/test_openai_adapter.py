@@ -146,6 +146,116 @@ async def test_stream_deltas_are_persisted_as_one_conversation_turn(tmp_path) ->
         store.close()
 
 
+async def test_streamed_sdk_actions_are_exposed_as_distinct_activities(
+    tmp_path,
+) -> None:
+    completed = SimpleNamespace(
+        id="turn-stream",
+        status=SimpleNamespace(value="completed"),
+        error=None,
+    )
+    events = [
+        SimpleNamespace(
+            method="item/commandExecution/outputDelta",
+            id="delta-1",
+            payload=SimpleNamespace(
+                thread_id="thread-stream",
+                turn_id="turn-stream",
+                item_id="cmd-1",
+                delta="1 passed",
+            ),
+        ),
+        SimpleNamespace(
+            method="item/completed",
+            id="complete-cmd-1",
+            payload=SimpleNamespace(
+                thread_id="thread-stream",
+                turn_id="turn-stream",
+                item=SimpleNamespace(
+                    id="cmd-1",
+                    type="commandExecution",
+                    command="uv run pytest tests",
+                    aggregated_output="1 passed",
+                    status=SimpleNamespace(value="completed"),
+                    exit_code=0,
+                ),
+            ),
+        ),
+        SimpleNamespace(
+            method="item/completed",
+            id="complete-file-1",
+            payload=SimpleNamespace(
+                thread_id="thread-stream",
+                turn_id="turn-stream",
+                item=SimpleNamespace(
+                    id="file-1",
+                    type="fileChange",
+                    changes=[
+                        SimpleNamespace(
+                            path="src/main.py",
+                            diff="+print('done')",
+                            kind=SimpleNamespace(type="add"),
+                        )
+                    ],
+                    status=SimpleNamespace(value="completed"),
+                ),
+            ),
+        ),
+        SimpleNamespace(
+            method="item/completed",
+            id="complete-mcp-1",
+            payload=SimpleNamespace(
+                thread_id="thread-stream",
+                turn_id="turn-stream",
+                item=SimpleNamespace(
+                    id="mcp-1",
+                    type="mcpToolCall",
+                    server="github",
+                    tool="get_issue",
+                    arguments={"number": 91},
+                    result={"body": "full technical result"},
+                    error={"message": "tool result warning"},
+                    status=SimpleNamespace(value="completed"),
+                ),
+            ),
+        ),
+        SimpleNamespace(
+            method="turn/completed", payload=SimpleNamespace(turn=completed)
+        ),
+    ]
+    thread = MagicMock(id="thread-stream")
+    thread.turn.return_value = StreamingTurn(events)
+    codex = SimpleNamespace(
+        thread_start=AsyncMock(return_value=thread), close=AsyncMock()
+    )
+    store = ConversationStore(tmp_path / "sdk-actions.db")
+    try:
+        adapter = OpenAICodexAdapter(lambda: codex, "0.155.1", store)
+        await adapter.execute(operation())
+
+        activities = store.snapshot("run-1")["conversations"][0]["turns"][0][
+            "activities"
+        ]
+        assert [
+            (activity["category"], activity["summary"]) for activity in activities
+        ] == [
+            ("test", "uv run pytest tests | 1 passed | Passed (exit 0)"),
+            ("file", "Files changed (1): src/main.py"),
+            ("tool", "github.get_issue"),
+        ]
+        assert activities[0]["text"] == "uv run pytest tests\n1 passed"
+        assert activities[0]["detail"]["exit_code"] == 0
+        assert activities[1]["detail"]["paths"] == ["src/main.py"]
+        assert activities[1]["detail"]["changes"] == [
+            {"path": "src/main.py", "diff": "+print('done')", "kind": "add"}
+        ]
+        assert activities[2]["detail"]["arguments"] == {"number": 91}
+        assert activities[2]["detail"]["result"] == {"body": "full technical result"}
+        assert activities[2]["detail"]["error"] == {"message": "tool result warning"}
+    finally:
+        store.close()
+
+
 async def test_same_operation_id_in_different_workflow_runs_is_not_cached_or_deduplicated(
     tmp_path,
 ) -> None:
@@ -547,5 +657,57 @@ async def test_resumed_history_never_imports_private_reasoning_content(tmp_path)
         snapshot = store.snapshot("run-1")
         assert "PRIVATE" not in str(snapshot)
         assert snapshot["conversations"][0]["turns"][0]["status"] == "failed"
+    finally:
+        store.close()
+
+
+async def test_sdk_error_exposes_public_cause_without_private_payload(tmp_path):
+    from openai_codex.generated.v2_all import ErrorNotification
+
+    completed = SimpleNamespace(
+        id="turn-error",
+        status="failed",
+        error=SimpleNamespace(message="Connection lost"),
+    )
+    error_payload = ErrorNotification.model_validate(
+        {
+            "threadId": "thread-error",
+            "turnId": "turn-error",
+            "willRetry": False,
+            "error": {
+                "message": "Connection lost\nTraceback: raw stack",
+                "additionalDetails": "Request timed out",
+                "codexErrorInfo": "serverOverloaded",
+                "content": "PRIVATE",
+            },
+        }
+    )
+    events = [
+        SimpleNamespace(method="error", payload=error_payload),
+        SimpleNamespace(
+            method="turn/completed", payload=SimpleNamespace(turn=completed)
+        ),
+    ]
+    thread = SimpleNamespace(
+        id="thread-error", turn=AsyncMock(return_value=StreamingTurn(events))
+    )
+    codex = SimpleNamespace(
+        thread_start=AsyncMock(return_value=thread), close=AsyncMock()
+    )
+    store = ConversationStore(tmp_path / "errors.db")
+    try:
+        await OpenAICodexAdapter(lambda: codex, "0.155.1", store).execute(operation())
+        turn = store.snapshot("run-1")["conversations"][0]["turns"][0]
+        sdk_error = turn["activities"][0]
+        assert sdk_error["summary"] == "Connection lost"
+        assert sdk_error["detail"] == {
+            "method": "error",
+            "message": "Connection lost\nTraceback: raw stack",
+            "additional_details": "Request timed out",
+            "error_type": "serverOverloaded",
+            "will_retry": False,
+        }
+        assert "PRIVATE" not in str(turn)
+        assert turn["displayOutput"] == "Connection lost"
     finally:
         store.close()

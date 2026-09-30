@@ -155,26 +155,44 @@ index 0000000..d779461
 +</style>
 diff --git a/src/lib/components/workflow/workflow-chat.svelte b/src/lib/components/workflow/workflow-chat.svelte
 new file mode 100644
-index 0000000..212c365
+index 0000000..145235f
 --- /dev/null
 +++ b/src/lib/components/workflow/workflow-chat.svelte
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,509 @@
 +<script lang="ts">
 +  import { untrack } from 'svelte';
 +
 +  import { page } from '$app/state';
 +
-+  import { IconCodex, IconSpinner } from '$lib/io/icon';
++  import {
++    IconCodex,
++    IconSpinner,
++    IconTerminal,
++    IconFileImport,
++    IconCheckCircle,
++    IconClock,
++    IconWarning,
++  } from '$lib/io/icon';
 +  import WorkflowChatMessage from '$lib/components/workflow/workflow-chat-message.svelte';
 +  import { getQuery } from '$lib/services/query-service';
 +
 +  type WorkingItem = { kind: string; text: string };
++  type Activity = {
++    id: string;
++    category: string;
++    summary: string;
++    text: string;
++    detail?: Record<string, unknown>;
++  };
 +  type Turn = {
 +    id: string;
 +    turnId?: string;
 +    input: string;
 +    output: string;
-+    working: WorkingItem[];
++    displayOutput?: string;
++    verificationMarkers?: string[];
++    activities?: Activity[];
++    working?: WorkingItem[];
 +    status: 'queued' | 'running' | 'completed' | 'failed';
 +    updatedAt: number;
 +  };
@@ -198,6 +216,62 @@ index 0000000..212c365
 +    deadline?: string;
 +    last_error?: string;
 +  };
++
++  const stageTitle = (stage: string) =>
++    stage
++      .replace(/[_-]+/g, ' ')
++      .replace(/\b\w/g, (letter) => letter.toUpperCase());
++
++  const errorSummary = (error: string) =>
++    error.split(/\r?\n/, 1)[0].slice(0, 160);
++
++  const turnActivities = (turn: Turn): Activity[] =>
++    turn.activities ??
++    (turn.working ?? []).map((item, index) => ({
++      id: `legacy:${index}`,
++      category: item.kind.startsWith('tool')
++        ? 'tool'
++        : item.kind.startsWith('plan')
++          ? 'plan'
++          : 'reasoning',
++      summary: item.kind.startsWith('tool')
++        ? 'Tool activity recorded'
++        : item.kind.startsWith('plan')
++          ? 'Plan updated'
++          : 'Progress update recorded',
++      text: item.text,
++    }));
++
++  const activityIcon = (category: string) =>
++    category === 'context' || category === 'file'
++      ? IconFileImport
++      : category === 'test' || category === 'verification'
++        ? IconCheckCircle
++        : category === 'command' || category === 'tool'
++          ? IconTerminal
++          : category === 'error'
++            ? IconWarning
++            : IconClock;
++
++  const detailLabel = (category: string) =>
++    category === 'context'
++      ? 'Context source'
++      : category === 'error'
++        ? 'Error details'
++        : category === 'command' || category === 'test'
++          ? 'Command output'
++          : category === 'file'
++            ? 'File details'
++            : 'Recorded output';
++
++  const turnLabel = (status: Turn['status']) =>
++    status === 'running'
++      ? 'In progress'
++      : status === 'failed'
++        ? 'Failed'
++        : status === 'queued'
++          ? 'Queued'
++          : 'Completed';
 +
 +  let conversations = $state<Conversation[]>([]);
 +  let loading = $state(true);
@@ -362,8 +436,17 @@ index 0000000..212c365
 +      {#if executionStatus.deadline}<span
 +          >Deadline: {executionStatus.deadline}</span
 +        >{/if}
-+      {#if executionStatus.last_error}<span>{executionStatus.last_error}</span
-+        >{/if}
++      {#if executionStatus.last_error}
++        <div class="min-w-0">
++          <span class="activity-summary"
++            >{errorSummary(executionStatus.last_error)}</span
++          >
++          <details class="mt-1 text-xs">
++            <summary class="cursor-pointer select-none">Error details</summary>
++            <pre class="raw-output mt-2">{executionStatus.last_error}</pre>
++          </details>
++        </div>
++      {/if}
 +    </div>
 +  {/if}
 +  {#if connection === 'reconnecting'}
@@ -385,80 +468,143 @@ index 0000000..212c365
 +      {emptyMessage}
 +    </div>
 +  {:else}
-+    <div class="flex flex-col gap-10">
++    <div class="flex flex-col gap-12">
 +      {#each conversations as conversation (conversation.id)}
 +        <article
 +          class="flex flex-col gap-6"
 +          data-thread-id={conversation.threadId ?? conversation.id}
 +        >
-+          <div class="flex items-center gap-3 border-b border-primary pb-3">
++          <header
++            class="flex flex-wrap items-start gap-3 border-b border-primary pb-4"
++          >
 +            <span
-+              class="flex h-8 w-8 items-center justify-center rounded-full bg-surface-secondary text-primary"
++              class="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-secondary text-primary"
 +            >
 +              <IconCodex class="h-4 w-4" />
 +            </span>
-+            <div class="min-w-0">
-+              <div class="font-medium text-primary">{conversation.role}</div>
-+              <div class="truncate font-mono text-xs text-secondary">
-+                {conversation.threadId ?? 'thread pending'} · {conversation.stage}
++            <div class="min-w-0 flex-1">
++              <h2 class="text-base font-semibold text-primary">
++                {stageTitle(conversation.stage)}
++              </h2>
++              <div class="mt-1 text-sm text-secondary">
++                {conversation.role} · {conversation.turns.length}
++                {conversation.turns.length === 1 ? ' turn' : ' turns'}
 +              </div>
 +            </div>
-+          </div>
++            <details class="min-w-0 text-xs text-secondary">
++              <summary class="cursor-pointer select-none"
++                >Thread details</summary
++              >
++              <div class="mt-2 max-w-56 break-all font-mono">
++                <div>Stage: {conversation.stage}</div>
++                <div>Thread: {conversation.threadId ?? 'thread pending'}</div>
++                <div>Operation: {conversation.id}</div>
++              </div>
++            </details>
++          </header>
 +
-+          {#each conversation.turns as turn (turn.id)}
-+            <div class="flex flex-col gap-5">
-+              {#if turn.input}
-+                <div class="flex justify-end">
-+                  <div
-+                    class="min-w-0 max-w-3xl rounded-lg bg-surface-secondary px-4 py-3 text-sm leading-6 text-primary"
-+                  >
-+                    <div
-+                      class="mb-2 text-[11px] font-medium uppercase tracking-wide text-secondary"
++          {#each conversation.turns as turn, turnIndex (turn.id)}
++            <section class="flex flex-col gap-4" data-testid="codex-turn">
++              <div
++                class="flex items-center justify-between gap-3 text-xs text-secondary"
++              >
++                <span class="font-medium uppercase tracking-wide"
++                  >Turn {turnIndex + 1}</span
++                >
++                <div class="flex flex-wrap items-center justify-end gap-3">
++                  <span>{turnLabel(turn.status)}</span>
++                  <details class="min-w-0">
++                    <summary class="cursor-pointer select-none"
++                      >Turn details</summary
 +                    >
-+                      Workflow input
++                    <div class="mt-2 max-w-56 break-all font-mono">
++                      {turn.turnId ?? turn.id}
 +                    </div>
-+                    <WorkflowChatMessage content={turn.input} />
-+                  </div>
++                  </details>
 +                </div>
-+              {/if}
++              </div>
 +
-+              {#if turn.working.length}
-+                <details class="max-w-3xl text-sm text-secondary">
++              {#if turn.input}
++                <details
++                  class="max-w-4xl text-sm text-secondary"
++                  data-testid="codex-prompt"
++                >
 +                  <summary class="cursor-pointer select-none"
-+                    >Working details</summary
++                    >Prompt · implementation context</summary
 +                  >
 +                  <div
-+                    class="mt-3 flex flex-col gap-3 border-l border-primary pl-4"
++                    class="mt-3 min-w-0 border-l border-primary pl-4 leading-6 text-primary"
 +                  >
-+                    {#each turn.working as item}
-+                      <div>
-+                        <div
-+                          class="mb-1 text-[11px] font-medium uppercase tracking-wide"
-+                        >
-+                          {item.kind}
-+                        </div>
-+                        <pre
-+                          class="whitespace-pre-wrap break-words font-sans leading-6">{item.text}</pre>
-+                      </div>
-+                    {/each}
++                    <WorkflowChatMessage content={turn.input} />
 +                  </div>
 +                </details>
 +              {/if}
 +
-+              {#if turn.output}
-+                <div class="flex gap-3">
++              {#if turnActivities(turn).length}
++                <ol
++                  class="flex min-w-0 max-w-4xl flex-col gap-4 border-l border-primary pl-4 text-sm"
++                  data-testid="codex-activity"
++                  aria-label="Activity timeline"
++                >
++                  {#each turnActivities(turn).filter((activity) => activity.category !== 'verification') as activity (activity.id)}
++                    {@const ActivityIcon = activityIcon(activity.category)}
++                    <li class="flex min-w-0 gap-3">
++                      <ActivityIcon
++                        class="mt-0.5 h-4 w-4 shrink-0 text-secondary"
++                      />
++                      <div class="min-w-0 flex-1">
++                        <div class="mb-0.5 text-xs text-secondary">
++                          {stageTitle(activity.category)}
++                        </div>
++                        <p class="activity-summary font-medium text-primary">
++                          {activity.category === 'error'
++                            ? errorSummary(activity.summary)
++                            : activity.summary}
++                        </p>
++                        {#if activity.text}
++                          <details class="mt-1 text-xs text-secondary">
++                            <summary class="cursor-pointer select-none"
++                              >{detailLabel(activity.category)}</summary
++                            >
++                            <pre
++                              class="raw-output mt-2 text-sm text-primary">{activity.text}</pre>
++                          </details>
++                        {/if}
++                        {#if activity.detail && Object.keys(activity.detail).length}
++                          <details class="mt-1 text-xs text-secondary">
++                            <summary class="cursor-pointer select-none"
++                              >Technical metadata</summary
++                            >
++                            <pre
++                              class="raw-output mt-2 text-sm text-primary">{JSON.stringify(
++                                activity.detail,
++                                null,
++                                2,
++                              )}</pre>
++                          </details>
++                        {/if}
++                      </div>
++                    </li>
++                  {/each}
++                </ol>
++              {/if}
++
++              {#if turn.displayOutput ?? turn.output}
++                <div class="flex gap-3" data-testid="codex-response">
 +                  <span
-+                    class="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surface-secondary text-primary"
++                    class="mt-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-secondary text-primary"
 +                  >
 +                    <IconCodex class="h-4 w-4" />
 +                  </span>
-+                  <div class="min-w-0 max-w-4xl text-sm leading-7 text-primary">
-+                    <div
-+                      class="mb-2 text-[11px] font-medium uppercase tracking-wide text-secondary"
-+                    >
++                  <div
++                    class="min-w-0 max-w-4xl flex-1 text-sm leading-7 text-primary"
++                  >
++                    <div class="mb-2 text-sm font-semibold text-primary">
 +                      Codex
 +                    </div>
-+                    <WorkflowChatMessage content={turn.output} />
++                    <WorkflowChatMessage
++                      content={turn.displayOutput ?? turn.output}
++                    />
 +                    {#if turn.status === 'running'}
 +                      <span
 +                        class="mt-2 inline-block h-4 w-1 animate-pulse bg-content-primary"
@@ -467,13 +613,61 @@ index 0000000..212c365
 +                  </div>
 +                </div>
 +              {/if}
-+            </div>
++              {#if (turn.verificationMarkers?.length ?? 0) || turnActivities(turn).some((activity) => activity.category === 'verification')}
++                <details
++                  class="min-w-0 max-w-4xl text-xs text-secondary"
++                  data-testid="codex-verification"
++                >
++                  <summary class="cursor-pointer select-none"
++                    >Verification details</summary
++                  >
++                  {#each turn.verificationMarkers ?? [] as marker}
++                    <pre class="raw-output mt-2">{marker}</pre>
++                  {/each}
++                  {#each turnActivities(turn).filter((activity) => activity.category === 'verification') as activity (activity.id)}
++                    <pre class="raw-output mt-2">{activity.text}</pre>
++                    {#if activity.detail && Object.keys(activity.detail).length}
++                      <details class="mt-1">
++                        <summary class="cursor-pointer select-none"
++                          >Technical metadata</summary
++                        >
++                        <pre class="raw-output mt-2">{JSON.stringify(
++                            activity.detail,
++                            null,
++                            2,
++                          )}</pre>
++                      </details>
++                    {/if}
++                  {/each}
++                </details>
++              {/if}
++              {#if !(turn.displayOutput ?? turn.output) && turn.status === 'running'}
++                <div
++                  class="flex items-center gap-3 text-sm text-secondary"
++                  role="status"
++                >
++                  <IconSpinner class="h-4 w-4 animate-spin" /> Codex is working…
++                </div>
++              {/if}
++            </section>
 +          {/each}
 +        </article>
 +      {/each}
 +    </div>
 +  {/if}
 +</section>
++
++<style>
++  .activity-summary,
++  .raw-output {
++    overflow-wrap: anywhere;
++  }
++
++  .raw-output {
++    max-width: 100%;
++    white-space: pre-wrap;
++  }
++</style>
 diff --git a/src/lib/i18n/locales/en/workflows.ts b/src/lib/i18n/locales/en/workflows.ts
 index b151c8f..892641c 100644
 --- a/src/lib/i18n/locales/en/workflows.ts
@@ -497,7 +691,7 @@ index 387740d..a347da7 100644
 +    routeForWorkflowChat,
    } from '$lib/utilities/route-for';
    import { isWorkflowTaskFailure } from '$lib/utilities/workflow-task-failures';
-
+ 
 @@ -277,6 +278,15 @@
    />
    <Tabs>
@@ -550,10 +744,10 @@ index c9efdf7..8f03eca 100644
 -import { get } from 'svelte/store';
 -
  import { BROWSER } from 'esm-env';
-
+ 
  import { resolve } from '$app/paths';
  import type { ResolvedPathname } from '$app/types';
-
+ 
 -import {
 -  eventFilterSort,
 -  workflowViewPreference,
@@ -564,7 +758,7 @@ index c9efdf7..8f03eca 100644
 @@ -396,31 +390,16 @@ export const routeForTimeline = ({
    return toURL(path, queryParams);
  };
-
+ 
 +export const routeForWorkflowChat = (
 +  parameters: WorkflowParameters,
 +): ResolvedPathname => {
@@ -598,7 +792,7 @@ index c9efdf7..8f03eca 100644
 -  });
 +  return routeForWorkflowChat(parameters);
  };
-
+ 
  export const routeForWorkers = (
 diff --git a/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts b/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts
 index eaac44d..c188f04 100644
@@ -606,7 +800,7 @@ index eaac44d..c188f04 100644
 +++ b/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts
 @@ -3,5 +3,5 @@ import { redirect } from '@sveltejs/kit';
  import type { PageLoad } from './$types';
-
+ 
  export const load: PageLoad = async function ({ url }) {
 -  redirect(302, `${url.pathname}/timeline`);
 +  redirect(302, `${url.pathname}/chat`);
@@ -634,10 +828,10 @@ index 0000000..df87936
 +<WorkflowChat />
 diff --git a/tests/integration/workflow-chat.spec.ts b/tests/integration/workflow-chat.spec.ts
 new file mode 100644
-index 0000000..b6a293a
+index 0000000..9090749
 --- /dev/null
 +++ b/tests/integration/workflow-chat.spec.ts
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,477 @@
 +import { expect, test } from '@playwright/test';
 +
 +import { mockWorkflowApis } from '~/test-utilities/mock-apis';
@@ -704,7 +898,14 @@ index 0000000..b6a293a
 +  await expect(
 +    page.getByText('Streamed response', { exact: true }),
 +  ).toBeVisible();
-+  await page.getByText('Working details').click();
++  await expect(
++    page.getByText('Tool activity recorded', { exact: true }),
++  ).toBeVisible();
++  await page
++    .getByTestId('codex-activity')
++    .getByText('Recorded output', { exact: true })
++    .last()
++    .click();
 +  await expect(page.getByText('Tests passed')).toBeVisible();
 +  unavailable = true;
 +  await expect(
@@ -728,6 +929,139 @@ index 0000000..b6a293a
 +    fullPage: true,
 +  });
 +  expect(errors).toEqual([]);
++});
++
++test('Chat keeps failure cause concise and full stack traces behind error details', async ({
++  page,
++}) => {
++  await mockWorkflowApis(page, mockWorkflow);
++  await page.route('**/query/get_status**', async (route) => {
++    await route.fulfill({
++      json: {
++        queryResult: {
++          payloads: [
++            {
++              metadata: { encoding: 'anNvbi9wbGFpbg==' },
++              data: Buffer.from(
++                JSON.stringify({
++                  phase: 'implement',
++                  status: 'failed',
++                  last_error:
++                    'Command exited with code 1\nRAW_STACK_TRACE\nat worker.py:42',
++                }),
++              ).toString('base64'),
++            },
++          ],
++        },
++      },
++    });
++  });
++  await page.route('http://127.0.0.1:18001/**', async (route) => {
++    const data = snapshot('', 1);
++    data.conversations[0].turns[0].status = 'failed';
++    Object.assign(data.conversations[0].turns[0], {
++      activities: [
++        {
++          id: 'error',
++          category: 'error',
++          summary: 'Test command failed',
++          text: 'RAW_TOOL_STACK_TRACE\nat run.py:8',
++        },
++      ],
++    });
++    await route.fulfill({ json: data });
++  });
++  await page.goto(workflowUrl);
++  await expect(page.getByText('Failed', { exact: true })).toBeVisible();
++  await expect(
++    page.getByText('Command exited with code 1', { exact: true }),
++  ).toBeVisible();
++  await expect(
++    page.getByText('Test command failed', { exact: true }),
++  ).toBeVisible();
++  await expect(
++    page.getByText('RAW_STACK_TRACE', { exact: false }),
++  ).toBeHidden();
++  await expect(
++    page.getByText('RAW_TOOL_STACK_TRACE', { exact: false }),
++  ).toBeHidden();
++  await page
++    .getByTestId('execution-status')
++    .getByText('Error details', { exact: true })
++    .click();
++  await expect(
++    page.getByText('RAW_STACK_TRACE', { exact: false }),
++  ).toBeVisible();
++  await page
++    .getByTestId('codex-activity')
++    .getByText('Error details', { exact: true })
++    .click();
++  await expect(
++    page.getByText('RAW_TOOL_STACK_TRACE', { exact: false }),
++  ).toBeVisible();
++});
++
++test('Chat shows readable activities while keeping internal context and raw output collapsed', async ({
++  page,
++}) => {
++  await mockWorkflowApis(page, mockWorkflow);
++  await page.route('http://127.0.0.1:18001/**', async (route) => {
++    const data = snapshot('A clear final response\nSDK_PROBE_OK', 1);
++    Object.assign(data.conversations[0].turns[0], {
++      displayOutput: 'A clear final response',
++      verificationMarkers: ['SDK_PROBE_OK'],
++      activities: [
++        {
++          id: 'read',
++          category: 'context',
++          summary: 'Read context: SKILL.md, README.md',
++          text: 'SECRET_SKILL_SOURCE',
++        },
++        {
++          id: 'test',
++          category: 'command',
++          summary: 'uv run pytest tests/acceptance',
++          text: 'RAW_TEST_OUTPUT',
++          detail: { exit_code: 0 },
++        },
++      ],
++    });
++    await route.fulfill({ json: data });
++  });
++  await page.goto(workflowUrl);
++
++  await expect(page.getByRole('heading', { name: 'Implement' })).toBeVisible();
++  await expect(page.getByText('Codex', { exact: true })).toBeVisible();
++  await expect(page.getByTestId('codex-response')).toContainText(
++    'A clear final response',
++  );
++  await expect(page.getByTestId('codex-prompt')).not.toHaveAttribute(
++    'open',
++    '',
++  );
++  await expect(page.getByText('Implement the selected ticket')).toBeHidden();
++  await expect(
++    page.getByText('Read context: SKILL.md, README.md', { exact: true }),
++  ).toBeVisible();
++  await expect(
++    page.getByText('uv run pytest tests/acceptance', { exact: true }),
++  ).toBeVisible();
++  await expect(
++    page.getByText('SECRET_SKILL_SOURCE', { exact: true }),
++  ).toBeHidden();
++  await expect(page.getByText('RAW_TEST_OUTPUT', { exact: true })).toBeHidden();
++  await expect(page.getByTestId('codex-response')).not.toContainText(
++    'SDK_PROBE_OK',
++  );
++  await expect(page.getByText('SDK_PROBE_OK', { exact: true })).toBeHidden();
++  await page.getByText('Context source', { exact: true }).click();
++  await expect(
++    page.getByText('SECRET_SKILL_SOURCE', { exact: true }),
++  ).toBeVisible();
++  await page.getByText('Command output', { exact: true }).click();
++  await expect(
++    page.getByText('RAW_TEST_OUTPUT', { exact: true }),
++  ).toBeVisible();
 +});
 +
 +test('Chat defaults to the exact execution and explains planning before Codex starts', async ({
@@ -774,6 +1108,161 @@ index 0000000..b6a293a
 +    expect(url.searchParams.get('workflow_id')).toBe(workflowId);
 +    expect(url.searchParams.get('run_id')).toBe(runId);
 +  }
++});
++
++test('Chat preserves Markdown and ordered turns with long content on narrow screens', async ({
++  page,
++}, testInfo) => {
++  await mockWorkflowApis(page, mockWorkflow);
++  const longPath = `src/${'very-long-directory-name-'.repeat(20)}worker.py`;
++  const finalResponse = `## Delivered\n\n- Updated workflow handling\n- Added acceptance coverage\n\n[Review changes](https://example.com/review)\n\n\`\`\`text\n${longPath}\n\`\`\`\n\n| File | Result |\n| --- | --- |\n| ${longPath} | Passed |\n\nFull final response ends here.`;
++  await page.route('http://127.0.0.1:18001/**', async (route) => {
++    const data = snapshot(finalResponse, 1);
++    data.conversations[0].stage = 'planning';
++    data.conversations[0].threadId = 'PRIVATE_THREAD_IDENTIFIER';
++    Object.assign(data.conversations[0].turns[0], {
++      turnId: 'PRIVATE_TURN_IDENTIFIER',
++      activities: [
++        {
++          id: 'plan',
++          category: 'plan',
++          summary: 'Inspect failure handling',
++          text: 'Raw plan',
++        },
++        {
++          id: 'reasoning',
++          category: 'reasoning',
++          summary: 'Use bounded retries',
++          text: 'Public reasoning summary',
++        },
++        {
++          id: 'file',
++          category: 'file',
++          summary: `Changed ${longPath}`,
++          text: longPath,
++          detail: { path: longPath },
++        },
++        {
++          id: 'test',
++          category: 'test',
++          summary: 'uv run pytest tests/acceptance',
++          text: 'Tests passed',
++        },
++        {
++          id: 'tool',
++          category: 'tool',
++          summary: 'Queried workflow status',
++          text: '{"RAW_TOOL_JSON": true}',
++        },
++        {
++          id: 'verification',
++          category: 'verification',
++          summary: 'Probe completed',
++          text: 'SDK_PROBE_OK',
++          detail: { receipt: 'PRIVATE_VERIFICATION_RECEIPT' },
++        },
++      ],
++    });
++    data.conversations[0].turns.push({
++      id: 'turn-2',
++      input: '',
++      output: '',
++      status: 'running',
++      updatedAt: 2,
++      working: [],
++    });
++    data.conversations.push({
++      id: 'implementation',
++      threadId: 'thread-2',
++      stage: 'implement',
++      role: 'implementer',
++      updatedAt: 3,
++      turns: [
++        {
++          id: 'turn-3',
++          input: '',
++          output: '',
++          status: 'queued',
++          updatedAt: 3,
++          working: [],
++        },
++      ],
++    });
++    await route.fulfill({ json: data });
++  });
++  await page.goto(workflowUrl);
++  const chat = page.getByTestId('workflow-chat');
++  await expect(chat.locator('article > header h2')).toHaveText([
++    'Planning',
++    'Implement',
++  ]);
++  await expect(
++    chat.getByTestId('codex-turn').getByText(/^Turn \d+$/),
++  ).toHaveText(['Turn 1', 'Turn 2', 'Turn 1']);
++  await expect(chat.getByText('In progress', { exact: true })).toBeVisible();
++  await expect(chat.getByText('Queued', { exact: true })).toBeVisible();
++  await expect(
++    chat.getByText('Codex is working…', { exact: true }),
++  ).toBeVisible();
++  for (const category of ['Plan', 'Reasoning', 'File', 'Test', 'Tool']) {
++    await expect(
++      chat.getByTestId('codex-activity').getByText(category, { exact: true }),
++    ).toBeVisible();
++  }
++  const response = chat.getByTestId('codex-response');
++  await expect(
++    response.getByRole('heading', { name: 'Delivered' }),
++  ).toBeVisible();
++  await expect(response.getByRole('listitem')).toHaveText([
++    'Updated workflow handling',
++    'Added acceptance coverage',
++  ]);
++  await expect(
++    response.getByRole('link', { name: 'Review changes' }),
++  ).toHaveAttribute('href', 'https://example.com/review');
++  await expect(response.locator('pre code')).toHaveText(`${longPath}\n`);
++  await expect(response.getByRole('table')).toContainText(longPath);
++  await expect(response).toContainText('Full final response ends here.');
++  await expect(
++    chat.getByText('PRIVATE_THREAD_IDENTIFIER', { exact: false }),
++  ).toBeHidden();
++  await expect(
++    chat.getByText('PRIVATE_TURN_IDENTIFIER', { exact: true }),
++  ).toBeHidden();
++  await expect(
++    chat.getByText('PRIVATE_VERIFICATION_RECEIPT', { exact: false }),
++  ).toBeHidden();
++  await page.screenshot({
++    path: testInfo.outputPath('chat-thread-reader.png'),
++    fullPage: true,
++  });
++  await chat.getByText('Thread details', { exact: true }).first().click();
++  await chat.getByText('Turn details', { exact: true }).first().click();
++  await chat.getByText('File details', { exact: true }).click();
++  await chat.getByText('Verification details', { exact: true }).click();
++  await chat
++    .getByTestId('codex-verification')
++    .getByText('Technical metadata', { exact: true })
++    .click();
++  await expect(
++    chat.getByText('PRIVATE_THREAD_IDENTIFIER', { exact: false }),
++  ).toBeVisible();
++  await expect(
++    chat.getByText('PRIVATE_TURN_IDENTIFIER', { exact: true }),
++  ).toBeVisible();
++  await expect(
++    chat.getByText('PRIVATE_VERIFICATION_RECEIPT', { exact: false }),
++  ).toBeVisible();
++  expect(
++    await chat.evaluate(
++      (element) => element.scrollWidth <= element.clientWidth,
++    ),
++  ).toBe(true);
++  expect(
++    await page.evaluate(
++      () => document.documentElement.scrollWidth <= window.innerWidth,
++    ),
++  ).toBe(true);
 +});
 +
 +test('Chat discards the previous execution when navigating to another run', async ({

@@ -11,6 +11,9 @@ from temporalio_codex.ticket_scheduler import (
     validate_scheduler_graph,
 )
 from temporalio_codex.ticket_workflows import TicketSchedulerWorkflow
+from temporalio_codex.models import RunInput, StageDefinition
+from temporalio_codex.workflows import CodexRunWorkflow
+from temporalio_codex.activities import foundation_stage
 
 
 def scheduler_input() -> SchedulerInput:
@@ -164,6 +167,41 @@ async def test_scheduler_restart_preserves_frontier() -> None:
             )
             result = await handle.result()
     assert result.status is SchedulerStatus.COMPLETED
+
+
+async def test_ready_ticket_runs_codex_and_completes_without_update() -> None:
+    input = SchedulerInput(
+        specs=(SpecPlan("first"),),
+        tickets=(TicketPlan("first-a", "first"), TicketPlan("first-b", "first", ("first-a",))),
+        codex_runs=(
+            (
+                "first-a",
+                RunInput("implement first-a", (StageDefinition(key="foundation"),)),
+            ),
+            (
+                "first-b",
+                RunInput("implement first-b", (StageDefinition(key="foundation"),)),
+            ),
+        ),
+    )
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="ticket-automatic-codex",
+            workflows=[TicketSchedulerWorkflow, CodexRunWorkflow],
+            activities=[foundation_stage],
+        ):
+            handle = await environment.client.start_workflow(
+                TicketSchedulerWorkflow.run,
+                input,
+                id="ticket-automatic-codex",
+                task_queue="ticket-automatic-codex",
+            )
+            result = await handle.result()
+
+    assert result.status is SchedulerStatus.COMPLETED
+    assert result.completed_tickets == ("first-a", "first-b")
+    assert len(result.codex_results) == 2
 
 
 def test_scheduler_graph_rejects_unresolved_and_cycle() -> None:

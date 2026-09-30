@@ -1,4 +1,4 @@
-from dataclasses import asdict
+from dataclasses import asdict, replace, replace
 from datetime import timedelta
 
 from temporalio import workflow
@@ -286,6 +286,29 @@ class RequirementDeliveryWorkflow:
                     for ticket in spec_tickets
                     if ticket.key in completion_by_ticket
                 ),
+                codex_runs=tuple(
+                    (
+                        ticket.key,
+                        replace(
+                            codex_by_spec[spec_key].to_run_input(
+                                parent_workflow_id=workflow.info().workflow_id,
+                                parent_workflow_run_id=workflow.info().run_id,
+                            ),
+                            requirement=(
+                                f"{codex_by_spec[spec_key].requirement}\n"
+                                f"Ready ticket: {ticket.key}\n"
+                                f"Title: {ticket.title}\n"
+                                "Acceptance criteria:\n"
+                                + "\n".join(
+                                    f"- {criterion}"
+                                    for criterion in ticket.acceptance_criteria
+                                )
+                            ),
+                        ),
+                    )
+                    for ticket in spec_tickets
+                    if ticket.key not in completion_by_ticket
+                ),
             )
             spec_issue_number = spec_issue_numbers.get(spec_key)
             if spec_issue_number is None:
@@ -351,32 +374,38 @@ class RequirementDeliveryWorkflow:
                 scheduler = {"status": "failed", "runs": scheduler_runs}
                 return self._failed("ticket scheduling did not complete", planning, scheduler)
 
-            self._phase = WholeFlowPhase.CODEX
-            self._next_action = f"run planning, implementation and review for {spec_key}"
-            plan = codex_by_spec[spec_key]
-            self._active_child_id = f"{workflow.info().workflow_id}:codex:{plan.spec_key}"
-            try:
-                result = await workflow.execute_child_workflow(
-                    "CodexRunWorkflow",
-                    plan.to_run_input(
-                        parent_workflow_id=workflow.info().workflow_id,
-                        parent_workflow_run_id=workflow.info().run_id,
-                    ),
-                    id=self._active_child_id,
-                    result_type=dict,
-                )
-            except Exception:
-                if self._cancelled:
-                    return self._cancelled_result(
-                        planning, scheduler_runs, codex_results, delivery_results
+            automatic_results = tuple(scheduler_run.get("codex_results", ()))
+            if automatic_results:
+                self._phase = WholeFlowPhase.CODEX
+                self._next_action = f"Codex execution completed for {spec_key}"
+                codex_results.extend(automatic_results)
+            else:
+                self._phase = WholeFlowPhase.CODEX
+                self._next_action = f"run planning, implementation and review for {spec_key}"
+                plan = codex_by_spec[spec_key]
+                self._active_child_id = f"{workflow.info().workflow_id}:codex:{plan.spec_key}"
+                try:
+                    result = await workflow.execute_child_workflow(
+                        "CodexRunWorkflow",
+                        plan.to_run_input(
+                            parent_workflow_id=workflow.info().workflow_id,
+                            parent_workflow_run_id=workflow.info().run_id,
+                        ),
+                        id=self._active_child_id,
+                        result_type=dict,
                     )
-                raise
-            finally:
-                self._active_child_id = None
-            codex_results.append(result)
-            if result.get("status") != "completed":
-                scheduler = {"status": "completed", "runs": scheduler_runs}
-                return self._failed("Codex implementation or review did not complete", planning, scheduler, tuple(codex_results))
+                except Exception:
+                    if self._cancelled:
+                        return self._cancelled_result(
+                            planning, scheduler_runs, codex_results, delivery_results
+                        )
+                    raise
+                finally:
+                    self._active_child_id = None
+                codex_results.append(result)
+                if result.get("status") != "completed":
+                    scheduler = {"status": "completed", "runs": scheduler_runs}
+                    return self._failed("Codex implementation or review did not complete", planning, scheduler, tuple(codex_results))
 
             self._phase = WholeFlowPhase.DELIVERY
             self._next_action = f"deliver and read back {spec_key}"

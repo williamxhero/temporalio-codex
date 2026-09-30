@@ -19,6 +19,7 @@ class TicketSchedulerWorkflow:
         self._status = SchedulerStatus.ACTIVE
         self._completed_tickets: set[str] = set()
         self._completion_operations: dict[str, str] = {}
+        self._codex_results: list[dict] = []
         self._reason = ""
 
     @workflow.query(name="get_scheduler_status")
@@ -63,6 +64,29 @@ class TicketSchedulerWorkflow:
             if automatic:
                 for ticket_key in automatic:
                     self._complete(ticket_key, completion_operations[ticket_key])
+                continue
+            codex_runs = dict(input.codex_runs)
+            automatic_codex = [key for key in frontier if key in codex_runs]
+            if automatic_codex:
+                for ticket_key in automatic_codex:
+                    result = await workflow.execute_child_workflow(
+                        "CodexRunWorkflow",
+                        codex_runs[ticket_key],
+                        id=f"{workflow.info().workflow_id}:codex:{ticket_key}",
+                        result_type=dict,
+                    )
+                    self._codex_results.append(result)
+                    if result.get("status") != "completed":
+                        self._status = SchedulerStatus.BLOCKED
+                        self._reason = (
+                            f"Codex execution failed for ticket {ticket_key}: "
+                            f"{result.get('summary', 'unknown failure')}"
+                        )
+                        return self._result()
+                    self._complete(
+                        ticket_key,
+                        f"{workflow.info().workflow_id}:codex:{ticket_key}",
+                    )
                 continue
             await workflow.wait_condition(
                 lambda: bool(
@@ -127,4 +151,5 @@ class TicketSchedulerWorkflow:
             completed_specs=self._completed_specs(),
             completed_tickets=tuple(sorted(self._completed_tickets)),
             reason=self._reason,
+            codex_results=tuple(self._codex_results),
         )

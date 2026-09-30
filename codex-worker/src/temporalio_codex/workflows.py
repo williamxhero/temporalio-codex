@@ -6,13 +6,16 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError, TimeoutError
 
 with workflow.unsafe.imports_passed_through():
+    from temporalio_codex.candidate_activities import (
+        CandidateCaptureInput,
+        capture_codex_candidate,
+    )
     from temporalio_codex.activities import codex_stage, foundation_stage
     from temporalio_codex.codex_models import (
         CodexObservation,
         CodexOperation,
         CodexOutcome,
     )
-    from temporalio_codex.execution_status import ExecutionProgress, report_progress
     from temporalio_codex.models import (
         RunInput,
         RunResult,
@@ -50,11 +53,11 @@ class CodexRunWorkflow:
         self._stage_results: list[StageResult] = []
         self._paused_from: RunStatus | None = None
         self._external_recheck_count = 0
-        self._progress: ExecutionProgress | None = None
+        self._candidate = None
+        self._review_evidence = None
 
     @workflow.query(name="get_status")
     def get_status(self) -> RunSnapshot:
-        progress = self._progress if self._status is RunStatus.ACTIVE else None
         return RunSnapshot(
             workflow_id=workflow.info().workflow_id,
             status=self._status,
@@ -63,18 +66,11 @@ class CodexRunWorkflow:
             pending_input=self._pending_input,
             stage_results=tuple(self._stage_results),
             external_recheck_count=self._external_recheck_count,
-            pending_reason=self._pending_input or "",
-            next_action=progress.next_action if progress else "",
-            retry_count=progress.retry_count if progress else 0,
-            deadline=progress.deadline if progress else None,
-            timeout_seconds=progress.timeout_seconds if progress else None,
-            last_error=(self._stage_results[-1].summary
-                        if self._status is RunStatus.FAILED and self._stage_results else None),
-            workflow_run_id=workflow.info().run_id,
         )
 
     @workflow.run
     async def run(self, input: RunInput) -> RunResult:
+        self._candidate = input.candidate
         if not input.stages:
             self._status = RunStatus.FAILED
             return RunResult(
@@ -147,6 +143,30 @@ class CodexRunWorkflow:
                         stage,
                         answer,
                     )
+                    if (
+                        self._candidate
+                        and stage_result.outcome is StageOutcome.COMPLETED
+                        and stage.role.value in ("implementation", "review")
+                    ):
+                        captured = await workflow.execute_activity(
+                            capture_codex_candidate,
+                            CandidateCaptureInput(
+                                candidate=self._candidate,
+                                expected_sha=self._candidate.candidate_sha
+                                if stage.role.value == "review"
+                                else None,
+                                review_json=stage_result.summary
+                                if stage.role.value == "review"
+                                else None,
+                                operation_id=stage_result.operation_id or "",
+                                thread_id=stage_result.thread_id or "",
+                                turn_id=stage_result.turn_id or "",
+                            ),
+                            start_to_close_timeout=timedelta(seconds=30),
+                            retry_policy=RetryPolicy(maximum_attempts=1),
+                        )
+                        self._candidate = captured.candidate
+                        self._review_evidence = captured.review
             except ActivityError as error:
                 if isinstance(error.cause, TimeoutError) or (
                     isinstance(error.cause, ApplicationError)
@@ -257,6 +277,8 @@ class CodexRunWorkflow:
             outcome=stage_result.outcome,
             stage=stage_result.stage,
             summary=stage_result.summary,
+            candidate=self._candidate,
+            review_evidence=self._review_evidence,
         )
 
     async def _run_codex_stage(
@@ -269,16 +291,15 @@ class CodexRunWorkflow:
         operation_id = f"{workflow.info().workflow_id}:{stage.key}:{stage.role.value}"
         thread_id = stage.thread_id
         prompt = self._codex_prompt(input.requirement, stage, answer)
+        if self._candidate and stage.role.value == "review":
+            prompt += (
+                f"\nIndependently review frozen candidate SHA {self._candidate.candidate_sha}. "
+                "Do not modify or commit files during review. Final response must be exactly "
+                "a JSON object with candidate_sha, verdict (approved or rejected), and findings "
+                "(an array). Approval requires no findings. SDK completion alone is not approval."
+            )
         answer_number = 0
         while True:
-            self._progress = await report_progress(
-                phase="codex", next_action=f"execute Codex {stage.key} turn",
-                timeout_seconds=stage.start_to_close_timeout_seconds,
-                deadline=(workflow.now() + timedelta(
-                    seconds=stage.start_to_close_timeout_seconds
-                )).isoformat(),
-                retry_count=answer_number,
-            )
             observation = await workflow.execute_activity(
                 codex_stage,
                 CodexOperation(
@@ -296,7 +317,6 @@ class CodexRunWorkflow:
                     parent_workflow_id=input.parent_workflow_id,
                     workflow_run_id=workflow.info().run_id,
                     parent_workflow_run_id=input.parent_workflow_run_id,
-                    namespace=workflow.info().namespace,
                 ),
                 start_to_close_timeout=timedelta(
                     seconds=stage.start_to_close_timeout_seconds

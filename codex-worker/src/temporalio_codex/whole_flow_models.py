@@ -1,11 +1,11 @@
-import math
 from dataclasses import dataclass
 from enum import StrEnum
 
 from temporalio_codex.codex_models import CodexRole
-from temporalio_codex.delivery_models import DeliveryInput
 from temporalio_codex.models import RunInput, StageDefinition
-from temporalio_codex.planning_models import GrillAnswer, PlanningInput, SourceOrigin
+from temporalio_codex.delivery_models import DeliveryInput
+from temporalio_codex.planning_models import PlanningInput
+from temporalio_codex.planning_models import GrillAnswer, SourceOrigin
 from temporalio_codex.spec_issue_adapter import SpecDraft
 from temporalio_codex.summary_adapter import SummaryPublicationInput
 from temporalio_codex.ticket_scheduler import SchedulerInput, validate_scheduler_graph
@@ -26,8 +26,6 @@ class WholeFlowPhase(StrEnum):
 
 class WholeFlowStatus(StrEnum):
     ACTIVE = "active"
-    DURABLE_WAITING = "durable_waiting"
-    RETRYING = "retrying"
     BLOCKED = "blocked"
     FAILED = "failed"
     NOT_VERIFIED = "not_verified"
@@ -146,12 +144,6 @@ class WholeFlowSnapshot:
     entry_launch_key: str | None = None
     entry_input_identity: str | None = None
     reason: str = ""
-    pending_reason: str = ""
-    retry_count: int = 0
-    deadline: str | None = None
-    timeout_seconds: float | None = None
-    last_error: str | None = None
-    workflow_run_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -184,15 +176,6 @@ def topological_spec_keys(input: SchedulerInput) -> tuple[str, ...]:
 
 def validate_whole_flow_input(input: WholeFlowInput) -> tuple[str, ...]:
     errors = list(validate_scheduler_graph(input.scheduler))
-    policy = input.planning
-    if (not isinstance(policy.publication_max_attempts, int)
-            or policy.publication_max_attempts < 1
-            or policy.publication_max_attempts > 100
-            or not math.isfinite(policy.publication_timeout_seconds)
-            or policy.publication_timeout_seconds <= 0
-            or not math.isfinite(policy.publication_retry_backoff_seconds)
-            or policy.publication_retry_backoff_seconds < 0):
-        errors.append("invalid bounded publication retry policy")
     if errors:
         return tuple(dict.fromkeys(errors))
 

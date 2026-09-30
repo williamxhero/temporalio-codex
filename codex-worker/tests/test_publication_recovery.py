@@ -6,8 +6,8 @@ from temporalio.api.activity.v1 import ActivityOptions
 from temporalio.api.common.v1 import ActivityType, WorkflowExecution
 from temporalio.api.workflow.v1 import PendingActivityInfo, WorkflowExecutionInfo
 from temporalio.api.workflowservice.v1 import DescribeWorkflowExecutionResponse
+
 from temporalio_codex.entry import extend_spec_publication
-from temporalio_codex.execution_status import ExecutionProgress
 from temporalio_codex.whole_flow_models import WholeFlowPhase, WholeFlowStatus
 from temporalio_codex.whole_flow_workflows import RequirementDeliveryWorkflow
 
@@ -59,11 +59,7 @@ async def test_parent_retry_accepts_live_blocked_planning_child(monkeypatch):
     monkeypatch.setattr(module.workflow, "get_external_workflow_handle", lambda _: external)
     parent = RequirementDeliveryWorkflow()
     parent._active_child_id = "delivery:planning"
-    parent._active_child_run_id = "child-run"
-    parent.execution_progress(ExecutionProgress(
-        "delivery:planning", "child-run", "planning", "blocked",
-        pending_reason="readback unknown",
-    ))
+    await parent.planning_blocked("readback unknown")
     assert await parent.retry_spec_publication()
     external.signal.assert_awaited_once_with("retry_spec_publication_signal")
     assert parent._phase is WholeFlowPhase.PLANNING

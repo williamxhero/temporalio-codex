@@ -1,5 +1,3 @@
-from dataclasses import replace
-
 from temporalio_codex.conversation_store import ConversationEvent, ConversationStore
 
 
@@ -30,9 +28,7 @@ def event(
     )
 
 
-def test_snapshot_groups_input_and_streamed_output_for_parent_workflow(
-    tmp_path,
-) -> None:
+def test_snapshot_groups_input_and_streamed_output_for_parent_workflow(tmp_path) -> None:
     store = ConversationStore(tmp_path / "conversations.sqlite3")
     try:
         store.append(
@@ -181,9 +177,7 @@ def test_snapshot_filters_workflow_execution_and_parent_execution(tmp_path) -> N
         store.close()
 
 
-def test_snapshot_excludes_events_without_run_scope_for_execution_queries(
-    tmp_path,
-) -> None:
+def test_snapshot_excludes_events_without_run_scope_for_execution_queries(tmp_path) -> None:
     store = ConversationStore(tmp_path / "conversations.sqlite3")
     try:
         store.append(
@@ -214,67 +208,5 @@ def test_snapshot_excludes_events_without_run_scope_for_execution_queries(
             for conversation in snapshot["conversations"]
             for turn in conversation["turns"]
         ] == ["current"]
-    finally:
-        store.close()
-
-
-def test_namespace_run_identity_and_authoritative_final(tmp_path):
-    store = ConversationStore(tmp_path / "events.db")
-    base = event(
-        workflow_id="child",
-        scope_workflow_id="parent",
-        operation_id="op",
-        workflow_run_id="child-run",
-        scope_workflow_run_id="parent-run",
-        kind="assistant_delta",
-        text="part",
-    )
-    try:
-        first = store.append(replace(base, event_id="same"))
-        assert store.append(replace(base, event_id="same")) == first
-        store.append(replace(base, namespace="other", event_id="same", text="foreign"))
-        store.append(
-            replace(base, workflow_run_id="another", event_id="same", text="old")
-        )
-        store.append(replace(base, kind="assistant_final", text="complete answer"))
-        assert (
-            store.snapshot("child", "child-run")["conversations"][0]["turns"][0][
-                "output"
-            ]
-            == "complete answer"
-        )
-        assert store.snapshot("parent", "wrong")["conversations"] == []
-        assert (
-            store.snapshot("child", "child-run", namespace="other")["conversations"][0][
-                "turns"
-            ][0]["output"]
-            == "foreign"
-        )
-    finally:
-        store.close()
-
-
-def test_legacy_database_migrates_without_leaking_unscoped_rows(tmp_path):
-    import sqlite3
-
-    path = tmp_path / "legacy.db"
-    connection = sqlite3.connect(path)
-    connection.execute("""CREATE TABLE codex_conversation_events (
-        sequence INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id TEXT NOT NULL,
-        scope_workflow_id TEXT NOT NULL, operation_id TEXT NOT NULL, stage TEXT NOT NULL,
-        role TEXT NOT NULL, thread_id TEXT, turn_id TEXT, kind TEXT NOT NULL,
-        text TEXT NOT NULL, detail_json TEXT NOT NULL, created_at REAL NOT NULL)""")
-    connection.execute(
-        "INSERT INTO codex_conversation_events(workflow_id,scope_workflow_id,operation_id,stage,role,kind,text,detail_json,created_at) VALUES ('child','parent','old','planning','planning','user_input','legacy','{}',1)"
-    )
-    connection.commit()
-    connection.close()
-    store = ConversationStore(path)
-    try:
-        assert (
-            store.snapshot("child")["conversations"][0]["turns"][0]["input"] == "legacy"
-        )
-        assert store.snapshot("child", "current")["conversations"] == []
-        assert store.snapshot("child", namespace="other")["conversations"] == []
     finally:
         store.close()

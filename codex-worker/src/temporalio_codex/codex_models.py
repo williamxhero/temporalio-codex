@@ -38,7 +38,6 @@ class CodexOperation:
     parent_workflow_id: str | None = None
     workflow_run_id: str | None = None
     parent_workflow_run_id: str | None = None
-    namespace: str = "default"
 
 
 @dataclass(frozen=True)
@@ -65,8 +64,6 @@ class CodexObservation:
 
 
 def validate_operation(operation: CodexOperation) -> None:
-    if not operation.namespace.strip():
-        raise ValueError("namespace must not be empty")
     if not operation.operation_id.strip():
         raise ValueError("operation_id must not be empty")
     if not operation.run_id.strip():

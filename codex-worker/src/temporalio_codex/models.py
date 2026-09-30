@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from temporalio_codex.codex_models import CodexRole
+from temporalio_codex.delivery_models import CandidateEvidence, ReviewEvidence
 
 
 class StageOutcome(StrEnum):
@@ -47,6 +48,7 @@ class RunInput:
     parent_workflow_run_id: str | None = None
     automatic: bool = False
     automatic_input_max_attempts: int = 1
+    candidate: CandidateEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -92,13 +94,6 @@ class RunSnapshot:
     pending_input: str | None
     stage_results: tuple[StageResult, ...]
     external_recheck_count: int = 0
-    pending_reason: str = ""
-    next_action: str = ""
-    retry_count: int = 0
-    deadline: str | None = None
-    timeout_seconds: float | None = None
-    last_error: str | None = None
-    workflow_run_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -108,3 +103,5 @@ class RunResult:
     outcome: StageOutcome
     stage: str
     summary: str
+    candidate: CandidateEvidence | None = None
+    review_evidence: ReviewEvidence | None = None

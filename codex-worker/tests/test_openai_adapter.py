@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
 from temporalio_codex.codex_models import (
     CodexFailure,
     CodexOperation,
@@ -89,7 +90,7 @@ async def test_stream_deltas_are_persisted_as_one_conversation_turn(tmp_path) ->
             ),
         ),
         SimpleNamespace(
-            method="item/reasoning/summaryTextDelta",
+            method="item/reasoning/textDelta",
             payload=SimpleNamespace(
                 thread_id="thread-stream", turn_id="turn-stream", delta="thinking"
             ),
@@ -206,9 +207,7 @@ async def test_existing_thread_history_is_persisted_for_workflow_chat(tmp_path) 
         root=SimpleNamespace(
             id="item-user",
             type="userMessage",
-            content=[
-                SimpleNamespace(root=SimpleNamespace(type="text", text="old prompt"))
-            ],
+            content=[SimpleNamespace(root=SimpleNamespace(type="text", text="old prompt"))],
         )
     )
     historical_agent = SimpleNamespace(
@@ -255,10 +254,7 @@ async def test_existing_thread_history_is_persisted_for_workflow_chat(tmp_path) 
         turns = snapshot["conversations"][0]["turns"]
 
         assert [turn["input"] for turn in turns] == ["old prompt", "make a plan"]
-        assert [turn["output"] for turn in turns] == [
-            "old response",
-            "current response",
-        ]
+        assert [turn["output"] for turn in turns] == ["old response", "current response"]
         thread.read.assert_awaited_once_with(include_turns=True)
     finally:
         store.close()
@@ -300,9 +296,7 @@ async def test_sdk_failures_have_stable_bounded_classifications(error, failure) 
     turn = SimpleNamespace(id="turn-1", run=AsyncMock(side_effect=error))
     thread = MagicMock(id="thread-1")
     thread.turn.return_value = turn
-    codex = SimpleNamespace(
-        thread_start=AsyncMock(return_value=thread), close=AsyncMock()
-    )
+    codex = SimpleNamespace(thread_start=AsyncMock(return_value=thread), close=AsyncMock())
     adapter = OpenAICodexAdapter(lambda: codex, "0.155.1")
 
     observation = await adapter.execute(operation())
@@ -362,189 +356,3 @@ async def test_historical_interrupt_is_explicitly_unsupported() -> None:
 
     assert await adapter.interrupt_historical_turn(operation()) is False
     assert await adapter.interrupt_owned_turn("missing") is False
-
-
-async def test_completed_operation_survives_adapter_and_store_restart(tmp_path):
-    result = SimpleNamespace(
-        id="turn-1",
-        status=SimpleNamespace(value="completed"),
-        final_response="durable",
-        error=None,
-    )
-    adapter, codex, thread = adapter_for(result)
-    path = tmp_path / "ledger.db"
-    store = ConversationStore(path)
-    adapter.conversation_store = store
-    first = await adapter.execute(operation())
-    store.close()
-    store = ConversationStore(path)
-    try:
-        restarted = OpenAICodexAdapter(lambda: codex, "0.155.1", store)
-        assert await restarted.execute(operation()) == first
-        thread.turn.assert_called_once()
-    finally:
-        store.close()
-
-
-async def test_cancelled_external_launch_never_launches_again_after_restart(tmp_path):
-    import asyncio
-
-    started = asyncio.Event()
-
-    async def launch(**kwargs):
-        started.set()
-        await asyncio.Future()
-
-    codex = SimpleNamespace(
-        thread_start=AsyncMock(side_effect=launch), close=AsyncMock()
-    )
-    store = ConversationStore(tmp_path / "ledger.db")
-    try:
-        adapter = OpenAICodexAdapter(lambda: codex, "0.155.1", store)
-        task = asyncio.create_task(adapter.execute(operation()))
-        await started.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        restarted = OpenAICodexAdapter(lambda: codex, "0.155.1", store)
-        observation = await restarted.execute(operation())
-        assert observation.outcome is CodexOutcome.UNKNOWN
-        assert observation.readback_required
-        codex.thread_start.assert_awaited_once()
-    finally:
-        store.close()
-
-
-async def test_async_sdk_turn_captures_completed_items_and_excludes_private_reasoning(
-    tmp_path,
-):
-    completed = SimpleNamespace(
-        id="turn-async", status=SimpleNamespace(value="completed"), error=None
-    )
-    events = [
-        SimpleNamespace(
-            method="item/reasoning/textDelta", payload=SimpleNamespace(delta="PRIVATE")
-        ),
-        SimpleNamespace(
-            method="turn/plan/updated",
-            payload=SimpleNamespace(
-                plan=[SimpleNamespace(step="Implement", status="inProgress")]
-            ),
-        ),
-        SimpleNamespace(
-            method="item/completed",
-            payload=SimpleNamespace(
-                item=SimpleNamespace(
-                    type="reasoning", summary=["public summary"], content=["PRIVATE"]
-                )
-            ),
-        ),
-        SimpleNamespace(
-            method="item/completed",
-            payload=SimpleNamespace(
-                item=SimpleNamespace(
-                    type="commandExecution",
-                    command="pytest",
-                    aggregated_output="passed",
-                )
-            ),
-        ),
-        SimpleNamespace(
-            method="item/agentMessage/delta", payload=SimpleNamespace(delta="partial")
-        ),
-        SimpleNamespace(
-            method="item/completed",
-            payload=SimpleNamespace(
-                item=SimpleNamespace(type="agentMessage", text="full final answer")
-            ),
-        ),
-        SimpleNamespace(
-            method="turn/completed", payload=SimpleNamespace(turn=completed)
-        ),
-    ]
-    thread = SimpleNamespace(
-        id="thread-async", turn=AsyncMock(return_value=StreamingTurn(events))
-    )
-    codex = SimpleNamespace(
-        thread_start=AsyncMock(return_value=thread), close=AsyncMock()
-    )
-    store = ConversationStore(tmp_path / "events.db")
-    try:
-        observation = await OpenAICodexAdapter(lambda: codex, "0.155.1", store).execute(
-            operation()
-        )
-        assert observation.outcome is CodexOutcome.COMPLETED
-        turn = store.snapshot("run-1")["conversations"][0]["turns"][0]
-        assert turn["output"] == "full final answer"
-        assert turn["working"] == [
-            {"kind": "plan", "text": "Implement: inProgress"},
-            {"kind": "reasoning", "text": "public summary"},
-            {"kind": "tool", "text": "pytest\npassed"},
-        ]
-        assert "PRIVATE" not in str(turn)
-        thread.turn.assert_awaited_once()
-    finally:
-        store.close()
-
-
-async def test_durable_operation_rejects_changed_input_and_separates_namespaces(
-    tmp_path,
-):
-    from dataclasses import replace
-
-    result = SimpleNamespace(
-        id="turn",
-        status=SimpleNamespace(value="completed"),
-        final_response="done",
-        error=None,
-    )
-    adapter, codex, thread = adapter_for(result)
-    store = ConversationStore(tmp_path / "events.db")
-    adapter.conversation_store = store
-    try:
-        await adapter.execute(operation())
-        restarted = OpenAICodexAdapter(lambda: codex, "0.155.1", store)
-        with pytest.raises(ValueError, match="different input"):
-            await restarted.execute(replace(operation(), prompt="changed"))
-        await restarted.execute(replace(operation(), namespace="other"))
-        assert thread.turn.call_count == 2
-    finally:
-        store.close()
-
-
-async def test_resumed_history_never_imports_private_reasoning_content(tmp_path):
-    from dataclasses import replace
-
-    result = SimpleNamespace(
-        id="turn",
-        status=SimpleNamespace(value="completed"),
-        final_response="done",
-        error=None,
-    )
-    adapter, _codex, thread = adapter_for(result)
-    thread.read = AsyncMock(
-        return_value=SimpleNamespace(
-            thread=SimpleNamespace(
-                turns=[
-                    SimpleNamespace(
-                        id="history",
-                        status="failed",
-                        items=[
-                            SimpleNamespace(
-                                type="reasoning", summary=[], content=["PRIVATE"]
-                            )
-                        ],
-                    )
-                ]
-            )
-        )
-    )
-    store = ConversationStore(tmp_path / "events.db")
-    adapter.conversation_store = store
-    try:
-        await adapter.execute(replace(operation(), thread_id="existing"))
-        snapshot = store.snapshot("run-1")
-        assert "PRIVATE" not in str(snapshot)
-        assert snapshot["conversations"][0]["turns"][0]["status"] == "failed"
-    finally:
-        store.close()

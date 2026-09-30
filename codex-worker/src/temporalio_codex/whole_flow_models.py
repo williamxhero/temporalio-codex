@@ -252,6 +252,24 @@ def validate_delivery_evidence(result: dict) -> tuple[str, ...]:
     receipts = result.get("receipts") or ()
     if not receipts:
         return ("delivery completed without receipts",)
+    candidate = result.get("candidate") or {}
+    review = result.get("review_evidence") or {}
+    sha = candidate.get("candidate_sha")
+    if (
+        not sha
+        or review.get("candidate_sha") != sha
+        or review.get("verdict") != "approved"
+        or not all(review.get(key) for key in ("operation_id", "thread_id", "turn_id"))
+    ):
+        return ("delivery has no matching candidate and approved SDK review proof",)
+    for phase in ("candidate", "acceptance", "review", "publish_candidate"):
+        if not any(
+            receipt.get("phase") == phase
+            and receipt.get("outcome") == "completed"
+            and receipt.get("candidate_sha") == sha
+            for receipt in receipts
+        ):
+            return (f"delivery has no verified {phase} receipt for its candidate",)
     push_receipts = [receipt for receipt in receipts if receipt.get("phase") == "push"]
     if not push_receipts:
         return ("delivery completed without push evidence",)

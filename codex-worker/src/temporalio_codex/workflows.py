@@ -6,11 +6,11 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError, TimeoutError
 
 with workflow.unsafe.imports_passed_through():
+    from temporalio_codex.activities import codex_stage, foundation_stage
     from temporalio_codex.candidate_activities import (
         CandidateCaptureInput,
         capture_codex_candidate,
     )
-    from temporalio_codex.activities import codex_stage, foundation_stage
     from temporalio_codex.codex_models import (
         CodexObservation,
         CodexOperation,
@@ -337,6 +337,16 @@ class CodexRunWorkflow:
                     workflow_run_id=workflow.info().run_id,
                     parent_workflow_run_id=input.parent_workflow_run_id,
                     namespace=workflow.info().namespace,
+                    output_schema={
+                        "type": "object",
+                        "properties": {
+                            "candidate_sha": {"type": "string"},
+                            "verdict": {"type": "string", "enum": ["approved", "rejected"]},
+                            "findings": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["candidate_sha", "verdict", "findings"],
+                        "additionalProperties": False,
+                    } if self._candidate and stage.role.value == "review" else None,
                 ),
                 start_to_close_timeout=timedelta(
                     seconds=stage.start_to_close_timeout_seconds

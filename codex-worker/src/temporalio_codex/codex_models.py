@@ -39,6 +39,7 @@ class CodexOperation:
     workflow_run_id: str | None = None
     parent_workflow_run_id: str | None = None
     namespace: str = "default"
+    output_schema: dict | None = None
 
 
 @dataclass(frozen=True)

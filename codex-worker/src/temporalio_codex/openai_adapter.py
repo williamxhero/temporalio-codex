@@ -103,6 +103,7 @@ class OpenAICodexAdapter:
                 effort=ReasoningEffort(operation.effort),
                 model=operation.model,
                 sandbox=self._sandbox(operation.allowed_scope),
+                output_schema=operation.output_schema,
             )
             if inspect.isawaitable(turn_handle):
                 turn_handle = await turn_handle

@@ -111,7 +111,7 @@ class ConversationServer:
                 await self._write_response(writer, 404, b"not found", "text/plain")
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
-        except (ValueError, UnicodeError, asyncio.TimeoutError):
+        except (TimeoutError, ValueError, UnicodeError):
             await self._write_response(writer, 400, b"malformed request", "text/plain")
         except (sqlite3.Error, OSError):
             await self._write_response(

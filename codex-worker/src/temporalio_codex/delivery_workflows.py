@@ -203,6 +203,8 @@ class DeliveryWorkflow:
             outcome=DeliveryOutcome.COMPLETED,
             summary="delivery completed and cleanup verified",
             receipts=tuple(self._receipts),
+            candidate=input.candidate,
+            review_evidence=input.review_evidence,
         )
 
     async def _git(self, operation: DeliveryOperation) -> DeliveryReceipt:

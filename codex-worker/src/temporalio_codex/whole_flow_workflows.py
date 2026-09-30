@@ -6,16 +6,26 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
-    from temporalio_codex.execution_status import ExecutionProgress
     from temporalio_codex.activities import delivery_git_stage
     from temporalio_codex.delivery_models import (
         CandidateEvidence,
-        ReviewEvidence,
         DeliveryOperation,
-        DeliveryPhase,
         DeliveryOutcome,
+        DeliveryPhase,
+        ReviewEvidence,
     )
+    from temporalio_codex.execution_status import ExecutionProgress
     from temporalio_codex.planning_activities import publish_ticket_issues
+    from temporalio_codex.planning_models import GrillAnswer
+    from temporalio_codex.spec_issue_adapter import (
+        SpecPublicationResult,
+        SpecPublicationStatus,
+    )
+    from temporalio_codex.ticket_issue_adapter import (
+        TicketPublicationInput,
+        TicketPublicationStatus,
+    )
+    from temporalio_codex.ticket_scheduler import SchedulerInput, SpecPlan, TicketPlan
     from temporalio_codex.whole_flow_models import (
         WholeFlowInput,
         WholeFlowPhase,
@@ -25,16 +35,6 @@ with workflow.unsafe.imports_passed_through():
         topological_spec_keys,
         validate_delivery_evidence,
         validate_whole_flow_input,
-    )
-    from temporalio_codex.planning_models import GrillAnswer
-    from temporalio_codex.ticket_scheduler import SchedulerInput, SpecPlan, TicketPlan
-    from temporalio_codex.ticket_issue_adapter import (
-        TicketPublicationInput,
-        TicketPublicationStatus,
-    )
-    from temporalio_codex.spec_issue_adapter import (
-        SpecPublicationResult,
-        SpecPublicationStatus,
     )
 
 
@@ -376,6 +376,7 @@ class RequirementDeliveryWorkflow:
             scheduler_input = SchedulerInput(
                 specs=(SpecPlan(spec_key),),
                 tickets=spec_tickets,
+                automatic=True,
                 completion_operations=tuple(
                     (ticket.key, completion_by_ticket[ticket.key])
                     for ticket in spec_tickets
@@ -605,6 +606,16 @@ class RequirementDeliveryWorkflow:
             finally:
                 self._active_child_id = None
             delivery_results.append(result)
+            if (
+                result.get("status") == "completed"
+                and (result.get("candidate") != final_candidate
+                     or result.get("review_evidence") != final_review)
+            ):
+                return self._failed(
+                    "delivery proof differs from the frozen Codex candidate and review",
+                    planning, {"runs": scheduler_runs},
+                    tuple(codex_results), tuple(delivery_results),
+                )
             evidence_errors = validate_delivery_evidence(result)
             if evidence_errors:
                 scheduler = {"status": "completed", "runs": scheduler_runs}

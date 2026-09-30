@@ -2,12 +2,16 @@ import asyncio
 import hashlib
 
 import pytest
-from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
+from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import Worker
 
-from temporalio_codex.planning_activities import prepare_grill, publish_spec_issues
+from temporalio_codex.planning_activities import (
+    configure_spec_issue_gateway,
+    prepare_grill,
+    publish_spec_issues,
+)
 from temporalio_codex.planning_models import (
     GrillAnswer,
     PlanningInput,
@@ -16,7 +20,6 @@ from temporalio_codex.planning_models import (
     SourceOrigin,
 )
 from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
-from temporalio_codex.planning_activities import configure_spec_issue_gateway
 from temporalio_codex.spec_issue_adapter import FakeSpecIssueGateway, SpecDraft
 
 
@@ -55,7 +58,9 @@ def configure_fake_issue_gateway() -> None:
 
 
 async def test_text_intake_completes_without_manual_planning_signals() -> None:
-    input = PlanningInput(origin=SourceOrigin.TEXT, source_text="ship a governed change")
+    input = PlanningInput(
+        origin=SourceOrigin.TEXT, source_text="ship a governed change"
+    )
     async with await WorkflowEnvironment.start_time_skipping() as environment:
         async with Worker(
             environment.client,
@@ -68,15 +73,18 @@ async def test_text_intake_completes_without_manual_planning_signals() -> None:
 
     assert result.status is PlanningStatus.COMPLETED
     assert result.phase is PlanningPhase.COMPLETED
-    assert result.source.source_identity == hashlib.sha256(
-        b"text:ship a governed change"
-    ).hexdigest()
+    assert (
+        result.source.source_identity
+        == hashlib.sha256(b"text:ship a governed change").hexdigest()
+    )
     assert result.grill.decisions == ("ship a governed change",)
     assert result.confirmation_operation_id.startswith("planning-confirm:")
     assert result.publication_operation_id.startswith("planning-publish:")
 
 
-async def test_historical_chat_without_readable_context_blocks_without_manual_input() -> None:
+async def test_historical_chat_without_readable_context_blocks_without_manual_input() -> (
+    None
+):
     input = PlanningInput(
         origin=SourceOrigin.HISTORICAL_CHAT,
         source_reference="artifact://chat-123",
@@ -197,7 +205,9 @@ async def test_unknown_spec_publication_can_retry_by_operation_identity() -> Non
             ):
                 handle = await start_planning(environment, "planning-retry", input)
                 for _ in range(100):
-                    snapshot = await handle.query(RequirementPlanningWorkflow.get_status)
+                    snapshot = await handle.query(
+                        RequirementPlanningWorkflow.get_status
+                    )
                     if snapshot.status is PlanningStatus.UNKNOWN:
                         break
                     await asyncio.sleep(0.01)
@@ -236,15 +246,18 @@ async def failed_publication(input):
 
 async def test_activity_failure_enters_readback_instead_of_failing_workflow():
     input = PlanningInput(
-        origin=SourceOrigin.TEXT, source_text="failed publication",
+        origin=SourceOrigin.TEXT,
+        source_text="failed publication",
         specs=(SpecDraft("a", "A", "A", ("works",), ("test",)),),
         grill_answers=(GrillAnswer(1, "approved"),),
-        confirmation_operation_id="confirm", publication_operation_id="publish",
+        confirmation_operation_id="confirm",
+        publication_operation_id="publish",
         publication_timeout_seconds=0.1,
     )
     async with await WorkflowEnvironment.start_time_skipping() as environment:
         async with Worker(
-            environment.client, task_queue="publication-failure",
+            environment.client,
+            task_queue="publication-failure",
             workflows=[RequirementPlanningWorkflow],
             activities=[prepare_grill, failed_publication],
         ):

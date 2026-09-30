@@ -6,6 +6,7 @@ from temporalio.api.activity.v1 import ActivityOptions
 from temporalio.api.common.v1 import ActivityType, WorkflowExecution
 from temporalio.api.workflow.v1 import PendingActivityInfo, WorkflowExecutionInfo
 from temporalio.api.workflowservice.v1 import DescribeWorkflowExecutionResponse
+
 from temporalio_codex.entry import extend_spec_publication
 from temporalio_codex.execution_status import ExecutionProgress
 from temporalio_codex.whole_flow_models import WholeFlowPhase, WholeFlowStatus

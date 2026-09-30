@@ -12,7 +12,6 @@ from temporalio_codex.delivery_models import (
 )
 from temporalio_codex.git_adapter import GitCommandError, LocalGitAdapter
 
-
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git is required")
 
 

@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -21,29 +20,31 @@ from temporalio_codex.activities import (
     foundation_stage,
     heartbeat_stage,
 )
-from temporalio_codex.openai_adapter import OpenAICodexAdapter
-from temporalio_codex.git_adapter import LocalGitAdapter
 from temporalio_codex.candidate_activities import capture_codex_candidate
 from temporalio_codex.delivery_adapter import FakeDeliveryAdapter
 from temporalio_codex.delivery_models import (
     DeliveryInput,
-    DeliveryPhase,
     DeliveryOutcome,
+    DeliveryPhase,
     DeliveryReceipt,
 )
+from temporalio_codex.delivery_workflows import DeliveryWorkflow
+from temporalio_codex.execution_status import ExecutionProgress
+from temporalio_codex.git_adapter import LocalGitAdapter
+from temporalio_codex.openai_adapter import OpenAICodexAdapter
 from temporalio_codex.planning_activities import (
-    configure_ticket_issue_gateway,
     configure_spec_issue_gateway,
-    publish_ticket_issues,
+    configure_ticket_issue_gateway,
     prepare_grill,
     publish_spec_issues,
+    publish_ticket_issues,
 )
 from temporalio_codex.planning_models import (
     GrillAnswer,
     SourceOrigin,
 )
+from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
 from temporalio_codex.spec_issue_adapter import FakeSpecIssueGateway, SpecDraft
-from temporalio_codex.ticket_issue_adapter import FakeTicketIssueGateway
 from temporalio_codex.summary_activities import (
     configure_summary_gateway,
     publish_delivery_summary,
@@ -52,23 +53,21 @@ from temporalio_codex.summary_adapter import (
     FakeSummaryCommentGateway,
     SummaryPublicationInput,
 )
-from temporalio_codex.ticket_workflows import TicketSchedulerWorkflow
+from temporalio_codex.summary_workflows import DeliverySummaryWorkflow
+from temporalio_codex.ticket_issue_adapter import FakeTicketIssueGateway
 from temporalio_codex.ticket_scheduler import SchedulerInput, SpecPlan, TicketPlan
+from temporalio_codex.ticket_workflows import TicketSchedulerWorkflow
 from temporalio_codex.whole_flow_models import (
+    PlanningPayload,
     SpecCodexPlan,
     SpecDeliveryPlan,
     WholeFlowInput,
     WholeFlowPhase,
     WholeFlowStatus,
-    PlanningPayload,
     validate_whole_flow_input,
 )
 from temporalio_codex.whole_flow_workflows import RequirementDeliveryWorkflow
 from temporalio_codex.workflows import CodexRunWorkflow
-from temporalio_codex.delivery_workflows import DeliveryWorkflow
-from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
-from temporalio_codex.summary_workflows import DeliverySummaryWorkflow
-from temporalio_codex.execution_status import ExecutionProgress
 
 
 def spec_drafts() -> tuple[SpecDraft, ...]:
@@ -220,7 +219,6 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
         final_response="governed change completed",
         error=None,
     )
-    turn = SimpleNamespace(id="turn-acceptance", run=AsyncMock(return_value=sdk_result))
     thread = MagicMock(id="thread-acceptance")
 
     def sdk_turn(prompt, **kwargs):
@@ -253,6 +251,9 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
                 git(workspace, "add", ".")
                 git(workspace, "commit", "-m", f"implement {ticket}")
             if prompt.startswith("Role: review"):
+                assert kwargs["output_schema"]["required"] == [
+                    "candidate_sha", "verdict", "findings"
+                ]
                 sha = git(workspace, "rev-parse", "HEAD")
                 if failure_phase == "review-dirty":
                     (workspace / "dirty").write_text(
@@ -372,7 +373,7 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
                 )
                 try:
                     result = await asyncio.wait_for(handle.result(), timeout=30)
-                except asyncio.TimeoutError as error:
+                except TimeoutError as error:
                     snapshot = await handle.query(
                         RequirementDeliveryWorkflow.get_status
                     )

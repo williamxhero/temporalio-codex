@@ -1,10 +1,10 @@
 import asyncio
 from dataclasses import replace
 
+from acceptance.test_whole_flow import whole_flow_input
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from acceptance.test_whole_flow import whole_flow_input
 from temporalio_codex.activities import (
     codex_stage,
     delivery_git_stage,
@@ -12,21 +12,21 @@ from temporalio_codex.activities import (
     foundation_stage,
     heartbeat_stage,
 )
+from temporalio_codex.delivery_workflows import DeliveryWorkflow
 from temporalio_codex.planning_activities import (
     configure_spec_issue_gateway,
     prepare_grill,
     publish_spec_issues,
     publish_ticket_issues,
 )
-from temporalio_codex.summary_activities import publish_delivery_summary
-from temporalio_codex.delivery_workflows import DeliveryWorkflow
 from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
+from temporalio_codex.spec_issue_adapter import FakeSpecIssueGateway
+from temporalio_codex.summary_activities import publish_delivery_summary
 from temporalio_codex.summary_workflows import DeliverySummaryWorkflow
 from temporalio_codex.ticket_workflows import TicketSchedulerWorkflow
-from temporalio_codex.workflows import CodexRunWorkflow
 from temporalio_codex.whole_flow_models import WholeFlowPhase, WholeFlowStatus
-from temporalio_codex.spec_issue_adapter import FakeSpecIssueGateway
 from temporalio_codex.whole_flow_workflows import RequirementDeliveryWorkflow
+from temporalio_codex.workflows import CodexRunWorkflow
 
 
 async def test_public_controls_preserve_identity_and_cancel_before_children() -> None:

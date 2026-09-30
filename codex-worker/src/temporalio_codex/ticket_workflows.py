@@ -119,6 +119,12 @@ class TicketSchedulerWorkflow:
                         f"{workflow.info().workflow_id}:codex:{ticket_key}",
                     )
                 continue
+            if input.automatic:
+                self._status = SchedulerStatus.BLOCKED
+                self._reason = (
+                    "ready ticket has no automatic Codex plan or completion operation"
+                )
+                return self._result()
             await report_progress(phase="tickets", status="durable_waiting",
                                   pending_reason="waiting for ticket completion",
                                   next_action="observe durable ticket completion")

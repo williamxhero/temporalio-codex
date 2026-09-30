@@ -122,6 +122,8 @@ class DeliveryResult:
     outcome: DeliveryOutcome
     summary: str
     receipts: tuple[DeliveryReceipt, ...] = ()
+    candidate: CandidateEvidence | None = None
+    review_evidence: ReviewEvidence | None = None
 
 
 def validate_operation(operation: DeliveryOperation) -> None:

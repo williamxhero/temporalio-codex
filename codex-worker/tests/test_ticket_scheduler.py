@@ -3,6 +3,8 @@ import asyncio
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
+from temporalio_codex.activities import foundation_stage
+from temporalio_codex.models import RunInput, StageDefinition
 from temporalio_codex.ticket_scheduler import (
     SchedulerInput,
     SchedulerStatus,
@@ -11,9 +13,7 @@ from temporalio_codex.ticket_scheduler import (
     validate_scheduler_graph,
 )
 from temporalio_codex.ticket_workflows import TicketSchedulerWorkflow
-from temporalio_codex.models import RunInput, StageDefinition
 from temporalio_codex.workflows import CodexRunWorkflow
-from temporalio_codex.activities import foundation_stage
 
 
 def scheduler_input() -> SchedulerInput:
@@ -202,6 +202,27 @@ async def test_ready_ticket_runs_codex_and_completes_without_update() -> None:
     assert result.status is SchedulerStatus.COMPLETED
     assert result.completed_tickets == ("first-a", "first-b")
     assert len(result.codex_results) == 2
+
+
+async def test_automatic_scheduler_blocks_ready_ticket_without_codex_plan() -> None:
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="ticket-missing-plan",
+            workflows=[TicketSchedulerWorkflow],
+        ):
+            result = await environment.client.execute_workflow(
+                TicketSchedulerWorkflow.run,
+                SchedulerInput(
+                    specs=(SpecPlan("first"),),
+                    tickets=(TicketPlan("first-a", "first"),),
+                    automatic=True,
+                ),
+                id="ticket-missing-plan",
+                task_queue="ticket-missing-plan",
+            )
+    assert result.status is SchedulerStatus.BLOCKED
+    assert "no automatic Codex plan" in result.reason
 
 
 def test_scheduler_graph_rejects_unresolved_and_cycle() -> None:

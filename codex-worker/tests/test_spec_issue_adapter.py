@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock
+
 from temporalio_codex.spec_issue_adapter import (
     FakeSpecIssueGateway,
     GhCliSpecIssueGateway,
@@ -8,7 +10,6 @@ from temporalio_codex.spec_issue_adapter import (
     topological_specs,
     validate_spec_graph,
 )
-from unittest.mock import AsyncMock
 
 
 def draft(key: str, dependencies=()):

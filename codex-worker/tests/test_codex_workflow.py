@@ -2,7 +2,6 @@ import asyncio
 from dataclasses import replace
 
 import pytest
-
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 

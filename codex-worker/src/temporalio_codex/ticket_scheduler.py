@@ -35,6 +35,7 @@ class SchedulerInput:
     codex_runs: tuple[tuple[str, RunInput], ...] = ()
     parent_workflow_id: str | None = None
     parent_workflow_run_id: str | None = None
+    automatic: bool = False
 
 
 @dataclass(frozen=True)

@@ -34,7 +34,7 @@ builds leave the serving process intact. A failed restart leaves its logs and
 staged assets available for diagnosis.
 
 The server binds to `127.0.0.1`; configure the worker/client with
-`TEMPORAL_ADDRESS=127.0.0.1:7233` to avoid a `localhost` IPv6 address connecting
+`--target-host 127.0.0.1:7233` to avoid a `localhost` IPv6 address connecting
 to a different listener on Windows.
 
 ## Ticket 88 verification (2026-09-30)

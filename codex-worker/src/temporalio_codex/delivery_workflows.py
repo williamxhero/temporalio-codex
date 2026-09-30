@@ -1,3 +1,4 @@
+import math
 from datetime import timedelta
 
 from temporalio import workflow
@@ -29,6 +30,7 @@ class DeliveryWorkflow:
         self._automatic = False
         self._readback_max_attempts = 60
         self._readback_backoff_seconds = 5.0
+        self._acceptance_timeout_seconds = 1800.0
 
     @workflow.query(name="get_delivery_status")
     def get_status(self) -> DeliverySnapshot:
@@ -44,7 +46,10 @@ class DeliveryWorkflow:
         self._automatic = input.automatic
         self._readback_max_attempts = input.readback_max_attempts
         self._readback_backoff_seconds = input.readback_backoff_seconds
-        if self._readback_max_attempts < 1 or self._readback_backoff_seconds < 0:
+        self._acceptance_timeout_seconds = input.acceptance_timeout_seconds
+        if (self._readback_max_attempts < 1 or self._readback_backoff_seconds < 0
+                or not math.isfinite(self._acceptance_timeout_seconds)
+                or self._acceptance_timeout_seconds <= 0):
             self._status = DeliveryStatus.FAILED
             return DeliveryResult(
                 workflow_id=workflow.info().workflow_id,
@@ -209,13 +214,17 @@ class DeliveryWorkflow:
 
     async def _git(self, operation: DeliveryOperation) -> DeliveryReceipt:
         self._phase = operation.phase
+        timeout_seconds = (
+            self._acceptance_timeout_seconds
+            if operation.phase is DeliveryPhase.ACCEPTANCE else 30
+        )
         await report_progress(phase="delivery", next_action=f"execute {operation.phase.value}",
-                              timeout_seconds=30,
-                              deadline=(workflow.now() + timedelta(seconds=30)).isoformat())
+                              timeout_seconds=timeout_seconds,
+                              deadline=(workflow.now() + timedelta(seconds=timeout_seconds)).isoformat())
         return await workflow.execute_activity(
             delivery_git_stage,
             operation,
-            start_to_close_timeout=timedelta(seconds=30),
+            start_to_close_timeout=timedelta(seconds=timeout_seconds),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
 

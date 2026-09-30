@@ -44,6 +44,7 @@ class SpecCodexPlan:
     approval_policy: str = "deny_all"
     model: str = "gpt-5-codex"
     effort: str = "low"
+    start_to_close_timeout_seconds: float = 1800
 
     def to_run_input(
         self,
@@ -60,6 +61,7 @@ class SpecCodexPlan:
                 approval_policy=self.approval_policy,
                 model=self.model,
                 effort=self.effort,
+                start_to_close_timeout_seconds=self.start_to_close_timeout_seconds,
             )
             for role in (CodexRole.PLANNING, CodexRole.IMPLEMENTATION, CodexRole.REVIEW)
         )
@@ -184,6 +186,12 @@ def topological_spec_keys(input: SchedulerInput) -> tuple[str, ...]:
 
 def validate_whole_flow_input(input: WholeFlowInput) -> tuple[str, ...]:
     errors = list(validate_scheduler_graph(input.scheduler))
+    if any(
+        not math.isfinite(plan.start_to_close_timeout_seconds)
+        or plan.start_to_close_timeout_seconds <= 0
+        for plan in input.codex
+    ):
+        errors.append("invalid bounded Codex stage timeout")
     policy = input.planning
     if (not isinstance(policy.publication_max_attempts, int)
             or policy.publication_max_attempts < 1

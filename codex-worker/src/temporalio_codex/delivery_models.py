@@ -105,6 +105,7 @@ class DeliveryInput:
     readback_backoff_seconds: float = 5
     candidate: CandidateEvidence | None = None
     review_evidence: ReviewEvidence | None = None
+    acceptance_timeout_seconds: float = 1800
 
 
 @dataclass(frozen=True)

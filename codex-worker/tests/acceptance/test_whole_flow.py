@@ -134,6 +134,7 @@ def whole_flow_input() -> WholeFlowInput:
                 requirement=f"deliver {key}",
                 repository=f"D:/acceptance/{key}",
                 allowed_scope=("src/",),
+                start_to_close_timeout_seconds=30,
             )
             for key in ("foundation", "follow-up")
         ),

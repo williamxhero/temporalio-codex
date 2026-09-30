@@ -5,6 +5,284 @@ import pytest
 from temporalio_codex.conversation_store import ConversationEvent, ConversationStore
 
 
+@pytest.mark.parametrize("final", [None, "**Result**\n\nFull answer\nwith details."])
+def test_failed_turn_displays_cause_and_preserves_raw_error(tmp_path, final):
+    store = ConversationStore(tmp_path / "failure.db")
+    base = event(
+        workflow_id="workflow",
+        scope_workflow_id="workflow",
+        operation_id="op",
+        kind="error",
+    )
+    raw = "\nConnection lost\nTraceback (most recent call last):\n  private_path.py:42"
+    try:
+        if final:
+            store.append(replace(base, kind="assistant_final", text=final))
+        store.append(replace(base, text=raw))
+        turn = store.snapshot("workflow")["conversations"][0]["turns"][0]
+        assert turn["status"] == "failed"
+        assert turn["output"] == (final or raw)
+        assert turn["displayOutput"] == (final or "Connection lost")
+        assert turn["activities"][0]["summary"] == "Connection lost"
+        assert turn["activities"][0]["text"] == raw
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("code", "status", "result", "expected"),
+    [
+        (
+            0,
+            "completed",
+            "===== 12 passed, 1 skipped in 0.3s =====",
+            "pytest tests -vv | 12 passed, 1 skipped | Passed (exit 0)",
+        ),
+        (
+            1,
+            "failed",
+            "===== 2 failed, 10 passed in 0.3s =====",
+            "pytest tests -vv | 2 failed, 10 passed | Failed (exit 1)",
+        ),
+        (None, "inProgress", "", "pytest tests -vv | inProgress"),
+        (True, "completed", "", "pytest tests -vv | completed"),
+    ],
+)
+def test_test_activity_exposes_compact_result_with_full_evidence(
+    tmp_path, code, status, result, expected
+):
+    store = ConversationStore(tmp_path / "results.db")
+    text = "pytest tests -vv\n" + result
+    try:
+        store.append(
+            replace(
+                event(
+                    workflow_id="workflow",
+                    scope_workflow_id="workflow",
+                    operation_id="op",
+                    kind="tool_delta",
+                    text=text,
+                ),
+                detail={
+                    "method": "item/completed",
+                    "item_type": "commandExecution",
+                    "command": "pytest tests -vv",
+                    "exit_code": code,
+                    "status": status,
+                    "aggregated_output": result,
+                },
+            )
+        )
+        activity = store.snapshot("workflow")["conversations"][0]["turns"][0][
+            "activities"
+        ][0]
+        assert activity["summary"] == expected
+        assert activity["text"] == text
+        assert activity["detail"]["aggregated_output"] == result
+    finally:
+        store.close()
+
+
+def test_file_activity_counts_all_changes_and_bounds_visible_paths(tmp_path):
+    paths = [
+        "src/" + "long-directory/" * 20 + name
+        for name in ("first.py", "second.py", "third.py", "fourth.py")
+    ]
+    raw = "Files changed: " + ", ".join(paths)
+    store = ConversationStore(tmp_path / "files.db")
+    try:
+        store.append(
+            replace(
+                event(
+                    workflow_id="workflow",
+                    scope_workflow_id="workflow",
+                    operation_id="op",
+                    kind="tool_delta",
+                    text=raw,
+                ),
+                detail={
+                    "method": "item/completed",
+                    "item_type": "fileChange",
+                    "paths": paths,
+                },
+            )
+        )
+        activity = store.snapshot("workflow")["conversations"][0]["turns"][0][
+            "activities"
+        ][0]
+        assert (
+            activity["summary"]
+            == "Files changed (4): first.py, second.py, third.py (+1 more)"
+        )
+        assert activity["text"] == raw
+        assert activity["detail"]["paths"] == paths
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("command", [None, [], {"invalid": True}])
+def test_blank_tool_output_with_malformed_command_remains_readable(tmp_path, command):
+    store = ConversationStore(tmp_path / "malformed.db")
+    try:
+        store.append(
+            replace(
+                event(
+                    workflow_id="workflow",
+                    scope_workflow_id="workflow",
+                    operation_id="op",
+                    kind="tool_delta",
+                    text="\n",
+                ),
+                detail={
+                    "command": command,
+                    "item_type": "commandExecution",
+                    "status": "failed",
+                },
+            )
+        )
+        activity = store.snapshot("workflow")["conversations"][0]["turns"][0][
+            "activities"
+        ][0]
+        assert activity["summary"] == "Command | failed"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "item_type", "text"),
+    [
+        ("reasoning_delta", "reasoning", "Public summary"),
+        ("tool_delta", "fileChange", "Files changed: src/main.py"),
+        ("tool_delta", "mcpToolCall", "search.query"),
+        ("plan_delta", "plan", "New plan"),
+    ],
+)
+def test_legacy_command_stream_survives_unrelated_completed_items(
+    tmp_path, kind, item_type, text
+):
+    store = ConversationStore(tmp_path / "legacy.db")
+    base = event(
+        workflow_id="workflow",
+        scope_workflow_id="workflow",
+        operation_id="op",
+        kind="tool_delta",
+    )
+    try:
+        store.append(
+            replace(
+                base,
+                text="valuable stdout",
+                detail={"method": "item/commandExecution/outputDelta"},
+            )
+        )
+        store.append(
+            replace(
+                base,
+                kind=kind,
+                text=text,
+                detail={"method": "item/completed", "item_type": item_type},
+            )
+        )
+        activities = store.snapshot("workflow")["conversations"][0]["turns"][0][
+            "activities"
+        ]
+        assert len(activities) == 2
+        assert activities[0]["text"] == "valuable stdout"
+        assert activities[1]["text"] == text
+    finally:
+        store.close()
+
+
+def test_plan_snapshot_shows_latest_status_and_deltas_still_stream(tmp_path):
+    store = ConversationStore(tmp_path / "plan.db")
+    base = event(
+        workflow_id="workflow",
+        scope_workflow_id="workflow",
+        operation_id="op",
+        kind="plan_delta",
+    )
+    try:
+        store.append(
+            replace(
+                base,
+                text="Implement: inProgress",
+                detail={"method": "turn/plan/updated"},
+            )
+        )
+        store.append(
+            replace(
+                base,
+                kind="tool_delta",
+                text="git status",
+                detail={"method": "item/completed", "item_type": "commandExecution"},
+            )
+        )
+        store.append(
+            replace(
+                base,
+                text="Implement: completed",
+                detail={"method": "turn/plan/updated"},
+            )
+        )
+        store.append(
+            replace(
+                base,
+                text="Next ",
+                detail={"method": "item/plan/delta", "item_id": "plan-2"},
+            )
+        )
+        store.append(
+            replace(
+                base,
+                text="step",
+                detail={"method": "item/plan/delta", "item_id": "plan-2"},
+            )
+        )
+        plans = [
+            a
+            for a in store.snapshot("workflow")["conversations"][0]["turns"][0][
+                "activities"
+            ]
+            if a["category"] == "plan"
+        ]
+        assert [a["text"] for a in plans] == ["Implement: completed", "Next step"]
+        assert "inProgress" not in str(plans)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("status", ["inProgress", "provider status " * 30])
+def test_command_summary_stays_bounded_without_losing_raw_evidence(tmp_path, status):
+    store = ConversationStore(tmp_path / "bounded.db")
+    command = "python script.py " + "long-argument " * 100
+    try:
+        store.append(
+            replace(
+                event(
+                    workflow_id="workflow",
+                    scope_workflow_id="workflow",
+                    operation_id="op",
+                    kind="tool_delta",
+                    text=command,
+                ),
+                detail={
+                    "item_type": "commandExecution",
+                    "command": command,
+                    "status": status,
+                },
+            )
+        )
+        activity = store.snapshot("workflow")["conversations"][0]["turns"][0][
+            "activities"
+        ][0]
+        assert len(activity["summary"]) <= 160
+        assert activity["summary"].startswith("python script.py")
+        assert activity["text"] == command
+        assert activity["detail"]["status"] == status
+    finally:
+        store.close()
+
+
 def event(
     *,
     workflow_id: str,
@@ -336,7 +614,7 @@ def test_snapshot_exposes_readable_activity_summaries_and_preserves_details(tmp_
             {
                 "id": "command-1",
                 "category": "test",
-                "summary": "uv run pytest tests/acceptance",
+                "summary": "uv run pytest tests/acceptance | Passed (exit 0)",
                 "text": "uv run pytest tests/acceptance",
                 "detail": {"method": "command/exec/outputDelta", "exit_code": 0},
             },
@@ -472,7 +750,7 @@ def test_streamed_command_output_is_replaced_by_completed_item(tmp_path):
             {
                 "id": "delta-1",
                 "category": "test",
-                "summary": "uv run pytest tests",
+                "summary": "uv run pytest tests | Passed (exit 0)",
                 "text": "uv run pytest tests\npart output",
                 "detail": completed.detail,
             }
@@ -484,15 +762,34 @@ def test_streamed_command_output_is_replaced_by_completed_item(tmp_path):
 def test_legacy_context_read_stream_is_one_activity_with_complete_evidence(tmp_path):
     store = ConversationStore(tmp_path / "context.db")
     base = event(
-        workflow_id="workflow", scope_workflow_id="workflow",
-        operation_id="op", kind="tool_delta",
+        workflow_id="workflow",
+        scope_workflow_id="workflow",
+        operation_id="op",
+        kind="tool_delta",
     )
-    command = "pwsh -Command \"Get-Content C:/skills/tdd/SKILL.md; Get-Content README.md\""
+    command = (
+        'pwsh -Command "Get-Content C:/skills/tdd/SKILL.md; Get-Content README.md"'
+    )
     source = "# TDD\nInternal skill source\n# README\nProject instructions"
     try:
-        for chunk in ("# TDD\n", "Internal skill source\n", "# README\n", "Project instructions"):
-            store.append(replace(base, text=chunk, detail={"method": "item/commandExecution/outputDelta"}))
-        store.append(replace(base, text=command + "\n" + source, detail={"method": "item/completed"}))
+        for chunk in (
+            "# TDD\n",
+            "Internal skill source\n",
+            "# README\n",
+            "Project instructions",
+        ):
+            store.append(
+                replace(
+                    base,
+                    text=chunk,
+                    detail={"method": "item/commandExecution/outputDelta"},
+                )
+            )
+        store.append(
+            replace(
+                base, text=command + "\n" + source, detail={"method": "item/completed"}
+            )
+        )
         turn = store.snapshot("workflow")["conversations"][0]["turns"][0]
         assert len(turn["activities"]) == 1
         activity = turn["activities"][0]
@@ -508,15 +805,33 @@ def test_legacy_context_read_stream_is_one_activity_with_complete_evidence(tmp_p
     ("original", "display", "markers"),
     [
         ("SDK_PROBE_OK", "", ["SDK_PROBE_OK"]),
-        ("**Result**\n\nAll tests passed.\n\nSDK_PROBE_OK", "**Result**\n\nAll tests passed.", ["SDK_PROBE_OK"]),
-        ("The SDK_PROBE_OK marker confirms the probe.", "The SDK_PROBE_OK marker confirms the probe.", []),
+        (
+            "**Result**\n\nAll tests passed.\n\nSDK_PROBE_OK",
+            "**Result**\n\nAll tests passed.",
+            ["SDK_PROBE_OK"],
+        ),
+        (
+            "The SDK_PROBE_OK marker confirms the probe.",
+            "The SDK_PROBE_OK marker confirms the probe.",
+            [],
+        ),
         ("```text\nSDK_PROBE_OK\n```", "```text\nSDK_PROBE_OK\n```", []),
     ],
 )
-def test_snapshot_separates_standalone_probe_metadata_from_complete_answer(tmp_path, original, display, markers):
+def test_snapshot_separates_standalone_probe_metadata_from_complete_answer(
+    tmp_path, original, display, markers
+):
     store = ConversationStore(tmp_path / "probe.db")
     try:
-        store.append(event(workflow_id="workflow", scope_workflow_id="workflow", operation_id="op", kind="assistant_final", text=original))
+        store.append(
+            event(
+                workflow_id="workflow",
+                scope_workflow_id="workflow",
+                operation_id="op",
+                kind="assistant_final",
+                text=original,
+            )
+        )
         turn = store.snapshot("workflow")["conversations"][0]["turns"][0]
         assert turn["output"] == original
         assert turn["displayOutput"] == display
@@ -527,20 +842,46 @@ def test_snapshot_separates_standalone_probe_metadata_from_complete_answer(tmp_p
 
 def test_structured_context_reads_are_concise_and_file_edits_remain_edits(tmp_path):
     store = ConversationStore(tmp_path / "structured-context.db")
-    base = event(workflow_id="workflow", scope_workflow_id="workflow", operation_id="op", kind="tool_delta")
+    base = event(
+        workflow_id="workflow",
+        scope_workflow_id="workflow",
+        operation_id="op",
+        kind="tool_delta",
+    )
     try:
-        store.append(replace(base, text="full config source\nsettings", detail={
-            "method": "item/completed", "item_id": "read-1", "item_type": "commandExecution",
-            "command": "cat policy.md config.yaml AGENTS.md", "exit_code": 0,
-        }))
-        store.append(replace(base, text="Files changed: README.md", detail={
-            "method": "item/completed", "item_id": "edit-1", "item_type": "fileChange",
-            "paths": ["README.md"],
-        }))
-        activities = store.snapshot("workflow")["conversations"][0]["turns"][0]["activities"]
-        assert [(activity["category"], activity["summary"]) for activity in activities] == [
+        store.append(
+            replace(
+                base,
+                text="full config source\nsettings",
+                detail={
+                    "method": "item/completed",
+                    "item_id": "read-1",
+                    "item_type": "commandExecution",
+                    "command": "cat policy.md config.yaml AGENTS.md",
+                    "exit_code": 0,
+                },
+            )
+        )
+        store.append(
+            replace(
+                base,
+                text="Files changed: README.md",
+                detail={
+                    "method": "item/completed",
+                    "item_id": "edit-1",
+                    "item_type": "fileChange",
+                    "paths": ["README.md"],
+                },
+            )
+        )
+        activities = store.snapshot("workflow")["conversations"][0]["turns"][0][
+            "activities"
+        ]
+        assert [
+            (activity["category"], activity["summary"]) for activity in activities
+        ] == [
             ("context", "Read context: policy.md, config.yaml, AGENTS.md"),
-            ("file", "Files changed: README.md"),
+            ("file", "Files changed (1): README.md"),
         ]
         assert activities[0]["text"] == "full config source\nsettings"
     finally:
@@ -549,13 +890,23 @@ def test_structured_context_reads_are_concise_and_file_edits_remain_edits(tmp_pa
 
 def test_context_summary_excludes_command_separator_strings(tmp_path):
     store = ConversationStore(tmp_path / "separator.db")
-    command = 'pwsh -Command "Get-Content C:/skills/tdd/SKILL.md; Write-Output \"`n---README---\"; Get-Content README.md"'
+    command = 'pwsh -Command "Get-Content C:/skills/tdd/SKILL.md; Write-Output "`n---README---"; Get-Content README.md"'
     try:
-        store.append(replace(
-            event(workflow_id="workflow", scope_workflow_id="workflow", operation_id="op", kind="tool_delta", text=command + "\nfull source"),
-            detail={"method": "item/completed"},
-        ))
-        activity = store.snapshot("workflow")["conversations"][0]["turns"][0]["activities"][0]
+        store.append(
+            replace(
+                event(
+                    workflow_id="workflow",
+                    scope_workflow_id="workflow",
+                    operation_id="op",
+                    kind="tool_delta",
+                    text=command + "\nfull source",
+                ),
+                detail={"method": "item/completed"},
+            )
+        )
+        activity = store.snapshot("workflow")["conversations"][0]["turns"][0][
+            "activities"
+        ][0]
         assert activity["summary"] == "Read context: SKILL.md, README.md"
         assert activity["text"] == command + "\nfull source"
     finally:

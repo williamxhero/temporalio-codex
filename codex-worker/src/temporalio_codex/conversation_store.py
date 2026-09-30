@@ -268,6 +268,7 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     conversations: dict[str, dict[str, Any]] = {}
     operation_groups: dict[tuple, str] = {}
     turns: dict[tuple, dict[str, Any]] = {}
+    final_turns: set[tuple] = set()
 
     for row in rows:
         operation_id = str(row["operation_id"])
@@ -343,6 +344,7 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         elif kind == "assistant_final":
             if text:
                 turn["output"] = text
+                final_turns.add(operation_key)
             turn["status"] = "completed"
         elif kind in {"reasoning_delta", "plan_delta", "tool_delta"} and text:
             working_kind = {
@@ -386,10 +388,21 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         elif kind == "history_error":
             turn["status"] = "failed"
 
-    for turn in turns.values():
+    for operation_key, turn in turns.items():
         for activity in turn["activities"]:
             _normalize_activity(activity)
-        turn["displayOutput"], turn["verificationMarkers"] = _display_output(turn["output"])
+        turn["displayOutput"], turn["verificationMarkers"] = _display_output(
+            turn["output"]
+        )
+        if turn["status"] == "failed" and operation_key not in final_turns:
+            errors = [a for a in turn["activities"] if a["category"] == "error"]
+            sdk_errors = [
+                a for a in errors if a.get("detail", {}).get("method") == "error"
+            ]
+            errors = sdk_errors or errors
+            turn["displayOutput"] = (
+                errors[-1]["summary"] if errors else _error_cause(turn["output"])
+            )
     return list(conversations.values())
 
 
@@ -420,7 +433,8 @@ def _activity_for_event(
     sequence: int,
 ) -> dict[str, Any]:
     detail = detail or None
-    command = str(detail.get("command", "")) if detail else ""
+    raw_command = detail.get("command") if detail else None
+    command = raw_command.strip() if isinstance(raw_command, str) else ""
     if kind in {"error", "history_error", "turn_failed"}:
         category = "error"
     elif kind == "plan_delta":
@@ -464,9 +478,13 @@ def _activity_for_event(
         "id": event_id or f"event:{sequence}",
         "category": category,
         "summary": (
-            _activity_summary(command or text.splitlines()[0])
-            if kind == "tool_delta"
-            else _activity_summary(text)
+            _error_cause(text)
+            if category == "error"
+            else (
+                _activity_summary(command or text.splitlines()[0])
+                if kind == "tool_delta"
+                else _activity_summary(text)
+            )
         ),
         "text": text,
     }
@@ -481,21 +499,42 @@ def _append_activity(
     detail = activity.get("detail")
     item_id = detail.get("item_id") if isinstance(detail, dict) else None
     method = detail.get("method", "") if isinstance(detail, dict) else ""
+    if method == "turn/plan/updated":
+        for existing in reversed(activities):
+            existing_detail = existing.get("detail")
+            if (
+                isinstance(existing_detail, dict)
+                and existing_detail.get("method") == method
+            ):
+                existing.update(
+                    {key: value for key, value in activity.items() if key != "id"}
+                )
+                return
+        activities.append(activity)
+        return
     if not item_id and activities and isinstance(detail, dict):
         previous = activities[-1]
         previous_detail = previous.get("detail", {})
         if (
             isinstance(previous_detail, dict)
             and not previous_detail.get("item_id")
-            and not any(key in previous_detail for key in ("exit_code", "probe", "command"))
+            and not any(
+                key in previous_detail for key in ("exit_code", "probe", "command")
+            )
             and not detail.get("probe")
         ):
             previous_method = previous_detail.get("method", "")
             if previous_method in _OUTPUT_DELTA_METHODS and method == previous_method:
                 previous["text"] += activity["text"]
                 return
-            if previous_method in _OUTPUT_DELTA_METHODS and method == "item/completed":
-                previous.update({key: value for key, value in activity.items() if key != "id"})
+            if (
+                previous_method in _OUTPUT_DELTA_METHODS
+                and method == "item/completed"
+                and _is_command_completion(activity, detail)
+            ):
+                previous.update(
+                    {key: value for key, value in activity.items() if key != "id"}
+                )
                 return
     if item_id:
         for existing in reversed(activities):
@@ -518,6 +557,11 @@ def _append_activity(
         activities
         and activity["category"] in {"plan", "reasoning"}
         and activities[-1]["category"] == activity["category"]
+        and not item_id
+        and not (
+            isinstance(activities[-1].get("detail"), dict)
+            and activities[-1]["detail"].get("method") == "turn/plan/updated"
+        )
     ):
         activities[-1]["text"] += activity["text"]
         activities[-1]["summary"] = _activity_summary(activities[-1]["text"])
@@ -537,6 +581,23 @@ def _append_activity(
     activities.append(activity)
 
 
+def _is_command_completion(activity: dict[str, Any], detail: dict[str, Any]) -> bool:
+    item_type = detail.get("item_type")
+    if item_type:
+        return item_type == "commandExecution"
+    if activity["category"] in {"command", "test"}:
+        return True
+    command = _command_text(detail, activity["text"])
+    return bool(
+        _READ_COMMAND.search(command)
+        or re.match(
+            r"^(?:pwsh|powershell|bash|sh|cmd|git|uv|python(?:\d+(?:\.\d+)*)?|npm|pnpm|yarn|go|make|rg|ls)(?:\s|$)",
+            command,
+            re.IGNORECASE,
+        )
+    )
+
+
 _OUTPUT_DELTA_METHODS = {
     "item/commandExecution/outputDelta",
     "command/exec/outputDelta",
@@ -546,7 +607,10 @@ _CONTEXT_PATH = re.compile(
     r"(?<![\w.-])(?:[A-Za-z]:)?(?:[^\s\"'`;|]*[\\/])?(?:SKILL\.md|AGENTS\.md|CLAUDE\.md|README(?:\.[\w-]+)?|[\w.-]*(?:policy|config)[\w.-]*\.(?:md|json|ya?ml|toml|ini))(?=$|[\s\"'`;|])",
     re.IGNORECASE,
 )
-_READ_COMMAND = re.compile(r"(?:^|[\s\"';])(?:Get-Content|cat|type|read|open|sed|head|tail)(?:\s|$)", re.IGNORECASE)
+_READ_COMMAND = re.compile(
+    r"(?:^|[\s\"';])(?:Get-Content|cat|type|read|open|sed|head|tail)(?:\s|$)",
+    re.IGNORECASE,
+)
 
 
 def _normalize_activity(activity: dict[str, Any]) -> None:
@@ -554,21 +618,84 @@ def _normalize_activity(activity: dict[str, Any]) -> None:
     if not isinstance(detail, dict):
         detail = {}
     text = activity["text"]
-    command = str(detail.get("command") or text.splitlines()[0])
+    command = _command_text(detail, text)
     paths = _CONTEXT_PATH.findall(command) if _READ_COMMAND.search(command) else []
     path = detail.get("path") or detail.get("file") or detail.get("file_path")
-    if isinstance(path, str) and _READ_COMMAND.search(command) and _CONTEXT_PATH.fullmatch(path):
+    if (
+        isinstance(path, str)
+        and _READ_COMMAND.search(command)
+        and _CONTEXT_PATH.fullmatch(path)
+    ):
         paths.append(path)
     if paths:
-        names = list(dict.fromkeys(path.replace("\\", "/").rsplit("/", 1)[-1] for path in paths))
+        names = list(
+            dict.fromkeys(path.replace("\\", "/").rsplit("/", 1)[-1] for path in paths)
+        )
         activity["category"] = "context"
-        activity["summary"] = _activity_summary("Read context: " + ", ".join(names[:3]) + (f" (+{len(names) - 3} more)" if len(names) > 3 else ""))
+        activity["summary"] = _activity_summary(
+            "Read context: "
+            + ", ".join(names[:3])
+            + (f" (+{len(names) - 3} more)" if len(names) > 3 else "")
+        )
     elif (
         activity["category"] == "command"
         and detail.get("method") in _OUTPUT_DELTA_METHODS
         and not detail.get("command")
     ):
         activity["summary"] = "Command output"
+    elif activity["category"] in {"command", "test"}:
+        result = []
+        if activity["category"] == "test":
+            output = detail.get("aggregated_output", text)
+            if isinstance(output, str):
+                for line in reversed(output.splitlines()):
+                    counts = re.findall(
+                        r"\b\d+ (?:passed|failed|skipped|errors?|xfailed|xpassed|deselected)\b",
+                        line,
+                    )
+                    if counts:
+                        result.append(", ".join(counts))
+                        break
+        exit_code = detail.get("exit_code")
+        if type(exit_code) is int:
+            result.append(
+                f"{'Passed' if exit_code == 0 else 'Failed'} (exit {exit_code})"
+            )
+        elif isinstance(detail.get("status"), str) and detail["status"].strip():
+            result.append(_activity_summary(detail["status"].strip(), 40))
+        suffix = _activity_summary(" | " + " | ".join(result), 120) if result else ""
+        if suffix:
+            suffix = " " + suffix
+        activity["summary"] = (
+            _activity_summary(command or "Command", 160 - len(suffix)) + suffix
+        )
+    elif activity["category"] == "file" and detail.get("item_type") == "fileChange":
+        paths = detail.get("paths", [])
+        if isinstance(paths, list):
+            paths = [path for path in paths if isinstance(path, str) and path]
+            names = [
+                _activity_summary(
+                    (
+                        path
+                        if len(path) <= 36
+                        else path.replace("\\", "/").rsplit("/", 1)[-1]
+                    ),
+                    36,
+                )
+                for path in paths[:3]
+            ]
+            activity["summary"] = (
+                f"Files changed ({len(paths)}): "
+                + ", ".join(names)
+                + (f" (+{len(paths) - 3} more)" if len(paths) > 3 else "")
+            )
+
+
+def _command_text(detail: dict[str, Any], text: str) -> str:
+    command = detail.get("command")
+    if isinstance(command, str) and command.strip():
+        return command.strip()
+    return next((line.strip() for line in text.splitlines() if line.strip()), "")
 
 
 def _display_output(output: str) -> tuple[str, list[str]]:
@@ -595,7 +722,16 @@ def _activity_summary(text: str, limit: int = 160) -> str:
     summary = " ".join(text.split())
     if len(summary) <= limit:
         return summary
-    return summary[: limit - 1].rstrip() + "..."
+    return summary[: limit - 3].rstrip() + "..."
+
+
+def _error_cause(text: str) -> str:
+    return _activity_summary(
+        next(
+            (line.strip() for line in text.splitlines() if line.strip()),
+            "Codex turn failed",
+        )
+    )
 
 
 def iso_timestamp(value: float) -> str:

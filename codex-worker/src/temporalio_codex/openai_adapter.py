@@ -288,13 +288,27 @@ class OpenAICodexAdapter:
                 )
             return
         if method == "error":
+            error = getattr(payload, "error", None)
+            detail = {"method": method}
+            for name in ("message", "additional_details"):
+                value = getattr(error, name, None)
+                if isinstance(value, str):
+                    detail[name] = value
+            retry = getattr(payload, "will_retry", None)
+            if isinstance(retry, bool):
+                detail["will_retry"] = retry
+            info = getattr(error, "codex_error_info", None)
+            info = getattr(info, "root", info)
+            error_type = getattr(info, "value", getattr(info, "type", None))
+            if isinstance(error_type, str):
+                detail["error_type"] = error_type
             self._emit(
                 operation,
                 "error",
-                "Codex SDK reported an error",
+                detail.get("message") or "Codex SDK reported an error",
                 thread_id=thread_id,
                 turn_id=turn_id,
-                detail={"method": method},
+                detail=detail,
             )
             return
         if method == "item/agentMessage/delta":
@@ -680,7 +694,7 @@ def _history_item_detail(item: Any) -> dict[str, Any]:
             for change in (getattr(value, "changes", ()) or ())
         ]
         detail["changes"] = []
-        for change in (getattr(value, "changes", ()) or ()):
+        for change in getattr(value, "changes", ()) or ():
             change_detail = {}
             for field_name in ("path", "diff", "kind"):
                 field_value = getattr(change, field_name, None)
@@ -690,7 +704,9 @@ def _history_item_detail(item: Any) -> dict[str, Any]:
                 change_detail[field_name] = (
                     model_dump(mode="json", by_alias=True)
                     if callable(model_dump)
-                    else getattr(field_value, "value", getattr(field_value, "type", field_value))
+                    else getattr(
+                        field_value, "value", getattr(field_value, "type", field_value)
+                    )
                 )
             detail["changes"].append(change_detail)
     if item_type == "mcpToolCall":

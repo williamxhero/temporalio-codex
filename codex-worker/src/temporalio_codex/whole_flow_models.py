@@ -1,11 +1,11 @@
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 
 from temporalio_codex.codex_models import CodexRole
-from temporalio_codex.models import RunInput, StageDefinition
 from temporalio_codex.delivery_models import DeliveryInput
-from temporalio_codex.planning_models import PlanningInput
-from temporalio_codex.planning_models import GrillAnswer, SourceOrigin
+from temporalio_codex.models import RunInput, StageDefinition
+from temporalio_codex.planning_models import GrillAnswer, PlanningInput, SourceOrigin
 from temporalio_codex.spec_issue_adapter import SpecDraft
 from temporalio_codex.summary_adapter import SummaryPublicationInput
 from temporalio_codex.ticket_scheduler import SchedulerInput, validate_scheduler_graph
@@ -26,6 +26,8 @@ class WholeFlowPhase(StrEnum):
 
 class WholeFlowStatus(StrEnum):
     ACTIVE = "active"
+    DURABLE_WAITING = "durable_waiting"
+    RETRYING = "retrying"
     BLOCKED = "blocked"
     FAILED = "failed"
     NOT_VERIFIED = "not_verified"
@@ -42,8 +44,14 @@ class SpecCodexPlan:
     approval_policy: str = "deny_all"
     model: str = "gpt-5-codex"
     effort: str = "low"
+    start_to_close_timeout_seconds: float = 1800
 
-    def to_run_input(self) -> RunInput:
+    def to_run_input(
+        self,
+        *,
+        parent_workflow_id: str | None = None,
+        parent_workflow_run_id: str | None = None,
+    ) -> RunInput:
         stages = tuple(
             StageDefinition(
                 key=role.value,
@@ -53,10 +61,17 @@ class SpecCodexPlan:
                 approval_policy=self.approval_policy,
                 model=self.model,
                 effort=self.effort,
+                start_to_close_timeout_seconds=self.start_to_close_timeout_seconds,
             )
             for role in (CodexRole.PLANNING, CodexRole.IMPLEMENTATION, CodexRole.REVIEW)
         )
-        return RunInput(requirement=self.requirement, stages=stages)
+        return RunInput(
+            requirement=self.requirement,
+            stages=stages,
+            parent_workflow_id=parent_workflow_id,
+            parent_workflow_run_id=parent_workflow_run_id,
+            automatic=True,
+        )
 
 
 @dataclass(frozen=True)
@@ -70,10 +85,20 @@ class PlanningPayload:
     grill_answers: tuple[GrillAnswer, ...] = ()
     confirmation_operation_id: str | None = None
     publication_operation_id: str | None = None
+    publication_timeout_seconds: float = 300.0
+    publication_max_attempts: int = 3
+    publication_retry_backoff_seconds: float = 1.0
 
-    def to_input(self) -> PlanningInput:
+    def to_input(
+        self,
+        *,
+        repository: str = "williamxhero/temporalio-codex",
+        parent_workflow_id: str | None = None,
+        parent_workflow_run_id: str | None = None,
+    ) -> PlanningInput:
         return PlanningInput(
             origin=self.origin,
+            repository=repository,
             source_text=self.source_text,
             source_reference=self.source_reference,
             sensitive=self.sensitive,
@@ -82,6 +107,11 @@ class PlanningPayload:
             grill_answers=self.grill_answers,
             confirmation_operation_id=self.confirmation_operation_id,
             publication_operation_id=self.publication_operation_id,
+            publication_timeout_seconds=self.publication_timeout_seconds,
+            publication_max_attempts=self.publication_max_attempts,
+            publication_retry_backoff_seconds=self.publication_retry_backoff_seconds,
+            parent_workflow_id=parent_workflow_id,
+            parent_workflow_run_id=parent_workflow_run_id,
         )
 
 
@@ -98,6 +128,7 @@ class WholeFlowInput:
     codex: tuple[SpecCodexPlan, ...]
     deliveries: tuple[SpecDeliveryPlan, ...]
     summary: SummaryPublicationInput
+    repository: str = "williamxhero/temporalio-codex"
     entry_contract_version: str | None = None
     entry_launch_key: str | None = None
     entry_input_identity: str | None = None
@@ -117,6 +148,12 @@ class WholeFlowSnapshot:
     entry_launch_key: str | None = None
     entry_input_identity: str | None = None
     reason: str = ""
+    pending_reason: str = ""
+    retry_count: int = 0
+    deadline: str | None = None
+    timeout_seconds: float | None = None
+    last_error: str | None = None
+    workflow_run_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -138,9 +175,7 @@ def topological_spec_keys(input: SchedulerInput) -> tuple[str, ...]:
     ordered: list[str] = []
     while remaining:
         ready = sorted(
-            key
-            for key in remaining
-            if dependencies[key].isdisjoint(remaining)
+            key for key in remaining if dependencies[key].isdisjoint(remaining)
         )
         if not ready:
             return ()
@@ -151,6 +186,21 @@ def topological_spec_keys(input: SchedulerInput) -> tuple[str, ...]:
 
 def validate_whole_flow_input(input: WholeFlowInput) -> tuple[str, ...]:
     errors = list(validate_scheduler_graph(input.scheduler))
+    if any(
+        not math.isfinite(plan.start_to_close_timeout_seconds)
+        or plan.start_to_close_timeout_seconds <= 0
+        for plan in input.codex
+    ):
+        errors.append("invalid bounded Codex stage timeout")
+    policy = input.planning
+    if (not isinstance(policy.publication_max_attempts, int)
+            or policy.publication_max_attempts < 1
+            or policy.publication_max_attempts > 100
+            or not math.isfinite(policy.publication_timeout_seconds)
+            or policy.publication_timeout_seconds <= 0
+            or not math.isfinite(policy.publication_retry_backoff_seconds)
+            or policy.publication_retry_backoff_seconds < 0):
+        errors.append("invalid bounded publication retry policy")
     if errors:
         return tuple(dict.fromkeys(errors))
 
@@ -210,9 +260,29 @@ def validate_delivery_evidence(result: dict) -> tuple[str, ...]:
     receipts = result.get("receipts") or ()
     if not receipts:
         return ("delivery completed without receipts",)
+    candidate = result.get("candidate") or {}
+    review = result.get("review_evidence") or {}
+    sha = candidate.get("candidate_sha")
+    if (
+        not sha
+        or review.get("candidate_sha") != sha
+        or review.get("verdict") != "approved"
+        or not all(review.get(key) for key in ("operation_id", "thread_id", "turn_id"))
+    ):
+        return ("delivery has no matching candidate and approved SDK review proof",)
+    for phase in ("candidate", "acceptance", "review", "publish_candidate"):
+        if not any(
+            receipt.get("phase") == phase
+            and receipt.get("outcome") == "completed"
+            and receipt.get("candidate_sha") == sha
+            for receipt in receipts
+        ):
+            return (f"delivery has no verified {phase} receipt for its candidate",)
     push_receipts = [receipt for receipt in receipts if receipt.get("phase") == "push"]
     if not push_receipts:
         return ("delivery completed without push evidence",)
-    if not any(receipt.get("remote_contains_merge") is True for receipt in push_receipts):
+    if not any(
+        receipt.get("remote_contains_merge") is True for receipt in push_receipts
+    ):
         return ("push evidence does not verify the expected remote merge",)
     return ()

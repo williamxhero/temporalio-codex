@@ -1,7 +1,10 @@
+from unittest.mock import AsyncMock
+
 import pytest
 
 from temporalio_codex.summary_adapter import (
     FakeSummaryCommentGateway,
+    GhCliSummaryCommentGateway,
     SummaryPublicationInput,
     SummaryPublicationStatus,
     publish_summary,
@@ -17,6 +20,18 @@ def publication_input(**overrides) -> SummaryPublicationInput:
     )
     values.update(overrides)
     return SummaryPublicationInput(**values)
+
+
+async def test_summary_readback_uses_comment_resource_and_actual_issue_scope() -> None:
+    gateway = GhCliSummaryCommentGateway("owner/repo")
+    gateway._api = AsyncMock(return_value={
+        "id": 42, "body": "summary", "issue_url": "https://api.github.com/repos/owner/repo/issues/9"
+    })
+
+    record = await gateway.read_summary_comment(publication_input(), 42)
+
+    gateway._api.assert_awaited_once_with("issues", "comments", "42")
+    assert record.issue_number == 9
 
 
 async def test_summary_publication_creates_and_verifies_comment() -> None:

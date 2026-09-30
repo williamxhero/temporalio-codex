@@ -1,14 +1,17 @@
+from dataclasses import replace
+
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from temporalio_codex.execution_status import ExecutionProgress, report_progress
     from temporalio_codex.ticket_scheduler import (
         SchedulerInput,
         SchedulerResult,
         SchedulerSnapshot,
         SchedulerStatus,
         TicketPlan,
-        validate_scheduler_graph,
         ready_frontier,
+        validate_scheduler_graph,
     )
 
 
@@ -19,7 +22,25 @@ class TicketSchedulerWorkflow:
         self._status = SchedulerStatus.ACTIVE
         self._completed_tickets: set[str] = set()
         self._completion_operations: dict[str, str] = {}
+        self._codex_results: list[dict] = []
         self._reason = ""
+        self._active_child_id: str | None = None
+        self._active_child_run_id: str | None = None
+        self._active_ticket: str | None = None
+
+    @workflow.signal(name="execution_progress")
+    async def execution_progress(self, progress: ExecutionProgress) -> None:
+        if (progress.workflow_id != self._active_child_id
+                or progress.workflow_run_id != self._active_child_run_id):
+            return
+        info = workflow.info()
+        if info.parent:
+            await workflow.get_external_workflow_handle(
+                info.parent.workflow_id, run_id=info.parent.run_id
+            ).signal("execution_progress", replace(
+                progress, workflow_id=info.workflow_id,
+                workflow_run_id=info.run_id, active_ticket=self._active_ticket,
+            ))
 
     @workflow.query(name="get_scheduler_status")
     def get_status(self) -> SchedulerSnapshot:
@@ -64,6 +85,49 @@ class TicketSchedulerWorkflow:
                 for ticket_key in automatic:
                     self._complete(ticket_key, completion_operations[ticket_key])
                 continue
+            codex_runs = dict(input.codex_runs)
+            automatic_codex = [key for key in frontier if key in codex_runs]
+            if automatic_codex:
+                for ticket_key in automatic_codex:
+                    self._active_ticket = ticket_key
+                    self._active_child_id = f"{workflow.info().workflow_id}:codex:{ticket_key}"
+                    await report_progress(phase="codex", active_ticket=ticket_key,
+                                          next_action="start ticket Codex execution")
+                    handle = await workflow.start_child_workflow(
+                        "CodexRunWorkflow",
+                        codex_runs[ticket_key],
+                        id=f"{workflow.info().workflow_id}:codex:{ticket_key}",
+                        result_type=dict,
+                    )
+                    self._active_child_run_id = handle.first_execution_run_id
+                    try:
+                        result = await handle
+                    finally:
+                        self._active_child_id = None
+                        self._active_child_run_id = None
+                        self._active_ticket = None
+                    self._codex_results.append(result)
+                    if result.get("status") != "completed":
+                        self._status = SchedulerStatus.BLOCKED
+                        self._reason = (
+                            f"Codex execution failed for ticket {ticket_key}: "
+                            f"{result.get('summary', 'unknown failure')}"
+                        )
+                        return self._result()
+                    self._complete(
+                        ticket_key,
+                        f"{workflow.info().workflow_id}:codex:{ticket_key}",
+                    )
+                continue
+            if input.automatic:
+                self._status = SchedulerStatus.BLOCKED
+                self._reason = (
+                    "ready ticket has no automatic Codex plan or completion operation"
+                )
+                return self._result()
+            await report_progress(phase="tickets", status="durable_waiting",
+                                  pending_reason="waiting for ticket completion",
+                                  next_action="observe durable ticket completion")
             await workflow.wait_condition(
                 lambda: bool(
                     set(self._completed_tickets).intersection(frontier)
@@ -127,4 +191,5 @@ class TicketSchedulerWorkflow:
             completed_specs=self._completed_specs(),
             completed_tickets=tuple(sorted(self._completed_tickets)),
             reason=self._reason,
+            codex_results=tuple(self._codex_results),
         )

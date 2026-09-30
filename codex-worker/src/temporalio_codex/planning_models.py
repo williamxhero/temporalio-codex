@@ -46,6 +46,12 @@ class PlanningInput:
     grill_answers: tuple[GrillAnswer, ...] = ()
     confirmation_operation_id: str | None = None
     publication_operation_id: str | None = None
+    repository: str = "williamxhero/temporalio-codex"
+    publication_timeout_seconds: float = 300.0
+    publication_max_attempts: int = 3
+    publication_retry_backoff_seconds: float = 1.0
+    parent_workflow_id: str | None = None
+    parent_workflow_run_id: str | None = None
 
     def __post_init__(self) -> None:
         has_text = bool(self.source_text and self.source_text.strip())
@@ -60,6 +66,12 @@ class PlanningInput:
             raise ValueError("sensitive sources must use source_reference")
         if self.origin is SourceOrigin.HISTORICAL_CHAT and not has_reference:
             raise ValueError("historical chat sources must use source_reference")
+        if self.publication_timeout_seconds <= 0:
+            raise ValueError("publication_timeout_seconds must be positive")
+        if self.publication_max_attempts <= 0:
+            raise ValueError("publication_max_attempts must be positive")
+        if self.publication_retry_backoff_seconds < 0:
+            raise ValueError("publication_retry_backoff_seconds must not be negative")
 
     @property
     def source_identity(self) -> str:

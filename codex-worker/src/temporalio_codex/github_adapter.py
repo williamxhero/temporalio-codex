@@ -350,7 +350,9 @@ class GhCliGateway:
 
     @staticmethod
     def _run(args: list[str]):
-        result = subprocess.run(args, capture_output=True, check=False, text=True)
+        result = subprocess.run(
+            args, capture_output=True, check=False, text=True, encoding="utf-8"
+        )
         if result.returncode:
             raise RuntimeError("GitHub API request failed")
         return json.loads(result.stdout)

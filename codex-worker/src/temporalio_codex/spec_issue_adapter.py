@@ -226,10 +226,12 @@ class GhCliSpecIssueGateway:
     repository: str
 
     async def find_by_operation(self, operation_id: str) -> SpecIssueRecord | None:
-        records = await self._api("issues?state=all&per_page=100")
-        for record in records:
-            if operation_id in (record.get("body") or ""):
-                return self._record(record, operation_id)
+        pages = await self._api("issues?state=all&per_page=100", paginate=True)
+        marker = f"Operation identity: {operation_id}"
+        for records in pages:
+            for record in records:
+                if marker in (record.get("body") or "").splitlines():
+                    return self._record(record, operation_id)
         return None
 
     async def create_issue(
@@ -298,8 +300,11 @@ class GhCliSpecIssueGateway:
         method: str = "GET",
         fields: tuple[str, ...] = (),
         typed_fields: tuple[str, ...] = (),
+        paginate: bool = False,
     ):
         args = ["gh", "api", f"repos/{self.repository}/{path}", "--method", method]
+        if paginate:
+            args.extend(["--paginate", "--slurp"])
         for field in fields:
             args.extend(["-f", field])
         for field in typed_fields:
@@ -308,14 +313,18 @@ class GhCliSpecIssueGateway:
 
     @staticmethod
     def _run(args: list[str]):
-        result = subprocess.run(args, capture_output=True, check=False, text=True)
+        result = subprocess.run(
+            args, capture_output=True, check=False, text=True, encoding="utf-8"
+        )
         if result.returncode:
             raise RuntimeError("GitHub API request failed")
         return json.loads(result.stdout)
 
     @staticmethod
     def _run_text(args: list[str]) -> str:
-        result = subprocess.run(args, capture_output=True, check=False, text=True)
+        result = subprocess.run(
+            args, capture_output=True, check=False, text=True, encoding="utf-8"
+        )
         if result.returncode:
             raise RuntimeError("GitHub SPEC issue creation failed")
         return result.stdout.strip()

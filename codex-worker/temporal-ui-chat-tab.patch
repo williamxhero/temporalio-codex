@@ -1,0 +1,822 @@
+diff --git a/package.json b/package.json
+index 90d1c62..5e59d8e 100644
+--- a/package.json
++++ b/package.json
+@@ -31,7 +31,7 @@
+     "dev:with-auth": "vite dev --mode with-auth",
+     "build:local": "vite build",
+     "build:docker": "VITE_API=http://localhost:8080 vite build",
+-    "build:server": "VITE_API= BUILD_PATH=server/ui/assets/local vite build",
++    "build:server": "node scripts/build-server.mjs",
+     "temporal-server": "esno scripts/start-temporal-server.ts --codecEndpoint http://127.0.0.1:8888",
+     "codec-server": "esno ./scripts/start-codec-server.ts --port 8888",
+     "oidc-server": "esno ./scripts/start-oidc-server.ts --port 8889",
+diff --git a/scripts/build-server.mjs b/scripts/build-server.mjs
+new file mode 100644
+index 0000000..da581da
+--- /dev/null
++++ b/scripts/build-server.mjs
+@@ -0,0 +1,20 @@
++import { execFileSync } from 'node:child_process';
++
++const env = { ...process.env };
++env.VITE_API = '';
++env.BUILD_PATH = process.env.BUILD_PATH || 'server/ui/assets/local';
++env.VITE_TEMPORAL_UI_BUILD_TARGET = 'local';
++
++const command = process.env.npm_execpath
++  ? process.execPath
++  : process.platform === 'win32'
++    ? 'pnpm.cmd'
++    : 'pnpm';
++const args = process.env.npm_execpath
++  ? [process.env.npm_execpath, 'exec', 'vite', 'build']
++  : ['exec', 'vite', 'build'];
++
++execFileSync(command, args, {
++  env,
++  stdio: 'inherit',
++});
+diff --git a/src/lib/components/workflow/workflow-chat-message.svelte b/src/lib/components/workflow/workflow-chat-message.svelte
+new file mode 100644
+index 0000000..d779461
+--- /dev/null
++++ b/src/lib/components/workflow/workflow-chat-message.svelte
+@@ -0,0 +1,110 @@
++<script lang="ts">
++  import { process, render } from '$lib/utilities/render-markdown';
++
++  let { content }: { content: string } = $props();
++  let html = $state('');
++
++  $effect(() => {
++    let active = true;
++    void process(content)
++      .then(render)
++      .then((value) => {
++        if (active) html = value;
++      });
++    return () => {
++      active = false;
++    };
++  });
++</script>
++
++<div class="chat-markdown overflow-wrap-anywhere min-w-0">{@html html}</div>
++
++<style>
++  .chat-markdown :global(p) {
++    margin: 0 0 0.75rem;
++  }
++
++  .chat-markdown :global(p:last-child) {
++    margin-bottom: 0;
++  }
++
++  .chat-markdown :global(h1),
++  .chat-markdown :global(h2),
++  .chat-markdown :global(h3) {
++    margin: 1rem 0 0.5rem;
++    font-weight: 600;
++    line-height: 1.3;
++  }
++
++  .chat-markdown :global(h1) {
++    font-size: 1.5rem;
++  }
++
++  .chat-markdown :global(h2) {
++    font-size: 1.25rem;
++  }
++
++  .chat-markdown :global(ul),
++  .chat-markdown :global(ol) {
++    margin: 0.75rem 0;
++    padding-left: 1.5rem;
++  }
++
++  .chat-markdown :global(ul) {
++    list-style: disc;
++  }
++
++  .chat-markdown :global(ol) {
++    list-style: decimal;
++  }
++
++  .chat-markdown :global(li) {
++    margin: 0.25rem 0;
++  }
++
++  .chat-markdown :global(pre) {
++    margin: 0.75rem 0;
++    overflow-x: auto;
++    border: 1px solid var(--color-border-secondary);
++    border-radius: 0.5rem;
++    background: var(--color-surface-secondary);
++    padding: 0.75rem;
++    white-space: pre;
++  }
++
++  .chat-markdown :global(code) {
++    border-radius: 0.25rem;
++    background: var(--color-surface-secondary);
++    padding: 0.1rem 0.25rem;
++    font-family: monospace;
++  }
++
++  .chat-markdown :global(pre code) {
++    background: none;
++    padding: 0;
++  }
++
++  .chat-markdown :global(a) {
++    color: var(--color-content-brand);
++    text-decoration: underline;
++  }
++
++  .chat-markdown :global(blockquote) {
++    margin: 0.75rem 0;
++    border-left: 3px solid var(--color-border-brand);
++    padding-left: 0.75rem;
++  }
++
++  .chat-markdown :global(table) {
++    display: block;
++    max-width: 100%;
++    overflow-x: auto;
++    border-collapse: collapse;
++  }
++
++  .chat-markdown :global(th),
++  .chat-markdown :global(td) {
++    border: 1px solid var(--color-border-secondary);
++    padding: 0.375rem 0.75rem;
++  }
++</style>
+diff --git a/src/lib/components/workflow/workflow-chat.svelte b/src/lib/components/workflow/workflow-chat.svelte
+new file mode 100644
+index 0000000..212c365
+--- /dev/null
++++ b/src/lib/components/workflow/workflow-chat.svelte
+@@ -0,0 +1,315 @@
++<script lang="ts">
++  import { untrack } from 'svelte';
++
++  import { page } from '$app/state';
++
++  import { IconCodex, IconSpinner } from '$lib/io/icon';
++  import WorkflowChatMessage from '$lib/components/workflow/workflow-chat-message.svelte';
++  import { getQuery } from '$lib/services/query-service';
++
++  type WorkingItem = { kind: string; text: string };
++  type Turn = {
++    id: string;
++    turnId?: string;
++    input: string;
++    output: string;
++    working: WorkingItem[];
++    status: 'queued' | 'running' | 'completed' | 'failed';
++    updatedAt: number;
++  };
++  type Conversation = {
++    id: string;
++    threadId?: string;
++    stage: string;
++    role: string;
++    turns: Turn[];
++    updatedAt: number;
++  };
++  type Snapshot = { conversations: Conversation[]; cursor: number };
++  type ExecutionStatus = {
++    phase?: string;
++    status?: string;
++    active_spec?: string;
++    active_ticket?: string;
++    pending_reason?: string;
++    next_action?: string;
++    retry_count?: number;
++    deadline?: string;
++    last_error?: string;
++  };
++
++  let conversations = $state<Conversation[]>([]);
++  let loading = $state(true);
++  let connection = $state('connecting');
++  let executionStatus = $state<ExecutionStatus | undefined>();
++  const conversationOrigin = 'http://127.0.0.1:18001';
++  const emptyMessage = $derived(
++    executionStatus?.phase === 'planning'
++      ? 'Planning is in progress. No Codex conversation has started yet.'
++      : executionStatus?.phase === 'spec_publication'
++        ? 'Publishing SPECs. No Codex conversation has started yet.'
++        : executionStatus?.phase === 'tickets'
++          ? 'Preparing tickets. No Codex conversation has been recorded yet.'
++          : executionStatus?.status === 'completed'
++            ? 'This execution completed without recorded Codex conversations.'
++            : executionStatus?.status === 'failed' ||
++                executionStatus?.status === 'blocked'
++              ? 'This execution stopped before a Codex conversation was recorded.'
++              : 'No Codex conversation has been recorded for this execution yet.',
++  );
++
++  $effect(() => {
++    const { namespace, workflow: workflowId, run: runId } = page.params;
++    return untrack(() => {
++      conversations = [];
++      executionStatus = undefined;
++      loading = true;
++      connection = 'connecting';
++      const controller = new AbortController();
++      const parameters = new URLSearchParams({
++        namespace,
++        workflow_id: workflowId,
++        run_id: runId,
++      });
++      const endpoint = `${conversationOrigin}/api/v1/codex/conversations?${parameters}`;
++      const streamEndpoint = `${conversationOrigin}/api/v1/codex/stream?${parameters}`;
++      let stream: EventSource | undefined;
++      let retryTimer: ReturnType<typeof setTimeout> | undefined;
++      let statusTimer: ReturnType<typeof setTimeout> | undefined;
++      let attempts = 0;
++      let cursor = -1;
++
++      const applySnapshot = (snapshot: Snapshot) => {
++        if (
++          !Array.isArray(snapshot.conversations) ||
++          !Number.isFinite(snapshot.cursor)
++        ) {
++          throw new Error('Invalid conversation snapshot');
++        }
++        if (controller.signal.aborted || snapshot.cursor < cursor) return;
++        cursor = snapshot.cursor;
++        conversations = snapshot.conversations;
++        loading = false;
++      };
++
++      const recover = () => {
++        if (controller.signal.aborted || retryTimer) return;
++        stream?.close();
++        loading = false;
++        connection = 'reconnecting';
++        const delay = Math.min(1000 * 2 ** attempts++, 15000);
++        retryTimer = setTimeout(() => {
++          retryTimer = undefined;
++          void load();
++        }, delay);
++      };
++
++      const subscribe = () => {
++        stream?.close();
++        stream = new EventSource(streamEndpoint);
++        stream.addEventListener('open', () => {
++          if (!controller.signal.aborted) {
++            connection = 'connected';
++            attempts = 0;
++          }
++        });
++        stream.addEventListener('error', recover);
++        stream.addEventListener('conversations', (event) => {
++          try {
++            applySnapshot(JSON.parse((event as MessageEvent).data) as Snapshot);
++          } catch {
++            recover();
++          }
++        });
++      };
++
++      const load = async () => {
++        try {
++          const response = await fetch(endpoint, { signal: controller.signal });
++          if (!response.ok)
++            throw new Error(`Conversation service returned ${response.status}`);
++          applySnapshot((await response.json()) as Snapshot);
++          if (!controller.signal.aborted) subscribe();
++        } catch {
++          recover();
++        }
++      };
++
++      const pollStatus = async () => {
++        try {
++          const status = await getQuery(
++            {
++              namespace,
++              workflow: { id: workflowId, runId },
++              queryType: 'get_status',
++            },
++            controller.signal,
++          );
++          if (
++            !controller.signal.aborted &&
++            status &&
++            typeof status === 'object' &&
++            !Array.isArray(status)
++          ) {
++            executionStatus = status as ExecutionStatus;
++          }
++        } catch {
++          // Ordinary Temporal workflows may not expose the Codex status query.
++        }
++        if (!controller.signal.aborted)
++          statusTimer = setTimeout(() => void pollStatus(), 5000);
++      };
++
++      void load();
++      void pollStatus();
++      return () => {
++        controller.abort();
++        stream?.close();
++        clearTimeout(retryTimer);
++        clearTimeout(statusTimer);
++      };
++    });
++  });
++</script>
++
++<section class="flex min-h-[28rem] flex-col gap-6" data-testid="workflow-chat">
++  {#if executionStatus}
++    <div
++      class="flex flex-wrap gap-x-4 gap-y-1 text-sm text-secondary"
++      data-testid="execution-status"
++      aria-live="polite"
++    >
++      <span
++        >{executionStatus.phase ?? 'Codex'} · {executionStatus.status ??
++          'running'}</span
++      >
++      {#if executionStatus.active_spec}<span
++          >SPEC: {executionStatus.active_spec}</span
++        >{/if}
++      {#if executionStatus.active_ticket}<span
++          >Ticket: {executionStatus.active_ticket}</span
++        >{/if}
++      {#if executionStatus.pending_reason}<span
++          >{executionStatus.pending_reason}</span
++        >{/if}
++      {#if executionStatus.next_action}<span
++          >Next: {executionStatus.next_action}</span
++        >{/if}
++      {#if executionStatus.retry_count}<span
++          >Retry: {executionStatus.retry_count}</span
++        >{/if}
++      {#if executionStatus.deadline}<span
++          >Deadline: {executionStatus.deadline}</span
++        >{/if}
++      {#if executionStatus.last_error}<span>{executionStatus.last_error}</span
++        >{/if}
++    </div>
++  {/if}
++  {#if connection === 'reconnecting'}
++    <div
++      role="status"
++      class="border-l-2 border-primary px-4 py-2 text-sm text-secondary"
++    >
++      Conversation service unavailable. Reconnecting automatically.
++    </div>
++  {/if}
++  {#if loading}
++    <div class="flex items-center gap-2 py-12 text-sm text-secondary">
++      <IconSpinner class="h-4 w-4 animate-spin" /> Loading conversation history...
++    </div>
++  {:else if conversations.length === 0}
++    <div
++      class="border border-dashed border-primary px-6 py-12 text-center text-sm text-secondary"
++    >
++      {emptyMessage}
++    </div>
++  {:else}
++    <div class="flex flex-col gap-10">
++      {#each conversations as conversation (conversation.id)}
++        <article
++          class="flex flex-col gap-6"
++          data-thread-id={conversation.threadId ?? conversation.id}
++        >
++          <div class="flex items-center gap-3 border-b border-primary pb-3">
++            <span
++              class="flex h-8 w-8 items-center justify-center rounded-full bg-surface-secondary text-primary"
++            >
++              <IconCodex class="h-4 w-4" />
++            </span>
++            <div class="min-w-0">
++              <div class="font-medium text-primary">{conversation.role}</div>
++              <div class="truncate font-mono text-xs text-secondary">
++                {conversation.threadId ?? 'thread pending'} · {conversation.stage}
++              </div>
++            </div>
++          </div>
++
++          {#each conversation.turns as turn (turn.id)}
++            <div class="flex flex-col gap-5">
++              {#if turn.input}
++                <div class="flex justify-end">
++                  <div
++                    class="min-w-0 max-w-3xl rounded-lg bg-surface-secondary px-4 py-3 text-sm leading-6 text-primary"
++                  >
++                    <div
++                      class="mb-2 text-[11px] font-medium uppercase tracking-wide text-secondary"
++                    >
++                      Workflow input
++                    </div>
++                    <WorkflowChatMessage content={turn.input} />
++                  </div>
++                </div>
++              {/if}
++
++              {#if turn.working.length}
++                <details class="max-w-3xl text-sm text-secondary">
++                  <summary class="cursor-pointer select-none"
++                    >Working details</summary
++                  >
++                  <div
++                    class="mt-3 flex flex-col gap-3 border-l border-primary pl-4"
++                  >
++                    {#each turn.working as item}
++                      <div>
++                        <div
++                          class="mb-1 text-[11px] font-medium uppercase tracking-wide"
++                        >
++                          {item.kind}
++                        </div>
++                        <pre
++                          class="whitespace-pre-wrap break-words font-sans leading-6">{item.text}</pre>
++                      </div>
++                    {/each}
++                  </div>
++                </details>
++              {/if}
++
++              {#if turn.output}
++                <div class="flex gap-3">
++                  <span
++                    class="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surface-secondary text-primary"
++                  >
++                    <IconCodex class="h-4 w-4" />
++                  </span>
++                  <div class="min-w-0 max-w-4xl text-sm leading-7 text-primary">
++                    <div
++                      class="mb-2 text-[11px] font-medium uppercase tracking-wide text-secondary"
++                    >
++                      Codex
++                    </div>
++                    <WorkflowChatMessage content={turn.output} />
++                    {#if turn.status === 'running'}
++                      <span
++                        class="mt-2 inline-block h-4 w-1 animate-pulse bg-content-primary"
++                      ></span>
++                    {/if}
++                  </div>
++                </div>
++              {/if}
++            </div>
++          {/each}
++        </article>
++      {/each}
++    </div>
++  {/if}
++</section>
+diff --git a/src/lib/i18n/locales/en/workflows.ts b/src/lib/i18n/locales/en/workflows.ts
+index b151c8f..892641c 100644
+--- a/src/lib/i18n/locales/en/workflows.ts
++++ b/src/lib/i18n/locales/en/workflows.ts
+@@ -141,6 +141,7 @@ export const Strings = {
+   'pause-success': 'Workflow paused',
+   'unpause-success': 'Workflow unpaused',
+   'timeline-tab': 'Timeline',
++  'chat-tab': 'Chat',
+   'hide-idle-time': 'Hide idle time',
+   'show-idle-time': 'Show idle time',
+   'hide-idle-time-segment': 'Hide {{distance}} time segment',
+diff --git a/src/lib/layouts/workflow-header.svelte b/src/lib/layouts/workflow-header.svelte
+index 387740d..a347da7 100644
+--- a/src/lib/layouts/workflow-header.svelte
++++ b/src/lib/layouts/workflow-header.svelte
+@@ -53,6 +53,7 @@
+     routeForWorkflows,
+     routeForWorkflowSearchAttributes,
+     routeForWorkflowWorkers,
++    routeForWorkflowChat,
+   } from '$lib/utilities/route-for';
+   import { isWorkflowTaskFailure } from '$lib/utilities/workflow-task-failures';
+
+@@ -277,6 +278,15 @@
+   />
+   <Tabs>
+     <TabList label="workflow detail">
++      <Tab
++        label={translate('workflows.chat-tab')}
++        id="chat-tab"
++        href={routeForWorkflowChat(routeParameters)}
++        active={pathMatches(
++          page.url.pathname,
++          routeForWorkflowChat(routeParameters),
++        )}
++      />
+       <Tab
+         label={translate('workflows.timeline-tab')}
+         id="timeline-tab"
+diff --git a/src/lib/utilities/route-for-base-path.test.ts b/src/lib/utilities/route-for-base-path.test.ts
+index 03ff979..74ebac0 100644
+--- a/src/lib/utilities/route-for-base-path.test.ts
++++ b/src/lib/utilities/route-for-base-path.test.ts
+@@ -59,6 +59,7 @@ import {
+   routeForWorkers,
+   routeForWorkersWithQuery,
+   routeForWorkflow,
++  routeForWorkflowChat,
+   routeForWorkflowMemo,
+   routeForWorkflowQuery,
+   routeForWorkflows,
+@@ -112,6 +113,7 @@ describe('routeFor functions should resolve the base path exactly once', () => {
+       () => routeForArchivalWorkflows(namespaceParams),
+     ],
+     ['routeForWorkflow', () => routeForWorkflow(workflowParams)],
++    ['routeForWorkflowChat', () => routeForWorkflowChat(workflowParams)],
+     ['routeForSchedules', () => routeForSchedules(namespaceParams)],
+     ['routeForScheduleCreate', () => routeForScheduleCreate(namespaceParams)],
+     ['routeForSchedule', () => routeForSchedule(scheduleParams)],
+@@ -366,6 +368,7 @@ describe('routeFor functions with prefix should resolve base + prefix correctly'
+       () => routeForArchivalWorkflows(namespaceParams),
+     ],
+     ['routeForWorkflow', () => routeForWorkflow(workflowParams)],
++    ['routeForWorkflowChat', () => routeForWorkflowChat(workflowParams)],
+     ['routeForSchedules', () => routeForSchedules(namespaceParams)],
+     ['routeForScheduleCreate', () => routeForScheduleCreate(namespaceParams)],
+     ['routeForSchedule', () => routeForSchedule(scheduleParams)],
+diff --git a/src/lib/utilities/route-for.ts b/src/lib/utilities/route-for.ts
+index c9efdf7..8f03eca 100644
+--- a/src/lib/utilities/route-for.ts
++++ b/src/lib/utilities/route-for.ts
+@@ -1,14 +1,8 @@
+-import { get } from 'svelte/store';
+-
+ import { BROWSER } from 'esm-env';
+
+ import { resolve } from '$app/paths';
+ import type { ResolvedPathname } from '$app/types';
+
+-import {
+-  eventFilterSort,
+-  workflowViewPreference,
+-} from '$lib/stores/event-view';
+ import type { EventView } from '$lib/types/events';
+ import type { Settings } from '$lib/types/global';
+ import { encodeURIForSvelte } from '$lib/utilities/encode-uri';
+@@ -396,31 +390,16 @@ export const routeForTimeline = ({
+   return toURL(path, queryParams);
+ };
+
++export const routeForWorkflowChat = (
++  parameters: WorkflowParameters,
++): ResolvedPathname => {
++  return `${baseRouteForWorkflow(parameters)}/chat`;
++};
++
+ export const routeForWorkflow = ({
+-  queryParams,
+   ...parameters
+ }: EventHistoryParameters & { archival?: boolean }): ResolvedPathname => {
+-  if (!BROWSER) return routeForTimeline({ ...parameters, queryParams });
+-
+-  const view = get(workflowViewPreference);
+-  const sort = get(eventFilterSort);
+-  const params: Record<string, string> = {
+-    ...(sort !== 'descending' && { sort }),
+-    ...queryParams,
+-  };
+-
+-  const hasParams = Object.keys(params).length > 0;
+-
+-  if (view === 'history') {
+-    return routeForEventHistory({
+-      ...parameters,
+-      ...(hasParams && { queryParams: params }),
+-    });
+-  }
+-  return routeForTimeline({
+-    ...parameters,
+-    ...(hasParams && { queryParams: params }),
+-  });
++  return routeForWorkflowChat(parameters);
+ };
+
+ export const routeForWorkers = (
+diff --git a/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts b/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts
+index eaac44d..c188f04 100644
+--- a/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts
++++ b/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts
+@@ -3,5 +3,5 @@ import { redirect } from '@sveltejs/kit';
+ import type { PageLoad } from './$types';
+
+ export const load: PageLoad = async function ({ url }) {
+-  redirect(302, `${url.pathname}/timeline`);
++  redirect(302, `${url.pathname}/chat`);
+ };
+diff --git a/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/chat/+page.svelte b/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/chat/+page.svelte
+new file mode 100644
+index 0000000..df87936
+--- /dev/null
++++ b/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/chat/+page.svelte
+@@ -0,0 +1,15 @@
++<script lang="ts">
++  import { page } from '$app/state';
++
++  import PageTitle from '$lib/components/page-title.svelte';
++  import WorkflowChat from '$lib/components/workflow/workflow-chat.svelte';
++  import { translate } from '$lib/i18n/translate';
++
++  const workflow = $derived(page.params.workflow);
++</script>
++
++<PageTitle
++  title={`${translate('workflows.chat-tab')} | ${workflow}`}
++  url={page.url.href}
++/>
++<WorkflowChat />
+diff --git a/tests/integration/workflow-chat.spec.ts b/tests/integration/workflow-chat.spec.ts
+new file mode 100644
+index 0000000..b6a293a
+--- /dev/null
++++ b/tests/integration/workflow-chat.spec.ts
+@@ -0,0 +1,182 @@
++import { expect, test } from '@playwright/test';
++
++import { mockWorkflowApis } from '~/test-utilities/mock-apis';
++import { mockWorkflow } from '~/test-utilities/mocks/workflow';
++
++const { workflowId, runId } = mockWorkflow.workflowExecutionInfo.execution;
++const workflowUrl = `/namespaces/default/workflows/${workflowId}/${runId}`;
++
++const snapshot = (output: string, cursor: number) => ({
++  cursor,
++  conversations: [
++    {
++      id: 'execution-turn',
++      threadId: 'thread-1',
++      stage: 'implement',
++      role: 'implementer',
++      updatedAt: 1,
++      turns: [
++        {
++          id: 'turn-1',
++          input: 'Implement the selected ticket',
++          output,
++          status: 'completed',
++          updatedAt: 1,
++          working: [
++            { kind: 'plan', text: 'Update the workflow' },
++            { kind: 'reasoning_summary', text: 'Use bounded retries' },
++            { kind: 'tool_output', text: 'Tests passed' },
++          ],
++        },
++      ],
++    },
++  ],
++});
++
++test('Chat keeps recorded messages through stream interruption and recovers automatically', async ({
++  page,
++}, testInfo) => {
++  test.setTimeout(30000);
++  const errors: string[] = [];
++  page.on('pageerror', (error) => errors.push(error.message));
++  await mockWorkflowApis(page, mockWorkflow);
++  let unavailable = false;
++  let recovered = false;
++  await page.route('http://127.0.0.1:18001/**', async (route) => {
++    const url = new URL(route.request().url());
++    if (unavailable) {
++      await route.fulfill({ status: 503, body: 'Unavailable' });
++    } else if (url.pathname.endsWith('/stream')) {
++      await route.fulfill({
++        contentType: 'text/event-stream',
++        body: `event: conversations\ndata: ${JSON.stringify(snapshot(recovered ? 'Recovered response' : 'Streamed response', recovered ? 3 : 2))}\n\n`,
++      });
++    } else {
++      await route.fulfill({
++        json: snapshot(
++          recovered ? 'Recovered response' : 'Recorded response',
++          recovered ? 3 : 1,
++        ),
++      });
++    }
++  });
++  await page.goto(workflowUrl);
++  await expect(
++    page.getByText('Streamed response', { exact: true }),
++  ).toBeVisible();
++  await page.getByText('Working details').click();
++  await expect(page.getByText('Tests passed')).toBeVisible();
++  unavailable = true;
++  await expect(
++    page
++      .getByRole('status')
++      .filter({ hasText: 'Conversation service unavailable' }),
++  ).toBeVisible();
++  await expect(
++    page.getByText('Streamed response', { exact: true }),
++  ).toBeVisible();
++  unavailable = false;
++  recovered = true;
++  await expect(
++    page.getByText('Recovered response', { exact: true }),
++  ).toBeVisible();
++  await expect(
++    page.getByText('Implement the selected ticket', { exact: true }),
++  ).toHaveCount(1);
++  await page.screenshot({
++    path: testInfo.outputPath('chat-recovered.png'),
++    fullPage: true,
++  });
++  expect(errors).toEqual([]);
++});
++
++test('Chat defaults to the exact execution and explains planning before Codex starts', async ({
++  page,
++}) => {
++  await mockWorkflowApis(page, mockWorkflow);
++  await page.route('**/query/get_status**', async (route) => {
++    await route.fulfill({
++      json: {
++        queryResult: {
++          payloads: [
++            {
++              metadata: { encoding: 'anNvbi9wbGFpbg==' },
++              data: Buffer.from(
++                JSON.stringify({
++                  phase: 'planning',
++                  status: 'running',
++                  next_action: 'Publish SPEC',
++                }),
++              ).toString('base64'),
++            },
++          ],
++        },
++      },
++    });
++  });
++  const requests: URL[] = [];
++  await page.route('http://127.0.0.1:18001/**', async (route) => {
++    const url = new URL(route.request().url());
++    requests.push(url);
++    await route.fulfill({ json: { conversations: [], cursor: 0 } });
++  });
++  await page.goto(workflowUrl);
++  await expect(page).toHaveURL(/\/chat$/);
++  await expect(page.getByTestId('chat-tab')).toBeVisible();
++  await expect(
++    page.getByText(
++      'Planning is in progress. No Codex conversation has started yet.',
++    ),
++  ).toBeVisible();
++  expect(requests.length).toBeGreaterThan(0);
++  for (const url of requests) {
++    expect(url.searchParams.get('namespace')).toBe('default');
++    expect(url.searchParams.get('workflow_id')).toBe(workflowId);
++    expect(url.searchParams.get('run_id')).toBe(runId);
++  }
++});
++
++test('Chat discards the previous execution when navigating to another run', async ({
++  page,
++}) => {
++  await mockWorkflowApis(page, mockWorkflow);
++  const otherRun = '11111111-1111-4111-8111-111111111111';
++  const requests: URL[] = [];
++  await page.route('http://127.0.0.1:18001/**', async (route) => {
++    const url = new URL(route.request().url());
++    requests.push(url);
++    const current = url.searchParams.get('run_id') === otherRun;
++    const data = snapshot(
++      current ? 'New execution output' : 'Previous execution output',
++      1,
++    );
++    if (url.pathname.endsWith('/stream')) {
++      await route.fulfill({
++        contentType: 'text/event-stream',
++        body: `event: conversations\ndata: ${JSON.stringify(data)}\n\n`,
++      });
++    } else await route.fulfill({ json: data });
++  });
++  await page.goto(`${workflowUrl}/chat`);
++  await expect(
++    page.getByText('Previous execution output', { exact: true }),
++  ).toBeVisible();
++  await page.evaluate((url) => {
++    const link = document.createElement('a');
++    link.href = url;
++    link.textContent = 'Open another execution';
++    link.style.cssText =
++      'position:fixed;top:0;left:0;z-index:9999;background:white;padding:12px;';
++    document.body.append(link);
++  }, `/namespaces/default/workflows/${workflowId}/${otherRun}/chat`);
++  await page.getByRole('link', { name: 'Open another execution' }).click();
++  await expect(
++    page.getByText('New execution output', { exact: true }),
++  ).toBeVisible();
++  await expect(
++    page.getByText('Previous execution output', { exact: true }),
++  ).toHaveCount(0);
++  expect(
++    requests.some((url) => url.searchParams.get('run_id') === otherRun),
++  ).toBe(true);
++});

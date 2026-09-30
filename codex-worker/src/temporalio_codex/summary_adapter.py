@@ -20,6 +20,7 @@ class SummaryPublicationInput:
     umbrella_issue_number: int
     operation_id: str
     summary_text: str
+    automatic: bool = False
 
 
 @dataclass(frozen=True)
@@ -257,7 +258,6 @@ class GhCliSummaryCommentGateway:
     ) -> SummaryCommentRecord:
         record = await self._api(
             "issues",
-            str(input.umbrella_issue_number),
             "comments",
             str(comment_id),
         )
@@ -279,26 +279,32 @@ class GhCliSummaryCommentGateway:
         ]
         if paginate:
             args.extend(["--paginate", "--slurp"])
-        for field in fields:
-            args.extend(["-f", field])
+        for api_field in fields:
+            args.extend(["-f", api_field])
         return await asyncio.to_thread(self._run, args)
 
     @staticmethod
     def _run(args: list[str]):
-        result = subprocess.run(args, capture_output=True, check=False, text=True)
+        result = subprocess.run(
+            args, capture_output=True, check=False, text=True, encoding="utf-8"
+        )
         if result.returncode:
             raise RuntimeError("GitHub API request failed")
         return json.loads(result.stdout)
 
     @staticmethod
     def _run_command(args: list[str]) -> None:
-        result = subprocess.run(args, capture_output=True, check=False, text=True)
+        result = subprocess.run(
+            args, capture_output=True, check=False, text=True, encoding="utf-8"
+        )
         if result.returncode:
             raise RuntimeError("GitHub comment request failed")
 
     @staticmethod
     def _write_body_file(body: str) -> str:
-        descriptor, path = tempfile.mkstemp(prefix="temporalio-codex-summary-", suffix=".txt")
+        descriptor, path = tempfile.mkstemp(
+            prefix="temporalio-codex-summary-", suffix=".txt"
+        )
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
             stream.write(body)
         return path
@@ -311,7 +317,11 @@ class GhCliSummaryCommentGateway:
     ) -> SummaryCommentRecord:
         return SummaryCommentRecord(
             comment_id=record["id"],
-            issue_number=input.umbrella_issue_number,
+            issue_number=(
+                int(record["issue_url"].rstrip("/").rsplit("/", 1)[-1])
+                if record.get("issue_url")
+                else input.umbrella_issue_number
+            ),
             operation_id=operation_id,
             body=record.get("body") or "",
         )

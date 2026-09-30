@@ -8,12 +8,13 @@ from enum import StrEnum
 from temporalio_codex.planning_models import SourceOrigin, stable_source_identity
 from temporalio_codex.whole_flow_models import WholeFlowInput
 
-
 ENTRY_CONTRACT_VERSION = "requirement-delivery/v1"
 
 
 class EntryStatus(StrEnum):
     ACTIVE = "active"
+    DURABLE_WAITING = "durable_waiting"
+    RETRYING = "retrying"
     WAITING_FOR_INPUT = "waiting_for_input"
     BLOCKED = "blocked"
     FAILED = "failed"
@@ -131,6 +132,12 @@ class EntryStatusSnapshot:
     entry_launch_key: str | None = None
     entry_input_identity: str | None = None
     reason: str = ""
+    pending_reason: str = ""
+    retry_count: int = 0
+    deadline: str | None = None
+    timeout_seconds: float | None = None
+    last_error: str | None = None
+    workflow_run_id: str = ""
 
 
 @dataclass(frozen=True)

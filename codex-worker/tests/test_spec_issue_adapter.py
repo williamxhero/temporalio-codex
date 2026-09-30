@@ -1,5 +1,8 @@
+from unittest.mock import AsyncMock
+
 from temporalio_codex.spec_issue_adapter import (
     FakeSpecIssueGateway,
+    GhCliSpecIssueGateway,
     SpecDraft,
     SpecPublicationInput,
     SpecPublicationStatus,
@@ -79,3 +82,17 @@ async def test_publication_unknown_preserves_partial_evidence() -> None:
     assert result.status is SpecPublicationStatus.UNKNOWN
     assert result.issues == ()
     assert "readback" in result.reason
+
+
+async def test_spec_readback_scans_all_pages_and_matches_exact_operation() -> None:
+    gateway = GhCliSpecIssueGateway("owner/repo")
+    gateway._api = AsyncMock(return_value=[
+        [{"number": 1, "id": 1, "title": "wrong", "body": "Operation identity: publish:a-extra"}],
+        [{"number": 2, "id": 2, "title": "right", "body": "Operation identity: publish:a\n"}],
+    ])
+
+    result = await gateway.find_by_operation("publish:a")
+
+    assert result is not None
+    assert result.number == 2
+    gateway._api.assert_awaited_once_with("issues?state=all&per_page=100", paginate=True)

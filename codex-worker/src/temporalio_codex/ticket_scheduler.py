@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from temporalio_codex.models import RunInput
+
 
 class SchedulerStatus(StrEnum):
     ACTIVE = "active"
@@ -28,6 +30,12 @@ class SchedulerInput:
     specs: tuple[SpecPlan, ...]
     tickets: tuple[TicketPlan, ...]
     completion_operations: tuple[tuple[str, str], ...] = ()
+    # Optional Codex inputs keyed by ticket. When present, ready tickets are
+    # executed by the scheduler and completed from the child result.
+    codex_runs: tuple[tuple[str, RunInput], ...] = ()
+    parent_workflow_id: str | None = None
+    parent_workflow_run_id: str | None = None
+    automatic: bool = False
 
 
 @dataclass(frozen=True)
@@ -49,6 +57,7 @@ class SchedulerResult:
     completed_specs: tuple[str, ...]
     completed_tickets: tuple[str, ...]
     reason: str = ""
+    codex_results: tuple[dict, ...] = ()
 
 
 def validate_scheduler_graph(input: SchedulerInput) -> tuple[str, ...]:

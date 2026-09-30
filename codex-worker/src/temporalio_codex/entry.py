@@ -16,6 +16,7 @@ from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
+from temporalio_codex.delivery_models import DeliveryInput
 from temporalio_codex.entry_models import (
     EntryLaunchReceipt,
     EntryPhase,
@@ -28,12 +29,14 @@ from temporalio_codex.planning_models import (
     GrillAnswer,
     SourceOrigin,
 )
+from temporalio_codex.settings import DEFAULT_TARGET_HOST
 from temporalio_codex.spec_issue_adapter import (
     SpecDraft,
     SpecIssueRecord,
     SpecPublicationResult,
     SpecPublicationStatus,
 )
+from temporalio_codex.summary_adapter import SummaryPublicationInput
 from temporalio_codex.ticket_scheduler import SchedulerInput, SpecPlan, TicketPlan
 from temporalio_codex.whole_flow_models import (
     PlanningPayload,
@@ -41,9 +44,6 @@ from temporalio_codex.whole_flow_models import (
     SpecDeliveryPlan,
     WholeFlowInput,
 )
-from temporalio_codex.delivery_models import DeliveryInput
-from temporalio_codex.summary_adapter import SummaryPublicationInput
-from temporalio_codex.settings import DEFAULT_TARGET_HOST
 from temporalio_codex.whole_flow_workflows import RequirementDeliveryWorkflow
 
 
@@ -129,6 +129,12 @@ async def read_status(
         entry_launch_key=whole.entry_launch_key,
         entry_input_identity=whole.entry_input_identity,
         reason=whole.reason,
+        pending_reason=whole.pending_reason,
+        retry_count=whole.retry_count,
+        deadline=whole.deadline,
+        timeout_seconds=whole.timeout_seconds,
+        last_error=whole.last_error,
+        workflow_run_id=whole.workflow_run_id,
     )
 
 
@@ -242,6 +248,12 @@ async def diagnose_requirement(client: Client, run_id: str) -> EntryStatusSnapsh
         entry_launch_key=whole.entry_launch_key,
         entry_input_identity=whole.entry_input_identity,
         reason=whole.reason,
+        pending_reason=whole.pending_reason,
+        retry_count=whole.retry_count,
+        deadline=whole.deadline,
+        timeout_seconds=whole.timeout_seconds,
+        last_error=whole.last_error,
+        workflow_run_id=whole.workflow_run_id,
     )
 
 

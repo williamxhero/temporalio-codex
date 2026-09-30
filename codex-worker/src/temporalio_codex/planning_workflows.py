@@ -5,8 +5,8 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
-    from temporalio_codex.planning_activities import prepare_grill
-    from temporalio_codex.planning_activities import publish_spec_issues
+    from temporalio_codex.execution_status import report_progress
+    from temporalio_codex.planning_activities import prepare_grill, publish_spec_issues
     from temporalio_codex.planning_models import (
         GrillAnswer,
         GrillPreparationInput,
@@ -68,6 +68,11 @@ class RequirementPlanningWorkflow:
         )
         self._phase = PlanningPhase.GRILLING
         self._status = PlanningStatus.WAITING_FOR_INPUT
+        await report_progress(
+            phase="planning", next_action="derive requirement planning questions",
+            timeout_seconds=30,
+            deadline=(workflow.now() + timedelta(seconds=30)).isoformat(),
+        )
         questions = await workflow.execute_activity(
             prepare_grill,
             GrillPreparationInput(input.origin, input.source_identity),
@@ -131,6 +136,10 @@ class RequirementPlanningWorkflow:
             return self._planning_result()
         self._phase = PlanningPhase.READY
         self._status = PlanningStatus.PUBLISHING
+        await report_progress(phase="planning", next_action="publish and verify SPEC Issues",
+                              timeout_seconds=max(30.0, input.publication_timeout_seconds),
+                              deadline=(workflow.now() + timedelta(
+                                  seconds=max(30.0, input.publication_timeout_seconds))).isoformat())
         publication = await self._publish_specs(input)
         attempt = 1
         while publication.status is SpecPublicationStatus.UNKNOWN:
@@ -142,14 +151,23 @@ class RequirementPlanningWorkflow:
                     f"SPEC publication readback timed out or remained unknown after {attempt} "
                     f"attempts: {publication.reason}"
                 )
-                if input.parent_workflow_id:
-                    await workflow.get_external_workflow_handle(
-                        input.parent_workflow_id
-                    ).signal("planning_blocked", self._publication_reason)
+                await report_progress(
+                    phase="planning", status="blocked",
+                    retry_count=attempt - 1,
+                    pending_reason=self._publication_reason,
+                    last_error=self._publication_reason,
+                )
                 return self._planning_result()
             if self._cancelled:
                 return self._cancelled_result()
             backoff = input.publication_retry_backoff_seconds * (2 ** (attempt - 1))
+            await report_progress(
+                phase="planning", status="retrying", retry_count=attempt,
+                pending_reason="SPEC publication outcome requires readback",
+                next_action="reconcile and retry SPEC publication",
+                deadline=(workflow.now() + timedelta(seconds=backoff)).isoformat(),
+                last_error=publication.reason,
+            )
             if backoff:
                 await workflow.sleep(backoff)
             if self._cancelled:
@@ -160,6 +178,11 @@ class RequirementPlanningWorkflow:
             self._publication_resolution = None
             self._status = PlanningStatus.PUBLISHING
             attempt += 1
+            await report_progress(phase="planning", next_action="reconcile SPEC publication",
+                                  retry_count=attempt - 1,
+                                  timeout_seconds=max(30.0, input.publication_timeout_seconds),
+                                  deadline=(workflow.now() + timedelta(
+                                      seconds=max(30.0, input.publication_timeout_seconds))).isoformat())
             publication = await self._publish_specs(input)
         if publication.status is not SpecPublicationStatus.VERIFIED:
             self._status = (

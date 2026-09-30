@@ -190,7 +190,7 @@ async def test_streamed_sdk_actions_are_exposed_as_distinct_activities(
                 item=SimpleNamespace(
                     id="file-1",
                     type="fileChange",
-                    changes=[SimpleNamespace(path="src/main.py")],
+                    changes=[SimpleNamespace(path="src/main.py", diff="+print('done')", kind=SimpleNamespace(type="add"))],
                     status=SimpleNamespace(value="completed"),
                 ),
             ),
@@ -208,6 +208,7 @@ async def test_streamed_sdk_actions_are_exposed_as_distinct_activities(
                     tool="get_issue",
                     arguments={"number": 91},
                     result={"body": "full technical result"},
+                    error={"message": "tool result warning"},
                     status=SimpleNamespace(value="completed"),
                 ),
             ),
@@ -239,8 +240,12 @@ async def test_streamed_sdk_actions_are_exposed_as_distinct_activities(
         assert activities[0]["text"] == "uv run pytest tests\n1 passed"
         assert activities[0]["detail"]["exit_code"] == 0
         assert activities[1]["detail"]["paths"] == ["src/main.py"]
+        assert activities[1]["detail"]["changes"] == [
+            {"path": "src/main.py", "diff": "+print('done')", "kind": "add"}
+        ]
         assert activities[2]["detail"]["arguments"] == {"number": 91}
         assert activities[2]["detail"]["result"] == {"body": "full technical result"}
+        assert activities[2]["detail"]["error"] == {"message": "tool result warning"}
     finally:
         store.close()
 

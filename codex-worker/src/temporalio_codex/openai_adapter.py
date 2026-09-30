@@ -679,8 +679,22 @@ def _history_item_detail(item: Any) -> dict[str, Any]:
             str(getattr(change, "path", "") or "")
             for change in (getattr(value, "changes", ()) or ())
         ]
+        detail["changes"] = []
+        for change in (getattr(value, "changes", ()) or ()):
+            change_detail = {}
+            for field_name in ("path", "diff", "kind"):
+                field_value = getattr(change, field_name, None)
+                if field_value is None:
+                    continue
+                model_dump = getattr(field_value, "model_dump", None)
+                change_detail[field_name] = (
+                    model_dump(mode="json", by_alias=True)
+                    if callable(model_dump)
+                    else getattr(field_value, "value", getattr(field_value, "type", field_value))
+                )
+            detail["changes"].append(change_detail)
     if item_type == "mcpToolCall":
-        for field_name in ("arguments", "result"):
+        for field_name in ("arguments", "result", "error"):
             field_value = getattr(value, field_name, None)
             if field_value is not None:
                 model_dump = getattr(field_value, "model_dump", None)

@@ -50,6 +50,7 @@ class RequirementDeliveryWorkflow:
         self._answered_question_ids: list[str] = []
         self._active_child_run_id: str | None = None
         self._progress: ExecutionProgress | None = None
+        self._retry_count = 0
 
     @workflow.signal(name="execution_progress")
     def execution_progress(self, progress: ExecutionProgress) -> None:
@@ -65,6 +66,7 @@ class RequirementDeliveryWorkflow:
         except ValueError:
             return
         self._progress = progress
+        self._retry_count = progress.retry_count
         self._phase = phase
         self._status = status
         self._active_ticket = progress.active_ticket
@@ -72,6 +74,7 @@ class RequirementDeliveryWorkflow:
 
     async def _execute_child(self, name: str, input, **kwargs):
         self._progress = None
+        self._retry_count = 0
         self._status = WholeFlowStatus.DURABLE_WAITING
         handle = await workflow.start_child_workflow(name, input, **kwargs)
         self._active_child_run_id = handle.first_execution_run_id
@@ -99,8 +102,11 @@ class RequirementDeliveryWorkflow:
             entry_launch_key=self._entry_launch_key,
             entry_input_identity=self._entry_input_identity,
             reason=self._reason,
-            pending_reason=(self._progress.pending_reason if self._progress else self._reason),
-            retry_count=self._progress.retry_count if self._progress else 0,
+            pending_reason=(self._progress.pending_reason if self._progress else
+                            (f"waiting for child execution {self._active_child_id}"
+                             if self._status is WholeFlowStatus.DURABLE_WAITING
+                             else self._reason)),
+            retry_count=self._progress.retry_count if self._progress else self._retry_count,
             deadline=self._progress.deadline if self._progress else None,
             timeout_seconds=self._progress.timeout_seconds if self._progress else None,
             last_error=self._progress.last_error if self._progress else (self._reason or None),
@@ -382,6 +388,7 @@ class RequirementDeliveryWorkflow:
             max_attempts = input.planning.publication_max_attempts
             for attempt in range(1, max_attempts + 1):
                 self._status = WholeFlowStatus.ACTIVE
+                self._retry_count = attempt - 1
                 self._progress = ExecutionProgress(
                     workflow.info().workflow_id, workflow.info().run_id,
                     "tickets", next_action=f"publish tickets for {spec_key}",
@@ -402,6 +409,7 @@ class RequirementDeliveryWorkflow:
                 if attempt < max_attempts:
                     backoff = input.planning.publication_retry_backoff_seconds * (2 ** (attempt - 1))
                     self._status = WholeFlowStatus.RETRYING
+                    self._retry_count = attempt
                     self._progress = ExecutionProgress(
                         workflow.info().workflow_id, workflow.info().run_id,
                         "tickets", "retrying", retry_count=attempt,

@@ -137,9 +137,9 @@ class RequirementPlanningWorkflow:
         self._phase = PlanningPhase.READY
         self._status = PlanningStatus.PUBLISHING
         await report_progress(phase="planning", next_action="publish and verify SPEC Issues",
-                              timeout_seconds=input.publication_timeout_seconds,
+                              timeout_seconds=max(30.0, input.publication_timeout_seconds),
                               deadline=(workflow.now() + timedelta(
-                                  seconds=input.publication_timeout_seconds)).isoformat())
+                                  seconds=max(30.0, input.publication_timeout_seconds))).isoformat())
         publication = await self._publish_specs(input)
         attempt = 1
         while publication.status is SpecPublicationStatus.UNKNOWN:
@@ -153,6 +153,7 @@ class RequirementPlanningWorkflow:
                 )
                 await report_progress(
                     phase="planning", status="blocked",
+                    retry_count=attempt - 1,
                     pending_reason=self._publication_reason,
                     last_error=self._publication_reason,
                 )
@@ -178,7 +179,10 @@ class RequirementPlanningWorkflow:
             self._status = PlanningStatus.PUBLISHING
             attempt += 1
             await report_progress(phase="planning", next_action="reconcile SPEC publication",
-                                  retry_count=attempt - 1)
+                                  retry_count=attempt - 1,
+                                  timeout_seconds=max(30.0, input.publication_timeout_seconds),
+                                  deadline=(workflow.now() + timedelta(
+                                      seconds=max(30.0, input.publication_timeout_seconds))).isoformat())
             publication = await self._publish_specs(input)
         if publication.status is not SpecPublicationStatus.VERIFIED:
             self._status = (

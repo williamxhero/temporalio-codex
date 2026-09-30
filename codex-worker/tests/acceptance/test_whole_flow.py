@@ -401,6 +401,7 @@ async def test_parent_reports_publication_retry_and_terminal_blocked_status() ->
                 assert terminal.pending_reason == result.reason
                 assert terminal.next_action == ""
                 assert terminal.deadline is None
+                assert terminal.retry_count == 1
     finally:
         configure_spec_issue_gateway(None)
 

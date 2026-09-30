@@ -1,7 +1,9 @@
 import asyncio
+import hashlib
 import inspect
+import json
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from temporalio_codex.codex_models import (
@@ -32,17 +34,44 @@ class OpenAICodexAdapter:
     factory: CodexFactory
     sdk_version: str
     conversation_store: ConversationStore | None = None
-    _observations: dict[tuple[str, str | None, str], CodexObservation] = field(
+    _observations: dict[tuple[str, str, str, str], CodexObservation] = field(
         default_factory=dict
     )
     _owned_turns: dict[str, tuple[Any, Any]] = field(default_factory=dict)
+    _fingerprints: dict[tuple[str, str, str, str], str] = field(default_factory=dict)
 
     async def execute(self, operation: CodexOperation) -> CodexObservation:
         validate_operation(operation)
         cache_key = self._operation_cache_key(operation)
+        fingerprint = hashlib.sha256(
+            json.dumps(asdict(operation), sort_keys=True).encode()
+        ).hexdigest()
+        previous_fingerprint = self._fingerprints.get(cache_key)
+        if previous_fingerprint is not None and previous_fingerprint != fingerprint:
+            raise ValueError("operation identity reused with different input")
+        self._fingerprints[cache_key] = fingerprint
         existing = self._observations.get(cache_key)
         if existing is not None:
             return existing
+        if self.conversation_store is not None:
+            claimed, saved = self.conversation_store.claim_operation(
+                cache_key, fingerprint
+            )
+            if not claimed:
+                if saved["fingerprint"] != fingerprint:
+                    raise ValueError("operation identity reused with different input")
+                if saved["observation_json"]:
+                    return _restore_observation(json.loads(saved["observation_json"]))
+                return CodexObservation(
+                    operation_id=operation.operation_id,
+                    role=operation.role,
+                    outcome=CodexOutcome.UNKNOWN,
+                    thread_id=saved["thread_id"],
+                    turn_id=saved["turn_id"],
+                    failure=CodexFailure.UNKNOWN,
+                    summary="Codex launch outcome is unknown; readback is required",
+                    readback_required=True,
+                )
 
         codex = None
         thread_id = operation.thread_id
@@ -56,6 +85,10 @@ class OpenAICodexAdapter:
             codex = self.factory()
             thread = await self._get_thread(codex, operation)
             thread_id = getattr(thread, "id", None) or thread_id
+            if self.conversation_store is not None:
+                self.conversation_store.record_operation(
+                    cache_key, thread_id=thread_id, turn_id=None
+                )
             await self._record_thread_history(operation, thread, thread_id)
             self._emit(
                 operation,
@@ -71,7 +104,13 @@ class OpenAICodexAdapter:
                 model=operation.model,
                 sandbox=self._sandbox(operation.allowed_scope),
             )
+            if inspect.isawaitable(turn_handle):
+                turn_handle = await turn_handle
             turn_id = getattr(turn_handle, "id", None)
+            if self.conversation_store is not None:
+                self.conversation_store.record_operation(
+                    cache_key, thread_id=thread_id, turn_id=turn_id
+                )
             self._owned_turns[operation.operation_id] = (codex, turn_handle)
             self._emit(
                 operation,
@@ -87,9 +126,12 @@ class OpenAICodexAdapter:
                 capabilities,
                 thread_id=thread_id,
             )
+            turn_id = observation.turn_id or turn_id
             self._emit(
                 operation,
-                "assistant_final",
+                "assistant_final"
+                if observation.outcome is CodexOutcome.COMPLETED
+                else "error",
                 observation.summary,
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -97,11 +139,20 @@ class OpenAICodexAdapter:
             )
             self._emit(
                 operation,
-                "turn_completed",
+                "turn_completed"
+                if observation.outcome is CodexOutcome.COMPLETED
+                else "turn_failed",
                 thread_id=thread_id,
                 turn_id=turn_id,
                 event_id=f"operation:{operation.operation_id}:turn-completed:{turn_id}",
             )
+            if self.conversation_store is not None:
+                self.conversation_store.record_operation(
+                    cache_key,
+                    thread_id=observation.thread_id,
+                    turn_id=observation.turn_id,
+                    observation=asdict(observation),
+                )
         except Exception as error:  # noqa: BLE001 - classify SDK failures uniformly
             failure = self._classify_exception(error)
             observation = CodexObservation(
@@ -146,6 +197,13 @@ class OpenAICodexAdapter:
                 await self._close(codex)
 
         self._observations[cache_key] = observation
+        if self.conversation_store is not None:
+            self.conversation_store.record_operation(
+                cache_key,
+                thread_id=observation.thread_id,
+                turn_id=observation.turn_id,
+                observation=asdict(observation),
+            )
         return observation
 
     async def _run_turn(self, operation: CodexOperation, turn_handle: Any) -> Any:
@@ -186,14 +244,54 @@ class OpenAICodexAdapter:
         turn_id = getattr(payload, "turn_id", None) or getattr(
             getattr(payload, "turn", None), "id", None
         )
+        if self.conversation_store is not None and (thread_id or turn_id):
+            self.conversation_store.record_operation(
+                self._operation_cache_key(operation),
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+        if method == "turn/plan/updated":
+            text = "\n".join(
+                f"{getattr(step, 'step', '')}: {getattr(step, 'status', '')}"
+                for step in (getattr(payload, "plan", ()) or ())
+            )
+            self._emit(
+                operation,
+                "plan_delta",
+                text,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                detail={"method": method},
+            )
+            return
+        if method == "item/completed":
+            item = getattr(payload, "item", None)
+            kind, text = _history_item(item)
+            if kind in {"reasoning_delta", "plan_delta", "tool_delta"} and text:
+                self._emit(
+                    operation,
+                    kind,
+                    text,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    detail={"method": method},
+                )
+            return
+        if method == "error":
+            self._emit(
+                operation,
+                "error",
+                "Codex SDK reported an error",
+                thread_id=thread_id,
+                turn_id=turn_id,
+                detail={"method": method},
+            )
+            return
         if method == "item/agentMessage/delta":
             kind = "assistant_delta"
         elif method == "item/plan/delta":
             kind = "plan_delta"
-        elif method in {
-            "item/reasoning/summaryTextDelta",
-            "item/reasoning/textDelta",
-        }:
+        elif method == "item/reasoning/summaryTextDelta":
             kind = "reasoning_delta"
         elif method in {
             "item/commandExecution/outputDelta",
@@ -213,6 +311,7 @@ class OpenAICodexAdapter:
             thread_id=thread_id,
             turn_id=turn_id,
             detail={"method": method},
+            event_id=getattr(event, "id", None),
         )
 
     def _emit(
@@ -246,14 +345,20 @@ class OpenAICodexAdapter:
                 scope_workflow_run_id=(
                     operation.parent_workflow_run_id or operation.workflow_run_id
                 ),
+                namespace=operation.namespace,
             )
         )
 
     @staticmethod
     def _operation_cache_key(
         operation: CodexOperation,
-    ) -> tuple[str, str | None, str]:
-        return operation.run_id, operation.workflow_run_id, operation.operation_id
+    ) -> tuple[str, str, str, str]:
+        return (
+            operation.namespace,
+            operation.run_id,
+            operation.workflow_run_id or "",
+            operation.operation_id,
+        )
 
     @staticmethod
     def _execution_event_id(
@@ -278,7 +383,7 @@ class OpenAICodexAdapter:
         try:
             response = read(include_turns=True)
             if inspect.isawaitable(response):
-                response = await response
+                response = await asyncio.wait_for(response, timeout=10)
             persisted_thread = getattr(response, "thread", response)
             turns = getattr(persisted_thread, "turns", ()) or ()
             for turn_index, turn in enumerate(turns):
@@ -306,9 +411,15 @@ class OpenAICodexAdapter:
                             f"{thread_id}:{turn_id}:{item_id}"
                         ),
                     )
+                status = getattr(turn, "status", "completed")
+                status = getattr(status, "value", status)
                 self._emit(
                     operation,
-                    "turn_completed",
+                    "turn_completed"
+                    if status == "completed"
+                    else "turn_failed"
+                    if status in {"failed", "interrupted"}
+                    else "turn_started",
                     thread_id=thread_id,
                     turn_id=turn_id,
                     detail={"source": "thread_read"},
@@ -503,7 +614,7 @@ def _history_item(item: Any) -> tuple[str | None, str]:
     if item_type == "plan":
         return "plan_delta", str(getattr(value, "text", "") or "")
     if item_type == "reasoning":
-        parts = getattr(value, "summary", None) or getattr(value, "content", None) or ()
+        parts = getattr(value, "summary", None) or ()
         return "reasoning_delta", "\n".join(str(part) for part in parts if part)
     if item_type == "commandExecution":
         command = str(getattr(value, "command", "") or "")
@@ -524,3 +635,16 @@ def _history_user_text(content: Any) -> str:
         if item_type:
             parts.append(f"[{item_type}]")
     return "\n".join(parts)
+
+
+def _restore_observation(value: dict[str, Any]) -> CodexObservation:
+    from temporalio_codex.codex_models import CodexRole
+
+    value["role"] = CodexRole(value["role"])
+    value["outcome"] = CodexOutcome(value["outcome"])
+    if value.get("failure"):
+        value["failure"] = CodexFailure(value["failure"])
+    if value.get("capabilities"):
+        value["capabilities"] = CodexCapabilities(**value["capabilities"])
+    value["evidence_refs"] = tuple(value.get("evidence_refs", ()))
+    return CodexObservation(**value)

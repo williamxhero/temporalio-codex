@@ -89,6 +89,7 @@ def test_snapshot_groups_input_and_streamed_output_for_parent_workflow(
                 "input": "Plan this requirement",
                 "output": "Plan complete",
                 "working": [],
+                "activities": [],
                 "status": "completed",
                 "updatedAt": conversation["turns"][0]["updatedAt"],
             }
@@ -259,11 +260,13 @@ def test_legacy_database_migrates_without_leaking_unscoped_rows(tmp_path):
 
     path = tmp_path / "legacy.db"
     connection = sqlite3.connect(path)
-    connection.execute("""CREATE TABLE codex_conversation_events (
+    connection.execute(
+        """CREATE TABLE codex_conversation_events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id TEXT NOT NULL,
         scope_workflow_id TEXT NOT NULL, operation_id TEXT NOT NULL, stage TEXT NOT NULL,
         role TEXT NOT NULL, thread_id TEXT, turn_id TEXT, kind TEXT NOT NULL,
-        text TEXT NOT NULL, detail_json TEXT NOT NULL, created_at REAL NOT NULL)""")
+        text TEXT NOT NULL, detail_json TEXT NOT NULL, created_at REAL NOT NULL)"""
+    )
     connection.execute(
         "INSERT INTO codex_conversation_events(workflow_id,scope_workflow_id,operation_id,stage,role,kind,text,detail_json,created_at) VALUES ('child','parent','old','planning','planning','user_input','legacy','{}',1)"
     )
@@ -276,5 +279,199 @@ def test_legacy_database_migrates_without_leaking_unscoped_rows(tmp_path):
         )
         assert store.snapshot("child", "current")["conversations"] == []
         assert store.snapshot("child", namespace="other")["conversations"] == []
+    finally:
+        store.close()
+
+
+def test_snapshot_exposes_readable_activity_summaries_and_preserves_details(tmp_path):
+    store = ConversationStore(tmp_path / "activities.db")
+    try:
+        common = {
+            "workflow_id": "workflow",
+            "scope_workflow_id": "workflow",
+            "operation_id": "op-1",
+            "workflow_run_id": "run-1",
+            "scope_workflow_run_id": "run-1",
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+        }
+        store.append(event(kind="plan_delta", text="inspect files", **common))
+        store.append(event(kind="plan_delta", text="run tests", **common))
+        store.append(
+            ConversationEvent(
+                **common,
+                stage="implementation",
+                role="implementation",
+                kind="tool_delta",
+                text="uv run pytest tests/acceptance",
+                detail={"method": "command/exec/outputDelta", "exit_code": 0},
+                event_id="command-1",
+            )
+        )
+        store.append(
+            ConversationEvent(
+                **common,
+                stage="implementation",
+                role="implementation",
+                kind="tool_delta",
+                text="SDK_PROBE_OK",
+                detail={"method": "command/exec/outputDelta", "probe": True},
+                event_id="probe-1",
+            )
+        )
+
+        turn = store.snapshot("workflow", "run-1")["conversations"][0]["turns"][0]
+
+        assert turn["activities"] == [
+            {
+                "id": "event:1",
+                "category": "plan",
+                "summary": "inspect filesrun tests",
+                "text": "inspect filesrun tests",
+            },
+            {
+                "id": "command-1",
+                "category": "test",
+                "summary": "uv run pytest tests/acceptance",
+                "text": "uv run pytest tests/acceptance",
+                "detail": {"method": "command/exec/outputDelta", "exit_code": 0},
+            },
+            {
+                "id": "probe-1",
+                "category": "verification",
+                "summary": "SDK_PROBE_OK",
+                "text": "SDK_PROBE_OK",
+                "detail": {"method": "command/exec/outputDelta", "probe": True},
+            },
+        ]
+        assert turn["working"] == [
+            {"kind": "plan", "text": "inspect filesrun tests"},
+            {"kind": "tool", "text": "uv run pytest tests/acceptanceSDK_PROBE_OK"},
+        ]
+    finally:
+        store.close()
+
+
+def test_snapshot_classifies_malformed_activity_details_without_failing(tmp_path):
+    store = ConversationStore(tmp_path / "malformed-activities.db")
+    try:
+        store.append(
+            ConversationEvent(
+                workflow_id="workflow",
+                scope_workflow_id="workflow",
+                operation_id="op-1",
+                workflow_run_id="run-1",
+                scope_workflow_run_id="run-1",
+                thread_id="thread-1",
+                turn_id="turn-1",
+                stage="implementation",
+                role="implementation",
+                kind="tool_delta",
+                text="open src/main.py",
+                detail={"method": None, "path": "src/main.py"},
+                event_id="file-1",
+            )
+        )
+        store.append(
+            ConversationEvent(
+                workflow_id="workflow",
+                scope_workflow_id="workflow",
+                operation_id="op-1",
+                workflow_run_id="run-1",
+                scope_workflow_run_id="run-1",
+                thread_id="thread-1",
+                turn_id="turn-1",
+                stage="implementation",
+                role="implementation",
+                kind="error",
+                text="tool failed",
+                detail="not-an-object",
+                event_id="error-1",
+            )
+        )
+
+        activities = store.snapshot("workflow", "run-1")["conversations"][0]["turns"][
+            0
+        ]["activities"]
+
+        assert activities == [
+            {
+                "id": "file-1",
+                "category": "file",
+                "summary": "open src/main.py",
+                "text": "open src/main.py",
+                "detail": {"method": None, "path": "src/main.py"},
+            },
+            {
+                "id": "error-1",
+                "category": "error",
+                "summary": "tool failed",
+                "text": "tool failed",
+            },
+        ]
+    finally:
+        store.close()
+
+
+def test_streamed_command_output_is_replaced_by_completed_item(tmp_path):
+    store = ConversationStore(tmp_path / "streamed-command.db")
+    try:
+        base = event(
+            workflow_id="workflow",
+            scope_workflow_id="workflow",
+            workflow_run_id="run-1",
+            scope_workflow_run_id="run-1",
+            operation_id="op-1",
+            kind="tool_delta",
+            text="part ",
+        )
+        store.append(
+            replace(
+                base,
+                detail={
+                    "method": "item/commandExecution/outputDelta",
+                    "item_id": "item-1",
+                },
+                event_id="delta-1",
+            )
+        )
+        store.append(
+            replace(
+                base,
+                text="output",
+                detail={
+                    "method": "item/commandExecution/outputDelta",
+                    "item_id": "item-1",
+                },
+                event_id="delta-2",
+            )
+        )
+        completed = replace(
+            base,
+            text="uv run pytest tests\npart output",
+            detail={
+                "method": "item/completed",
+                "item_id": "item-1",
+                "item_type": "commandExecution",
+                "command": "uv run pytest tests",
+                "exit_code": 0,
+            },
+            event_id="complete-1",
+        )
+        store.append(completed)
+        store.append(completed)
+
+        activities = store.snapshot("workflow", "run-1")["conversations"][0]["turns"][
+            0
+        ]["activities"]
+        assert activities == [
+            {
+                "id": "delta-1",
+                "category": "test",
+                "summary": "uv run pytest tests",
+                "text": "uv run pytest tests\npart output",
+                "detail": completed.detail,
+            }
+        ]
     finally:
         store.close()

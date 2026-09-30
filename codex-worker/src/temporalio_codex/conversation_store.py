@@ -386,6 +386,10 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         elif kind == "history_error":
             turn["status"] = "failed"
 
+    for turn in turns.values():
+        for activity in turn["activities"]:
+            _normalize_activity(activity)
+        turn["displayOutput"], turn["verificationMarkers"] = _display_output(turn["output"])
     return list(conversations.values())
 
 
@@ -476,6 +480,23 @@ def _append_activity(
 ) -> None:
     detail = activity.get("detail")
     item_id = detail.get("item_id") if isinstance(detail, dict) else None
+    method = detail.get("method", "") if isinstance(detail, dict) else ""
+    if not item_id and activities and isinstance(detail, dict):
+        previous = activities[-1]
+        previous_detail = previous.get("detail", {})
+        if (
+            isinstance(previous_detail, dict)
+            and not previous_detail.get("item_id")
+            and not any(key in previous_detail for key in ("exit_code", "probe", "command"))
+            and not detail.get("probe")
+        ):
+            previous_method = previous_detail.get("method", "")
+            if previous_method in _OUTPUT_DELTA_METHODS and method == previous_method:
+                previous["text"] += activity["text"]
+                return
+            if previous_method in _OUTPUT_DELTA_METHODS and method == "item/completed":
+                previous.update({key: value for key, value in activity.items() if key != "id"})
+                return
     if item_id:
         for existing in reversed(activities):
             existing_detail = existing.get("detail")
@@ -514,6 +535,60 @@ def _append_activity(
                 activities[-1]["detail"] = details
         return
     activities.append(activity)
+
+
+_OUTPUT_DELTA_METHODS = {
+    "item/commandExecution/outputDelta",
+    "command/exec/outputDelta",
+    "process/outputDelta",
+}
+_CONTEXT_PATH = re.compile(
+    r"(?:[A-Za-z]:)?[^\s\"'`;|]*[\\/]?(?:SKILL\.md|AGENTS\.md|CLAUDE\.md|README(?:\.[\w-]+)?|[\w.-]*(?:policy|config)[\w.-]*\.(?:md|json|ya?ml|toml|ini))",
+    re.IGNORECASE,
+)
+_READ_COMMAND = re.compile(r"(?:^|[\s\"';])(?:Get-Content|cat|type|read|open|sed|head|tail)(?:\s|$)", re.IGNORECASE)
+
+
+def _normalize_activity(activity: dict[str, Any]) -> None:
+    detail = activity.get("detail", {})
+    if not isinstance(detail, dict):
+        detail = {}
+    text = activity["text"]
+    command = str(detail.get("command") or text.splitlines()[0])
+    paths = _CONTEXT_PATH.findall(command) if _READ_COMMAND.search(command) else []
+    path = detail.get("path") or detail.get("file") or detail.get("file_path")
+    if isinstance(path, str) and _READ_COMMAND.search(command) and _CONTEXT_PATH.fullmatch(path):
+        paths.append(path)
+    if paths:
+        names = list(dict.fromkeys(path.replace("\\", "/").rsplit("/", 1)[-1] for path in paths))
+        activity["category"] = "context"
+        activity["summary"] = _activity_summary("Read context: " + ", ".join(names[:3]) + (f" (+{len(names) - 3} more)" if len(names) > 3 else ""))
+    elif (
+        activity["category"] == "command"
+        and detail.get("method") in _OUTPUT_DELTA_METHODS
+        and not detail.get("command")
+    ):
+        activity["summary"] = "Command output"
+
+
+def _display_output(output: str) -> tuple[str, list[str]]:
+    lines = []
+    markers = []
+    fence = ""
+    for line in output.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            delimiter = stripped[:3]
+            if not fence:
+                fence = delimiter
+            elif fence == delimiter:
+                fence = ""
+        if not fence and stripped in {"SDK_PROBE_OK", "`SDK_PROBE_OK`"}:
+            if "SDK_PROBE_OK" not in markers:
+                markers.append("SDK_PROBE_OK")
+            continue
+        lines.append(line)
+    return ("".join(lines).strip() if markers else output), markers
 
 
 def _activity_summary(text: str, limit: int = 160) -> str:

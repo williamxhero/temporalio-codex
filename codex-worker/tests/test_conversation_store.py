@@ -1,5 +1,7 @@
 from dataclasses import replace
 
+import pytest
+
 from temporalio_codex.conversation_store import ConversationEvent, ConversationStore
 
 
@@ -88,6 +90,8 @@ def test_snapshot_groups_input_and_streamed_output_for_parent_workflow(
                 "turnId": "turn-1",
                 "input": "Plan this requirement",
                 "output": "Plan complete",
+                "displayOutput": "Plan complete",
+                "verificationMarkers": [],
                 "working": [],
                 "activities": [],
                 "status": "completed",
@@ -473,5 +477,71 @@ def test_streamed_command_output_is_replaced_by_completed_item(tmp_path):
                 "detail": completed.detail,
             }
         ]
+    finally:
+        store.close()
+
+
+def test_legacy_context_read_stream_is_one_activity_with_complete_evidence(tmp_path):
+    store = ConversationStore(tmp_path / "context.db")
+    base = event(
+        workflow_id="workflow", scope_workflow_id="workflow",
+        operation_id="op", kind="tool_delta",
+    )
+    command = "pwsh -Command \"Get-Content C:/skills/tdd/SKILL.md; Get-Content README.md\""
+    source = "# TDD\nInternal skill source\n# README\nProject instructions"
+    try:
+        for chunk in ("# TDD\n", "Internal skill source\n", "# README\n", "Project instructions"):
+            store.append(replace(base, text=chunk, detail={"method": "item/commandExecution/outputDelta"}))
+        store.append(replace(base, text=command + "\n" + source, detail={"method": "item/completed"}))
+        turn = store.snapshot("workflow")["conversations"][0]["turns"][0]
+        assert len(turn["activities"]) == 1
+        activity = turn["activities"][0]
+        assert activity["category"] == "context"
+        assert activity["summary"] == "Read context: SKILL.md, README.md"
+        assert activity["text"] == command + "\n" + source
+        assert turn["working"][0]["text"].endswith(command + "\n" + source)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("original", "display", "markers"),
+    [
+        ("SDK_PROBE_OK", "", ["SDK_PROBE_OK"]),
+        ("**Result**\n\nAll tests passed.\n\nSDK_PROBE_OK", "**Result**\n\nAll tests passed.", ["SDK_PROBE_OK"]),
+        ("The SDK_PROBE_OK marker confirms the probe.", "The SDK_PROBE_OK marker confirms the probe.", []),
+        ("```text\nSDK_PROBE_OK\n```", "```text\nSDK_PROBE_OK\n```", []),
+    ],
+)
+def test_snapshot_separates_standalone_probe_metadata_from_complete_answer(tmp_path, original, display, markers):
+    store = ConversationStore(tmp_path / "probe.db")
+    try:
+        store.append(event(workflow_id="workflow", scope_workflow_id="workflow", operation_id="op", kind="assistant_final", text=original))
+        turn = store.snapshot("workflow")["conversations"][0]["turns"][0]
+        assert turn["output"] == original
+        assert turn["displayOutput"] == display
+        assert turn["verificationMarkers"] == markers
+    finally:
+        store.close()
+
+
+def test_structured_context_reads_are_concise_and_file_edits_remain_edits(tmp_path):
+    store = ConversationStore(tmp_path / "structured-context.db")
+    base = event(workflow_id="workflow", scope_workflow_id="workflow", operation_id="op", kind="tool_delta")
+    try:
+        store.append(replace(base, text="full config source\nsettings", detail={
+            "method": "item/completed", "item_id": "read-1", "item_type": "commandExecution",
+            "command": "cat policy.md config.yaml AGENTS.md", "exit_code": 0,
+        }))
+        store.append(replace(base, text="Files changed: README.md", detail={
+            "method": "item/completed", "item_id": "edit-1", "item_type": "fileChange",
+            "paths": ["README.md"],
+        }))
+        activities = store.snapshot("workflow")["conversations"][0]["turns"][0]["activities"]
+        assert [(activity["category"], activity["summary"]) for activity in activities] == [
+            ("context", "Read context: policy.md, config.yaml, AGENTS.md"),
+            ("file", "Files changed: README.md"),
+        ]
+        assert activities[0]["text"] == "full config source\nsettings"
     finally:
         store.close()

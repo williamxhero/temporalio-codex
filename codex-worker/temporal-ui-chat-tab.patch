@@ -155,10 +155,10 @@ index 0000000..d779461
 +</style>
 diff --git a/src/lib/components/workflow/workflow-chat.svelte b/src/lib/components/workflow/workflow-chat.svelte
 new file mode 100644
-index 0000000..212c365
+index 0000000..5da0dd5
 --- /dev/null
 +++ b/src/lib/components/workflow/workflow-chat.svelte
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,405 @@
 +<script lang="ts">
 +  import { untrack } from 'svelte';
 +
@@ -169,6 +169,11 @@ index 0000000..212c365
 +  import { getQuery } from '$lib/services/query-service';
 +
 +  type WorkingItem = { kind: string; text: string };
++  type Activity = {
++    kind: 'plan' | 'reasoning' | 'tool';
++    text: string;
++    updates: number;
++  };
 +  type Turn = {
 +    id: string;
 +    turnId?: string;
@@ -198,6 +203,54 @@ index 0000000..212c365
 +    deadline?: string;
 +    last_error?: string;
 +  };
++
++  const stageTitle = (stage: string) =>
++    stage
++      .replace(/[_-]+/g, ' ')
++      .replace(/\b\w/g, (letter) => letter.toUpperCase());
++
++  const activityKind = (kind: string): Activity['kind'] => {
++    if (kind.startsWith('tool')) return 'tool';
++    if (kind.startsWith('plan')) return 'plan';
++    return 'reasoning';
++  };
++
++  const activityGroups = (items: WorkingItem[]): Activity[] => {
++    const groups: Activity[] = [];
++    for (const item of items) {
++      const kind = activityKind(item.kind);
++      const previous = groups.at(-1);
++      if (previous && previous.kind === kind && kind !== 'tool') {
++        previous.text += item.text;
++        previous.updates += 1;
++      } else {
++        groups.push({ kind, text: item.text, updates: 1 });
++      }
++    }
++    return groups;
++  };
++
++  const activityLabel = (kind: Activity['kind']) =>
++    kind === 'plan'
++      ? 'Plan'
++      : kind === 'tool'
++        ? 'Tool output'
++        : 'Reasoning summary';
++
++  const activitySummary = (activity: Activity) => {
++    const count =
++      activity.updates === 1 ? '1 update' : `${activity.updates} updates`;
++    return `${activityLabel(activity.kind)} · ${count}`;
++  };
++
++  const turnLabel = (status: Turn['status']) =>
++    status === 'running'
++      ? 'In progress'
++      : status === 'failed'
++        ? 'Failed'
++        : status === 'queued'
++          ? 'Queued'
++          : 'Completed';
 +
 +  let conversations = $state<Conversation[]>([]);
 +  let loading = $state(true);
@@ -385,77 +438,106 @@ index 0000000..212c365
 +      {emptyMessage}
 +    </div>
 +  {:else}
-+    <div class="flex flex-col gap-10">
++    <div class="flex flex-col gap-12">
 +      {#each conversations as conversation (conversation.id)}
 +        <article
 +          class="flex flex-col gap-6"
 +          data-thread-id={conversation.threadId ?? conversation.id}
 +        >
-+          <div class="flex items-center gap-3 border-b border-primary pb-3">
++          <header class="flex items-start gap-3 border-b border-primary pb-4">
 +            <span
-+              class="flex h-8 w-8 items-center justify-center rounded-full bg-surface-secondary text-primary"
++              class="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-secondary text-primary"
 +            >
 +              <IconCodex class="h-4 w-4" />
 +            </span>
-+            <div class="min-w-0">
-+              <div class="font-medium text-primary">{conversation.role}</div>
-+              <div class="truncate font-mono text-xs text-secondary">
-+                {conversation.threadId ?? 'thread pending'} · {conversation.stage}
++            <div class="min-w-0 flex-1">
++              <h2 class="text-base font-semibold text-primary">
++                {stageTitle(conversation.stage)}
++              </h2>
++              <div class="mt-1 text-sm text-secondary">
++                {conversation.role} · {conversation.turns.length}
++                {conversation.turns.length === 1 ? ' turn' : ' turns'}
 +              </div>
 +            </div>
-+          </div>
++            <details class="shrink-0 text-right text-xs text-secondary">
++              <summary class="cursor-pointer select-none"
++                >Thread details</summary
++              >
++              <div class="mt-2 max-w-56 break-all font-mono">
++                {conversation.threadId ?? 'thread pending'}
++              </div>
++            </details>
++          </header>
 +
-+          {#each conversation.turns as turn (turn.id)}
-+            <div class="flex flex-col gap-5">
++          {#each conversation.turns as turn, turnIndex (turn.id)}
++            <section class="flex flex-col gap-4" data-testid="codex-turn">
++              <div
++                class="flex items-center justify-between gap-3 text-xs text-secondary"
++              >
++                <span class="font-medium uppercase tracking-wide"
++                  >Turn {turnIndex + 1}</span
++                >
++                <span>{turnLabel(turn.status)}</span>
++              </div>
++
 +              {#if turn.input}
-+                <div class="flex justify-end">
-+                  <div
-+                    class="min-w-0 max-w-3xl rounded-lg bg-surface-secondary px-4 py-3 text-sm leading-6 text-primary"
++                <details
++                  class="max-w-4xl text-sm text-secondary"
++                  data-testid="codex-prompt"
++                >
++                  <summary class="cursor-pointer select-none"
++                    >Prompt · implementation context</summary
 +                  >
-+                    <div
-+                      class="mb-2 text-[11px] font-medium uppercase tracking-wide text-secondary"
-+                    >
-+                      Workflow input
-+                    </div>
++                  <div
++                    class="mt-3 rounded-lg bg-surface-secondary px-4 py-3 leading-6 text-primary"
++                  >
 +                    <WorkflowChatMessage content={turn.input} />
 +                  </div>
-+                </div>
++                </details>
 +              {/if}
 +
 +              {#if turn.working.length}
-+                <details class="max-w-3xl text-sm text-secondary">
++                <details
++                  class="max-w-4xl text-sm text-secondary"
++                  data-testid="codex-activity"
++                >
 +                  <summary class="cursor-pointer select-none"
-+                    >Working details</summary
++                    >Activity · {turn.working.length} recorded events</summary
 +                  >
 +                  <div
-+                    class="mt-3 flex flex-col gap-3 border-l border-primary pl-4"
++                    class="mt-3 flex flex-col gap-2 border-l border-primary pl-4"
 +                  >
-+                    {#each turn.working as item}
-+                      <div>
++                    {#each activityGroups(turn.working) as activity}
++                      <details
++                        class="rounded-lg bg-surface-secondary px-3 py-2 text-primary"
++                      >
++                        <summary class="cursor-pointer select-none text-sm">
++                          <span class="font-medium"
++                            >{activitySummary(activity)}</span
++                          >
++                        </summary>
 +                        <div
-+                          class="mb-1 text-[11px] font-medium uppercase tracking-wide"
++                          class="mt-3 border-t border-primary pt-3 text-sm leading-6"
 +                        >
-+                          {item.kind}
++                          <WorkflowChatMessage content={activity.text} />
 +                        </div>
-+                        <pre
-+                          class="whitespace-pre-wrap break-words font-sans leading-6">{item.text}</pre>
-+                      </div>
++                      </details>
 +                    {/each}
 +                  </div>
 +                </details>
 +              {/if}
 +
 +              {#if turn.output}
-+                <div class="flex gap-3">
++                <div class="flex gap-3" data-testid="codex-response">
 +                  <span
-+                    class="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surface-secondary text-primary"
++                    class="mt-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-secondary text-primary"
 +                  >
 +                    <IconCodex class="h-4 w-4" />
 +                  </span>
-+                  <div class="min-w-0 max-w-4xl text-sm leading-7 text-primary">
-+                    <div
-+                      class="mb-2 text-[11px] font-medium uppercase tracking-wide text-secondary"
-+                    >
++                  <div
++                    class="min-w-0 max-w-4xl flex-1 text-sm leading-7 text-primary"
++                  >
++                    <div class="mb-2 text-sm font-semibold text-primary">
 +                      Codex
 +                    </div>
 +                    <WorkflowChatMessage content={turn.output} />
@@ -467,7 +549,15 @@ index 0000000..212c365
 +                  </div>
 +                </div>
 +              {/if}
-+            </div>
++              {#if !turn.output && turn.status === 'running'}
++                <div
++                  class="flex items-center gap-3 text-sm text-secondary"
++                  role="status"
++                >
++                  <IconSpinner class="h-4 w-4 animate-spin" /> Codex is working…
++                </div>
++              {/if}
++            </section>
 +          {/each}
 +        </article>
 +      {/each}
@@ -634,10 +724,10 @@ index 0000000..df87936
 +<WorkflowChat />
 diff --git a/tests/integration/workflow-chat.spec.ts b/tests/integration/workflow-chat.spec.ts
 new file mode 100644
-index 0000000..b6a293a
+index 0000000..7fcf9db
 --- /dev/null
 +++ b/tests/integration/workflow-chat.spec.ts
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,206 @@
 +import { expect, test } from '@playwright/test';
 +
 +import { mockWorkflowApis } from '~/test-utilities/mock-apis';
@@ -704,7 +794,8 @@ index 0000000..b6a293a
 +  await expect(
 +    page.getByText('Streamed response', { exact: true }),
 +  ).toBeVisible();
-+  await page.getByText('Working details').click();
++  await page.getByTestId('codex-activity').locator('summary').first().click();
++  await page.getByText('Tool output · 1 update', { exact: true }).click();
 +  await expect(page.getByText('Tests passed')).toBeVisible();
 +  unavailable = true;
 +  await expect(
@@ -728,6 +819,29 @@ index 0000000..b6a293a
 +    fullPage: true,
 +  });
 +  expect(errors).toEqual([]);
++});
++
++test('Chat reads like a thread and keeps prompt and activity details collapsed', async ({
++  page,
++}) => {
++  await mockWorkflowApis(page, mockWorkflow);
++  await page.route('http://127.0.0.1:18001/**', async (route) => {
++    await route.fulfill({ json: snapshot('A clear final response', 1) });
++  });
++  await page.goto(workflowUrl);
++
++  await expect(page.getByRole('heading', { name: 'Implement' })).toBeVisible();
++  await expect(page.getByText('Codex', { exact: true })).toBeVisible();
++  await expect(page.getByTestId('codex-response')).toContainText(
++    'A clear final response',
++  );
++  await expect(page.getByTestId('codex-prompt')).not.toHaveAttribute(
++    'open',
++    '',
++  );
++  await expect(page.getByText('Implement the selected ticket')).toBeHidden();
++  await expect(page.getByText('Tests passed')).toBeHidden();
++  await expect(page.getByText('Tool output · 1 update')).toBeHidden();
 +});
 +
 +test('Chat defaults to the exact execution and explains planning before Codex starts', async ({

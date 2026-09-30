@@ -268,7 +268,7 @@ class RequirementDeliveryWorkflow:
                 id=self._active_child_id,
                 result_type=dict,
             )
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - child failures become workflow evidence
             if self._cancelled:
                 return self._cancelled_result()
             return self._failed(f"planning child failed: {error}")
@@ -445,7 +445,7 @@ class RequirementDeliveryWorkflow:
                     id=self._active_child_id,
                     result_type=dict,
                 )
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 - child failures become workflow evidence
                 if self._cancelled:
                     return self._cancelled_result(
                         planning, scheduler_runs, codex_results, delivery_results
@@ -490,7 +490,7 @@ class RequirementDeliveryWorkflow:
                         id=self._active_child_id,
                         result_type=dict,
                     )
-                except Exception as error:
+                except Exception as error:  # noqa: BLE001 - child failures become workflow evidence
                     if self._cancelled:
                         return self._cancelled_result(
                             planning, scheduler_runs, codex_results, delivery_results
@@ -521,7 +521,7 @@ class RequirementDeliveryWorkflow:
                     id=self._active_child_id,
                     result_type=dict,
                 )
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 - child failures become workflow evidence
                 if self._cancelled:
                     return self._cancelled_result(
                         planning, scheduler_runs, codex_results, delivery_results
@@ -573,7 +573,7 @@ class RequirementDeliveryWorkflow:
                 id=self._active_child_id,
                 result_type=dict,
             )
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - child failures become workflow evidence
             if self._cancelled:
                 return self._cancelled_result(
                     planning, scheduler, codex_results, delivery_results

@@ -182,14 +182,10 @@ class RequirementPlanningWorkflow:
         )
         if not required:
             return ()
-        context = (input.source_text or input.source_reference or "").strip()
+        context = (input.source_text or "").strip()
         if not context:
             return None
-        if input.source_text:
-            answer = context
-        else:
-            answer = f"Use the requirement context identified by {context}."
-        return tuple(GrillAnswer(question.number, answer) for question in required)
+        return tuple(GrillAnswer(question.number, context) for question in required)
 
     async def _publish_specs(self, input: PlanningInput) -> SpecPublicationResult:
         try:

@@ -76,7 +76,7 @@ async def test_text_intake_completes_without_manual_planning_signals() -> None:
     assert result.publication_operation_id.startswith("planning-publish:")
 
 
-async def test_historical_chat_completes_from_reference_without_manual_input() -> None:
+async def test_historical_chat_without_readable_context_blocks_without_manual_input() -> None:
     input = PlanningInput(
         origin=SourceOrigin.HISTORICAL_CHAT,
         source_reference="artifact://chat-123",
@@ -91,11 +91,10 @@ async def test_historical_chat_completes_from_reference_without_manual_input() -
             handle = await start_planning(environment, "planning-chat", input)
             result = await handle.result()
 
-    assert result.status is PlanningStatus.COMPLETED
+    assert result.status is PlanningStatus.BLOCKED
     assert result.source.source_reference == "artifact://chat-123"
-    assert result.grill.decisions == (
-        "Use the requirement context identified by artifact://chat-123.",
-    )
+    assert result.grill.decisions == ()
+    assert "unable to safely derive" in result.publication_reason
 
 
 async def test_specs_publish_without_confirmation_signal() -> None:

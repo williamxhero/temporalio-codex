@@ -296,6 +296,7 @@ class CodexRunWorkflow:
                     parent_workflow_id=input.parent_workflow_id,
                     workflow_run_id=workflow.info().run_id,
                     parent_workflow_run_id=input.parent_workflow_run_id,
+                    namespace=workflow.info().namespace,
                 ),
                 start_to_close_timeout=timedelta(
                     seconds=stage.start_to_close_timeout_seconds

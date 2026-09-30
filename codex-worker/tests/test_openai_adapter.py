@@ -146,6 +146,105 @@ async def test_stream_deltas_are_persisted_as_one_conversation_turn(tmp_path) ->
         store.close()
 
 
+async def test_streamed_sdk_actions_are_exposed_as_distinct_activities(
+    tmp_path,
+) -> None:
+    completed = SimpleNamespace(
+        id="turn-stream",
+        status=SimpleNamespace(value="completed"),
+        error=None,
+    )
+    events = [
+        SimpleNamespace(
+            method="item/commandExecution/outputDelta",
+            id="delta-1",
+            payload=SimpleNamespace(
+                thread_id="thread-stream",
+                turn_id="turn-stream",
+                item_id="cmd-1",
+                delta="1 passed",
+            ),
+        ),
+        SimpleNamespace(
+            method="item/completed",
+            id="complete-cmd-1",
+            payload=SimpleNamespace(
+                thread_id="thread-stream",
+                turn_id="turn-stream",
+                item=SimpleNamespace(
+                    id="cmd-1",
+                    type="commandExecution",
+                    command="uv run pytest tests",
+                    aggregated_output="1 passed",
+                    status=SimpleNamespace(value="completed"),
+                    exit_code=0,
+                ),
+            ),
+        ),
+        SimpleNamespace(
+            method="item/completed",
+            id="complete-file-1",
+            payload=SimpleNamespace(
+                thread_id="thread-stream",
+                turn_id="turn-stream",
+                item=SimpleNamespace(
+                    id="file-1",
+                    type="fileChange",
+                    changes=[SimpleNamespace(path="src/main.py")],
+                    status=SimpleNamespace(value="completed"),
+                ),
+            ),
+        ),
+        SimpleNamespace(
+            method="item/completed",
+            id="complete-mcp-1",
+            payload=SimpleNamespace(
+                thread_id="thread-stream",
+                turn_id="turn-stream",
+                item=SimpleNamespace(
+                    id="mcp-1",
+                    type="mcpToolCall",
+                    server="github",
+                    tool="get_issue",
+                    arguments={"number": 91},
+                    result={"body": "full technical result"},
+                    status=SimpleNamespace(value="completed"),
+                ),
+            ),
+        ),
+        SimpleNamespace(
+            method="turn/completed", payload=SimpleNamespace(turn=completed)
+        ),
+    ]
+    thread = MagicMock(id="thread-stream")
+    thread.turn.return_value = StreamingTurn(events)
+    codex = SimpleNamespace(
+        thread_start=AsyncMock(return_value=thread), close=AsyncMock()
+    )
+    store = ConversationStore(tmp_path / "sdk-actions.db")
+    try:
+        adapter = OpenAICodexAdapter(lambda: codex, "0.155.1", store)
+        await adapter.execute(operation())
+
+        activities = store.snapshot("run-1")["conversations"][0]["turns"][0][
+            "activities"
+        ]
+        assert [
+            (activity["category"], activity["summary"]) for activity in activities
+        ] == [
+            ("test", "uv run pytest tests"),
+            ("file", "Files changed: src/main.py"),
+            ("tool", "github.get_issue"),
+        ]
+        assert activities[0]["text"] == "uv run pytest tests\n1 passed"
+        assert activities[0]["detail"]["exit_code"] == 0
+        assert activities[1]["detail"]["paths"] == ["src/main.py"]
+        assert activities[2]["detail"]["arguments"] == {"number": 91}
+        assert activities[2]["detail"]["result"] == {"body": "full technical result"}
+    finally:
+        store.close()
+
+
 async def test_same_operation_id_in_different_workflow_runs_is_not_cached_or_deduplicated(
     tmp_path,
 ) -> None:

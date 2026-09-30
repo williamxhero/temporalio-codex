@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -108,14 +109,16 @@ class ConversationStore:
             "CREATE INDEX IF NOT EXISTS idx_codex_execution ON codex_conversation_events(namespace,workflow_id,workflow_run_id,sequence)"
         )
         self._connection.commit()
-        self._connection.execute("""
+        self._connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS codex_operation_ledger (
                 namespace TEXT NOT NULL, workflow_id TEXT NOT NULL,
                 workflow_run_id TEXT NOT NULL, operation_id TEXT NOT NULL,
                 thread_id TEXT, turn_id TEXT, observation_json TEXT, fingerprint TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY(namespace, workflow_id, workflow_run_id, operation_id)
             )
-        """)
+        """
+        )
         ledger_columns = {
             row[1]
             for row in self._connection.execute(
@@ -316,6 +319,7 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
                 "input": "",
                 "output": "",
                 "working": [],
+                "activities": [],
                 "status": "queued",
                 "updatedAt": row["created_at"],
             }
@@ -350,6 +354,16 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
                 turn["working"].append({"kind": working_kind, "text": text})
             else:
                 turn["working"][-1]["text"] += text
+            _append_activity(
+                turn["activities"],
+                _activity_for_event(
+                    kind,
+                    text,
+                    _detail_from_row(row),
+                    event_id=row["event_id"],
+                    sequence=row["sequence"],
+                ),
+            )
         elif kind == "turn_started":
             turn["status"] = "running"
         elif kind == "turn_completed":
@@ -358,10 +372,155 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
             turn["status"] = "failed"
             if text and not turn["output"]:
                 turn["output"] = text
+            if text:
+                _append_activity(
+                    turn["activities"],
+                    _activity_for_event(
+                        kind,
+                        text,
+                        _detail_from_row(row),
+                        event_id=row["event_id"],
+                        sequence=row["sequence"],
+                    ),
+                )
         elif kind == "history_error":
             turn["status"] = "failed"
 
     return list(conversations.values())
+
+
+_TEST_COMMAND = re.compile(
+    r"(?:^|\s)(?:pytest|uv\s+run\s+pytest|python(?:\d+(?:\.\d+)*)?\s+-m\s+pytest)(?:\s|$)",
+    re.IGNORECASE,
+)
+_FILE_TEXT = re.compile(
+    r"(?:^|\s)(?:read|write|edit|open|create|delete)\s+[^\s]+\.[A-Za-z0-9]+",
+    re.IGNORECASE,
+)
+
+
+def _detail_from_row(row: sqlite3.Row) -> dict[str, Any] | None:
+    try:
+        value = json.loads(row["detail_json"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _activity_for_event(
+    kind: str,
+    text: str,
+    detail: dict[str, Any] | None,
+    *,
+    event_id: str | None,
+    sequence: int,
+) -> dict[str, Any]:
+    detail = detail or None
+    command = str(detail.get("command", "")) if detail else ""
+    if kind in {"error", "history_error", "turn_failed"}:
+        category = "error"
+    elif kind == "plan_delta":
+        category = "plan"
+    elif kind == "reasoning_delta":
+        category = "reasoning"
+    elif detail and detail.get("probe") is True:
+        category = "verification"
+    elif kind == "tool_delta":
+        method = str(detail.get("method", "")).lower() if detail else ""
+        item_type = str(detail.get("item_type", "")).lower() if detail else ""
+        if detail and (
+            any(key in detail for key in ("path", "file", "file_path"))
+            or item_type == "filechange"
+        ):
+            category = "file"
+        elif "test" in item_type or _TEST_COMMAND.search(
+            command or text.splitlines()[0]
+        ):
+            category = "test"
+        elif (
+            "command" in item_type
+            or "command" in method
+            or "process" in method
+            or command
+        ):
+            category = "command"
+        elif _FILE_TEXT.search(text):
+            category = "file"
+        elif (
+            "verify" in text.splitlines()[0].lower()
+            or "probe" in text.splitlines()[0].lower()
+        ):
+            category = "verification"
+        else:
+            category = "tool"
+    else:
+        category = kind.removesuffix("_delta") or "activity"
+
+    activity: dict[str, Any] = {
+        "id": event_id or f"event:{sequence}",
+        "category": category,
+        "summary": (
+            _activity_summary(command or text.splitlines()[0])
+            if kind == "tool_delta"
+            else _activity_summary(text)
+        ),
+        "text": text,
+    }
+    if detail:
+        activity["detail"] = detail
+    return activity
+
+
+def _append_activity(
+    activities: list[dict[str, Any]], activity: dict[str, Any]
+) -> None:
+    detail = activity.get("detail")
+    item_id = detail.get("item_id") if isinstance(detail, dict) else None
+    if item_id:
+        for existing in reversed(activities):
+            existing_detail = existing.get("detail")
+            if (
+                isinstance(existing_detail, dict)
+                and existing_detail.get("item_id") == item_id
+            ):
+                if detail.get("method") == "item/completed":
+                    existing.update(
+                        {key: value for key, value in activity.items() if key != "id"}
+                    )
+                else:
+                    existing["text"] += activity["text"]
+                    existing["summary"] = _activity_summary(
+                        existing["text"].splitlines()[0]
+                    )
+                return
+    if (
+        activities
+        and activity["category"] in {"plan", "reasoning"}
+        and activities[-1]["category"] == activity["category"]
+    ):
+        activities[-1]["text"] += activity["text"]
+        activities[-1]["summary"] = _activity_summary(activities[-1]["text"])
+        if "detail" in activity:
+            previous_detail = activities[-1].get("detail")
+            if previous_detail is None:
+                activities[-1]["detail"] = activity["detail"]
+            elif previous_detail != activity["detail"]:
+                details = (
+                    previous_detail
+                    if isinstance(previous_detail, list)
+                    else [previous_detail]
+                )
+                details.append(activity["detail"])
+                activities[-1]["detail"] = details
+        return
+    activities.append(activity)
+
+
+def _activity_summary(text: str, limit: int = 160) -> str:
+    summary = " ".join(text.split())
+    if len(summary) <= limit:
+        return summary
+    return summary[: limit - 1].rstrip() + "..."
 
 
 def iso_timestamp(value: float) -> str:

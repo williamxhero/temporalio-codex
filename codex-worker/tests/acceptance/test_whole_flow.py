@@ -113,11 +113,7 @@ def whole_flow_input() -> WholeFlowInput:
                 TicketPlan("foundation-b", "foundation"),
                 TicketPlan("follow-up-a", "follow-up", ("foundation-a", "foundation-b")),
             ),
-            completion_operations=(
-                ("foundation-a", "acceptance:foundation-a"),
-                ("foundation-b", "acceptance:foundation-b"),
-                ("follow-up-a", "acceptance:follow-up-a"),
-            ),
+            completion_operations=(),
         ),
         codex=tuple(
             SpecCodexPlan(

@@ -543,7 +543,7 @@ _OUTPUT_DELTA_METHODS = {
     "process/outputDelta",
 }
 _CONTEXT_PATH = re.compile(
-    r"(?:[A-Za-z]:)?[^\s\"'`;|]*[\\/]?(?:SKILL\.md|AGENTS\.md|CLAUDE\.md|README(?:\.[\w-]+)?|[\w.-]*(?:policy|config)[\w.-]*\.(?:md|json|ya?ml|toml|ini))",
+    r"(?<![\w.-])(?:[A-Za-z]:)?(?:[^\s\"'`;|]*[\\/])?(?:SKILL\.md|AGENTS\.md|CLAUDE\.md|README(?:\.[\w-]+)?|[\w.-]*(?:policy|config)[\w.-]*\.(?:md|json|ya?ml|toml|ini))(?=$|[\s\"'`;|])",
     re.IGNORECASE,
 )
 _READ_COMMAND = re.compile(r"(?:^|[\s\"';])(?:Get-Content|cat|type|read|open|sed|head|tail)(?:\s|$)", re.IGNORECASE)

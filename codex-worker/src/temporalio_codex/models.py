@@ -94,6 +94,13 @@ class RunSnapshot:
     pending_input: str | None
     stage_results: tuple[StageResult, ...]
     external_recheck_count: int = 0
+    pending_reason: str = ""
+    next_action: str = ""
+    retry_count: int = 0
+    deadline: str | None = None
+    timeout_seconds: float | None = None
+    last_error: str | None = None
+    workflow_run_id: str = ""
 
 
 @dataclass(frozen=True)

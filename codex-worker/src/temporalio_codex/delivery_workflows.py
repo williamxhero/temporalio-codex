@@ -15,6 +15,7 @@ with workflow.unsafe.imports_passed_through():
         DeliverySnapshot,
         DeliveryStatus,
     )
+    from temporalio_codex.execution_status import report_progress
 
 
 @workflow.defn
@@ -206,6 +207,9 @@ class DeliveryWorkflow:
 
     async def _git(self, operation: DeliveryOperation) -> DeliveryReceipt:
         self._phase = operation.phase
+        await report_progress(phase="delivery", next_action=f"execute {operation.phase.value}",
+                              timeout_seconds=30,
+                              deadline=(workflow.now() + timedelta(seconds=30)).isoformat())
         return await workflow.execute_activity(
             delivery_git_stage,
             operation,
@@ -216,6 +220,9 @@ class DeliveryWorkflow:
     async def _github(self, operation: DeliveryOperation) -> DeliveryReceipt:
         self._phase = operation.phase
         for attempt in range(self._readback_max_attempts):
+            await report_progress(phase="delivery", next_action=f"verify {operation.phase.value}",
+                                  retry_count=attempt, timeout_seconds=30,
+                                  deadline=(workflow.now() + timedelta(seconds=30)).isoformat())
             receipt = await workflow.execute_activity(
                 delivery_github_stage,
                 operation,
@@ -225,6 +232,14 @@ class DeliveryWorkflow:
             if not self._automatic or receipt.outcome is not DeliveryOutcome.WAITING:
                 return receipt
             if attempt < self._readback_max_attempts - 1:
+                await report_progress(
+                    phase="delivery", status="retrying", retry_count=attempt + 1,
+                    pending_reason=receipt.summary,
+                    next_action=f"read back {operation.phase.value}",
+                    deadline=(workflow.now() + timedelta(
+                        seconds=self._readback_backoff_seconds)).isoformat(),
+                    last_error=receipt.summary,
+                )
                 await workflow.sleep(timedelta(seconds=self._readback_backoff_seconds))
         return receipt
 

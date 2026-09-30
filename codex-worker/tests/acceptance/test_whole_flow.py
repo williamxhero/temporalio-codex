@@ -1,4 +1,7 @@
 import asyncio
+import json
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +22,8 @@ from temporalio_codex.activities import (
     heartbeat_stage,
 )
 from temporalio_codex.openai_adapter import OpenAICodexAdapter
+from temporalio_codex.git_adapter import LocalGitAdapter
+from temporalio_codex.candidate_activities import capture_codex_candidate
 from temporalio_codex.delivery_adapter import FakeDeliveryAdapter
 from temporalio_codex.delivery_models import (
     DeliveryInput,
@@ -154,11 +159,58 @@ def whole_flow_input() -> WholeFlowInput:
 
 @pytest.mark.parametrize(
     "failure_phase",
-    [None, DeliveryPhase.CLEANUP, DeliveryPhase.CI, "summary", "ci-transient"],
+    [
+        None,
+        DeliveryPhase.CLEANUP,
+        DeliveryPhase.CI,
+        "summary",
+        "ci-transient",
+        "review-missing",
+        "review-mismatch",
+        "review-dirty",
+    ],
 )
 async def test_two_spec_whole_flow_runs_through_public_child_workflows(
     failure_phase,
+    tmp_path,
 ) -> None:
+    def git(cwd, *args):
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    input = whole_flow_input()
+    plans = []
+    for plan in input.deliveries:
+        repository = tmp_path / plan.spec_key
+        repository.mkdir()
+        git(repository, "init", "-b", "main")
+        git(repository, "config", "user.name", "Acceptance")
+        git(repository, "config", "user.email", "acceptance@example.invalid")
+        (repository / "README").write_text("base\n", encoding="utf-8")
+        git(repository, "add", "README")
+        git(repository, "commit", "-m", "base")
+        remote = tmp_path / f"{plan.spec_key}.git"
+        git(tmp_path, "init", "--bare", str(remote))
+        git(repository, "remote", "add", "origin", str(remote))
+        git(repository, "push", "origin", "main")
+        plans.append(
+            replace(
+                plan,
+                delivery=replace(
+                    plan.delivery,
+                    repository=str(repository),
+                    workspace=str(tmp_path / f"{plan.spec_key}-candidate"),
+                    base_sha=git(repository, "rev-parse", "HEAD"),
+                    acceptance_command=(
+                        sys.executable,
+                        "-c",
+                        "from pathlib import Path; assert list(Path('.').glob('*-implemented.txt'))",
+                    ),
+                ),
+            )
+        )
+    input = replace(input, deliveries=tuple(plans))
     sdk_result = SimpleNamespace(
         id="turn-acceptance",
         status=SimpleNamespace(value="completed"),
@@ -167,7 +219,46 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
     )
     turn = SimpleNamespace(id="turn-acceptance", run=AsyncMock(return_value=sdk_result))
     thread = MagicMock(id="thread-acceptance")
-    thread.turn.return_value = turn
+
+    def sdk_turn(prompt, **kwargs):
+        workspace = Path(kwargs["cwd"])
+
+        async def run():
+            if prompt.startswith("Role: implementation"):
+                ticket = prompt.split("Ready ticket: ", 1)[1].splitlines()[0]
+                (workspace / f"{ticket}-implemented.txt").write_text(
+                    "implemented\n", encoding="utf-8"
+                )
+                git(workspace, "add", ".")
+                git(workspace, "commit", "-m", f"implement {ticket}")
+            if prompt.startswith("Role: review"):
+                sha = git(workspace, "rev-parse", "HEAD")
+                if failure_phase == "review-dirty":
+                    (workspace / "dirty").write_text(
+                        "changed during review", encoding="utf-8"
+                    )
+                response = json.dumps(
+                    {
+                        "candidate_sha": "wrong"
+                        if failure_phase == "review-mismatch"
+                        else sha,
+                        "verdict": "approved",
+                        "findings": [],
+                    }
+                )
+                if failure_phase == "review-missing":
+                    response = "SDK completed, but no review verdict"
+                return SimpleNamespace(
+                    id="turn-acceptance",
+                    status=SimpleNamespace(value="completed"),
+                    final_response=response,
+                    error=None,
+                )
+            return sdk_result
+
+        return SimpleNamespace(id="turn-acceptance", run=run)
+
+    thread.turn.side_effect = sdk_turn
     sdk = SimpleNamespace(
         thread_start=AsyncMock(return_value=thread),
         thread_resume=AsyncMock(return_value=thread),
@@ -188,6 +279,20 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
             summary="injected unresolved external result",
         )
     github_adapter = FakeDeliveryAdapter(receipts)
+    fake_execute = github_adapter.execute
+
+    async def assert_published_before_pr(operation):
+        if operation.phase is DeliveryPhase.PULL_REQUEST:
+            remote = git(
+                Path(operation.repository),
+                "ls-remote",
+                "origin",
+                f"refs/heads/{operation.candidate_branch}",
+            )
+            assert remote.split()[0] == operation.candidate_sha
+        return await fake_execute(operation)
+
+    github_adapter.execute = assert_published_before_pr
     if failure_phase == "ci-transient":
         execute = github_adapter.execute
         ci_calls = 0
@@ -206,7 +311,7 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
             return await execute(operation)
 
         github_adapter.execute = transient_ci
-    configure_delivery_adapters(FakeDeliveryAdapter(), github_adapter)
+    configure_delivery_adapters(LocalGitAdapter(), github_adapter)
     configure_spec_issue_gateway(FakeSpecIssueGateway())
     configure_ticket_issue_gateway(FakeTicketIssueGateway())
     configure_summary_gateway(
@@ -226,6 +331,7 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
                     DeliverySummaryWorkflow,
                 ],
                 activities=[
+                    capture_codex_candidate,
                     foundation_stage,
                     heartbeat_stage,
                     codex_stage,
@@ -239,12 +345,12 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
             ):
                 handle = await environment.client.start_workflow(
                     RequirementDeliveryWorkflow.run,
-                    whole_flow_input(),
+                    input,
                     id="whole-flow-acceptance",
                     task_queue="whole-flow-acceptance",
                 )
                 try:
-                    result = await asyncio.wait_for(handle.result(), timeout=5)
+                    result = await asyncio.wait_for(handle.result(), timeout=30)
                 except asyncio.TimeoutError as error:
                     snapshot = await handle.query(
                         RequirementDeliveryWorkflow.get_status
@@ -260,6 +366,24 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
         assert result.phase == WholeFlowPhase.COMPLETED
         assert snapshot.completed_specs == ("foundation", "follow-up")
         assert result.delivery_results
+        for codex_result in result.codex_results:
+            assert (
+                codex_result["candidate"]["candidate_sha"]
+                != codex_result["candidate"]["base_sha"]
+            )
+            assert (
+                codex_result["review_evidence"]["candidate_sha"]
+                == codex_result["candidate"]["candidate_sha"]
+            )
+        final_foundation = result.codex_results[1]["candidate"]
+        files = git(
+            Path(final_foundation["workspace"]),
+            "ls-tree",
+            "--name-only",
+            final_foundation["candidate_sha"],
+        )
+        assert "foundation-a-implemented.txt" in files
+        assert "foundation-b-implemented.txt" in files
         assert all(
             run["ticket_publication"]["status"] == "verified"
             for run in result.scheduler["runs"]

@@ -16,6 +16,7 @@ from temporalio_codex.activities import (
     foundation_stage,
     heartbeat_stage,
 )
+from temporalio_codex.candidate_activities import capture_codex_candidate
 from temporalio_codex.conversation_server import ConversationServer
 from temporalio_codex.conversation_store import ConversationStore
 from temporalio_codex.summary_activities import (
@@ -82,6 +83,7 @@ async def run_worker(
                 RequirementDeliveryWorkflow,
             ],
             activities=[
+                capture_codex_candidate,
                 foundation_stage,
                 heartbeat_stage,
                 codex_stage,
@@ -112,7 +114,9 @@ def _build_codex_adapter(
 
 
 def _repository_name() -> str:
-    return os.environ.get("TEMPORALIO_CODEX_REPOSITORY", "williamxhero/temporalio-codex")
+    return os.environ.get(
+        "TEMPORALIO_CODEX_REPOSITORY", "williamxhero/temporalio-codex"
+    )
 
 
 def main() -> None:

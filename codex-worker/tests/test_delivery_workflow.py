@@ -34,7 +34,9 @@ def delivery_input() -> DeliveryInput:
 
 
 async def run_delivery(run_id: str, git=None, github=None):
-    configure_delivery_adapters(git or FakeDeliveryAdapter(), github or FakeDeliveryAdapter())
+    configure_delivery_adapters(
+        git or FakeDeliveryAdapter(), github or FakeDeliveryAdapter()
+    )
     try:
         async with await WorkflowEnvironment.start_time_skipping() as environment:
             async with Worker(
@@ -66,6 +68,7 @@ async def test_delivery_workflow_runs_all_phases_with_fake_adapters() -> None:
         DeliveryPhase.CANDIDATE,
         DeliveryPhase.ACCEPTANCE,
         DeliveryPhase.REVIEW,
+        DeliveryPhase.PUBLISH_CANDIDATE,
         DeliveryPhase.PULL_REQUEST,
         DeliveryPhase.CI,
         DeliveryPhase.MERGE,

@@ -5,6 +5,14 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
+    from temporalio_codex.activities import delivery_git_stage
+    from temporalio_codex.delivery_models import (
+        CandidateEvidence,
+        ReviewEvidence,
+        DeliveryOperation,
+        DeliveryPhase,
+        DeliveryOutcome,
+    )
     from temporalio_codex.planning_activities import publish_ticket_issues
     from temporalio_codex.whole_flow_models import (
         WholeFlowInput,
@@ -275,6 +283,38 @@ class RequirementDeliveryWorkflow:
                     planning, scheduler_runs, codex_results, delivery_results
                 )
             self._active_spec = spec_key
+            delivery_plan = delivery_by_spec[spec_key].delivery
+            try:
+                prepared = await workflow.execute_activity(
+                    delivery_git_stage,
+                    DeliveryOperation(
+                        operation_id=f"{workflow.info().workflow_id}:prepare:{spec_key}",
+                        run_id=workflow.info().workflow_id,
+                        phase=DeliveryPhase.CANDIDATE,
+                        repository=delivery_plan.repository,
+                        workspace=delivery_plan.workspace,
+                        base_sha=delivery_plan.base_sha,
+                    ),
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+            except Exception as error:
+                return self._failed(
+                    f"candidate workspace preparation failed: {error}", planning
+                )
+            if (
+                prepared.outcome is not DeliveryOutcome.COMPLETED
+                or not prepared.candidate_sha
+            ):
+                return self._failed(
+                    "candidate workspace preparation not verified", planning
+                )
+            candidate = CandidateEvidence(
+                delivery_plan.repository,
+                delivery_plan.workspace,
+                prepared.candidate_sha,
+                prepared.candidate_sha,
+            )
             self._next_action = f"publish tickets for {spec_key}"
             self._phase = WholeFlowPhase.TICKETS
             spec_tickets = tuple(
@@ -308,6 +348,13 @@ class RequirementDeliveryWorkflow:
                                 parent_workflow_id=workflow.info().workflow_id,
                                 parent_workflow_run_id=workflow.info().run_id,
                             ),
+                            stages=tuple(
+                                replace(stage, repository=delivery_plan.workspace)
+                                for stage in codex_by_spec[spec_key]
+                                .to_run_input()
+                                .stages
+                            ),
+                            candidate=candidate,
                             requirement=(
                                 f"{codex_by_spec[spec_key].requirement}\n"
                                 f"Ready ticket: {ticket.key}\n"
@@ -421,9 +468,16 @@ class RequirementDeliveryWorkflow:
                 try:
                     result = await workflow.execute_child_workflow(
                         "CodexRunWorkflow",
-                        plan.to_run_input(
-                            parent_workflow_id=workflow.info().workflow_id,
-                            parent_workflow_run_id=workflow.info().run_id,
+                        replace(
+                            plan.to_run_input(
+                                parent_workflow_id=workflow.info().workflow_id,
+                                parent_workflow_run_id=workflow.info().run_id,
+                            ),
+                            stages=tuple(
+                                replace(stage, repository=delivery_plan.workspace)
+                                for stage in plan.to_run_input().stages
+                            ),
+                            candidate=candidate,
                         ),
                         id=self._active_child_id,
                         result_type=dict,
@@ -449,13 +503,28 @@ class RequirementDeliveryWorkflow:
             self._phase = WholeFlowPhase.DELIVERY
             self._next_action = f"deliver and read back {spec_key}"
             plan = delivery_by_spec[spec_key]
+            final_result = codex_results[-1] if codex_results else {}
+            final_candidate = final_result.get("candidate")
+            final_review = final_result.get("review_evidence")
+            if not final_candidate or not final_review:
+                return self._failed(
+                    "Codex execution has no frozen candidate and approved review evidence",
+                    planning,
+                    {"runs": scheduler_runs},
+                    tuple(codex_results),
+                )
             self._active_child_id = (
                 f"{workflow.info().workflow_id}:delivery:{plan.spec_key}"
             )
             try:
                 result = await workflow.execute_child_workflow(
                     "DeliveryWorkflow",
-                    replace(plan.delivery, automatic=True),
+                    replace(
+                        plan.delivery,
+                        automatic=True,
+                        candidate=CandidateEvidence(**final_candidate),
+                        review_evidence=ReviewEvidence(**final_review),
+                    ),
                     id=self._active_child_id,
                     result_type=dict,
                 )

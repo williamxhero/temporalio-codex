@@ -308,6 +308,12 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
     fake_execute = github_adapter.execute
 
     async def assert_published_before_pr(operation):
+        if operation.phase is DeliveryPhase.CLEANUP:
+            expected = (
+                {100, 500, 501}
+                if ":foundation:" in operation.operation_id else {101, 502}
+            )
+            assert expected.issubset(operation.issue_numbers)
         if operation.phase is DeliveryPhase.PULL_REQUEST:
             remote = git(
                 Path(operation.repository),

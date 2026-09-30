@@ -23,6 +23,7 @@ The SDK in this acceptance is deterministic/instrumented, so it proves worker re
 | Production review was permanently unverified | Native SDK output schema requests a verdict for the frozen SHA; capture validates approval, empty findings, and operation/thread/turn identity. |
 | Candidate branch did not exist before PR | Candidate publication precedes PR creation, uses an absent-branch lease and remote SHA readback, and rejects a conflicting remote branch. |
 | Completed delivery omitted final proof | Candidate/review records persist in DeliveryResult; parent verifies matching candidate, acceptance, review and publication receipts and compares them with captured Codex evidence. |
+| Cleanup missed issues published during this run | Delivery receives the verified SPEC/ticket numbers from publication readback, together with explicitly configured closure targets. |
 | SDK async turn and restart outcomes were unsafe | Await async turn handles; SQLite operation claim precedes launch, completed observations persist, uncertain launch is UNKNOWN without duplicate mutation, changed input is rejected. |
 | Status omitted active child and retry details | Child Run ID guarded progress signals propagate phase/ticket/wait/retry/deadline/error; terminal states clear active progress. |
 | Chat mixed scope or lost data on disconnect | Namespace/Workflow/Run snapshot and SSE scope, deterministic event identity, final output reconciliation, explicit resumed-thread history only, retained UI messages and automatic reconnect. |
@@ -47,7 +48,7 @@ On 2026-09-30, `scripts/probe_automatic_sdk.py --live` submitted a read-only aut
 
 ## Verification and limits
 
-The complete offline Worker suite passes. Core Ruff error checks, Python compilation, and `git diff --check` pass. Full Ruff reports 86 findings, chiefly nested context managers, broad gateway exception handling and import/style warnings, including existing repository debt; it is not reported as a clean gate. `make lint-code-fast` was attempted and cannot run because `make` is absent on this Windows host. No Go Server code was modified.
+The complete offline Worker suite passed with 230 tests, 1 skipped and 1 live test deselected. The final cleanup-number binding was additionally verified with focused whole-flow/recovery tests. Core Ruff error checks, Python compilation, and full-branch `git diff --check` pass. Full Ruff reports 86 findings, chiefly nested context managers, broad gateway exception handling and import/style warnings, including existing repository debt; it is not reported as a clean gate. `make lint-code-fast` was attempted and cannot run because `make` is absent on this Windows host. No Go Server code was modified.
 
 The full delivery tests use real local Git repositories/bare origins and production Git/candidate adapters, with instrumented SDK and GitHub boundaries. The authenticated live probe verifies actual SDK execution, persistence, HTTP and rendered Chat. A complete authenticated GitHub publication/PR/CI/merge delivery was not run, so this report does not claim live remote delivery or CI success. That requires a concrete authorized requirement, repository access, acceptance command and CI configuration.
 

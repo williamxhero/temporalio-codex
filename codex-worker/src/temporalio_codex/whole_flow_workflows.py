@@ -587,6 +587,11 @@ class RequirementDeliveryWorkflow:
                         automatic=True,
                         candidate=CandidateEvidence(**final_candidate),
                         review_evidence=ReviewEvidence(**final_review),
+                        issue_numbers=tuple(dict.fromkeys((
+                            spec_issue_number,
+                            *(ticket_issue_numbers[ticket.key] for ticket in spec_tickets),
+                            *plan.delivery.issue_numbers,
+                        ))),
                     ),
                     id=self._active_child_id,
                     result_type=dict,

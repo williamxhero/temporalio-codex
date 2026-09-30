@@ -60,17 +60,17 @@ async def run_worker(
         )
     )
     conversation_server = ConversationServer(store, port=conversation_port)
-    await conversation_server.start()
-    configure_codex_adapter(_build_codex_adapter(store))
-    configure_delivery_adapters(
-        LocalGitAdapter(),
-        GitHubDeliveryAdapter(GhCliGateway(_repository_name())),
-    )
-    configure_spec_issue_gateway(GhCliSpecIssueGateway(_repository_name()))
-    configure_ticket_issue_gateway(GhCliTicketIssueGateway(_repository_name()))
-    configure_summary_gateway(GhCliSummaryCommentGateway(_repository_name()))
-    client = await Client.connect(target_host)
     try:
+        await conversation_server.start()
+        configure_codex_adapter(_build_codex_adapter(store))
+        configure_delivery_adapters(
+            LocalGitAdapter(),
+            GitHubDeliveryAdapter(GhCliGateway(_repository_name())),
+        )
+        configure_spec_issue_gateway(GhCliSpecIssueGateway(_repository_name()))
+        configure_ticket_issue_gateway(GhCliTicketIssueGateway(_repository_name()))
+        configure_summary_gateway(GhCliSummaryCommentGateway(_repository_name()))
+        client = await Client.connect(target_host)
         async with Worker(
             client,
             task_queue=task_queue,

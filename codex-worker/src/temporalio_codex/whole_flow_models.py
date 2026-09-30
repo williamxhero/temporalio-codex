@@ -81,6 +81,8 @@ class PlanningPayload:
     confirmation_operation_id: str | None = None
     publication_operation_id: str | None = None
     publication_timeout_seconds: float = 300.0
+    publication_max_attempts: int = 3
+    publication_retry_backoff_seconds: float = 1.0
 
     def to_input(
         self,
@@ -101,6 +103,8 @@ class PlanningPayload:
             confirmation_operation_id=self.confirmation_operation_id,
             publication_operation_id=self.publication_operation_id,
             publication_timeout_seconds=self.publication_timeout_seconds,
+            publication_max_attempts=self.publication_max_attempts,
+            publication_retry_backoff_seconds=self.publication_retry_backoff_seconds,
             parent_workflow_id=parent_workflow_id,
             parent_workflow_run_id=parent_workflow_run_id,
         )

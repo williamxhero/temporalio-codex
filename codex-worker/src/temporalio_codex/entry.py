@@ -407,6 +407,8 @@ def load_request(path: str) -> RequirementDeliveryRequest:
         confirmation_operation_id=planning_payload.get("confirmation_operation_id"),
         publication_operation_id=planning_payload.get("publication_operation_id"),
         publication_timeout_seconds=planning_payload.get("publication_timeout_seconds", 300.0),
+        publication_max_attempts=planning_payload.get("publication_max_attempts", 3),
+        publication_retry_backoff_seconds=planning_payload.get("publication_retry_backoff_seconds", 1.0),
     )
     scheduler_payload = plan_payload["scheduler"]
     scheduler = SchedulerInput(

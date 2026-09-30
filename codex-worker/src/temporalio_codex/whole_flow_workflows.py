@@ -2,6 +2,7 @@ from dataclasses import asdict, replace, replace
 from datetime import timedelta
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from temporalio_codex.delivery_workflows import DeliveryWorkflow
@@ -317,22 +318,34 @@ class RequirementDeliveryWorkflow:
                     planning,
                     {"status": "blocked", "runs": scheduler_runs},
                 )
-            ticket_publication = await workflow.execute_activity(
-                publish_ticket_issues,
-                TicketPublicationInput(
-                    repository=input.repository,
-                    operation_id=f"{workflow.info().workflow_id}:tickets:{spec_key}",
-                    spec_issue_number=spec_issue_number,
-                    blocker_issue_numbers=tuple(
-                        (blocker, ticket_issue_numbers[blocker])
-                        for ticket in spec_tickets
-                        for blocker in ticket.blockers
-                        if blocker in ticket_issue_numbers
-                    ),
-                    tickets=spec_tickets,
+            ticket_input = TicketPublicationInput(
+                repository=input.repository,
+                operation_id=f"{workflow.info().workflow_id}:tickets:{spec_key}",
+                spec_issue_number=spec_issue_number,
+                blocker_issue_numbers=tuple(
+                    (blocker, ticket_issue_numbers[blocker])
+                    for ticket in spec_tickets
+                    for blocker in ticket.blockers
+                    if blocker in ticket_issue_numbers
                 ),
-                start_to_close_timeout=timedelta(seconds=30),
+                tickets=spec_tickets,
             )
+            ticket_publication = None
+            max_attempts = input.planning.publication_max_attempts
+            for attempt in range(1, max_attempts + 1):
+                ticket_publication = await workflow.execute_activity(
+                    publish_ticket_issues,
+                    ticket_input,
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+                if ticket_publication.status is not TicketPublicationStatus.UNKNOWN:
+                    break
+                if attempt < max_attempts:
+                    await workflow.sleep(
+                        input.planning.publication_retry_backoff_seconds * (2 ** (attempt - 1))
+                    )
+            assert ticket_publication is not None
             if ticket_publication.status is not TicketPublicationStatus.VERIFIED:
                 return self._failed(
                     "ticket Issue publication did not complete",

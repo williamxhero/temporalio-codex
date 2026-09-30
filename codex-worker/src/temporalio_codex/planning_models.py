@@ -48,6 +48,8 @@ class PlanningInput:
     publication_operation_id: str | None = None
     repository: str = "williamxhero/temporalio-codex"
     publication_timeout_seconds: float = 300.0
+    publication_max_attempts: int = 3
+    publication_retry_backoff_seconds: float = 1.0
     parent_workflow_id: str | None = None
     parent_workflow_run_id: str | None = None
 
@@ -66,6 +68,10 @@ class PlanningInput:
             raise ValueError("historical chat sources must use source_reference")
         if self.publication_timeout_seconds <= 0:
             raise ValueError("publication_timeout_seconds must be positive")
+        if self.publication_max_attempts <= 0:
+            raise ValueError("publication_max_attempts must be positive")
+        if self.publication_retry_backoff_seconds < 0:
+            raise ValueError("publication_retry_backoff_seconds must not be negative")
 
     @property
     def source_identity(self) -> str:

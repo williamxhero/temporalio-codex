@@ -1,4 +1,3 @@
-import asyncio
 from datetime import timedelta
 
 from temporalio import workflow
@@ -133,31 +132,15 @@ class RequirementPlanningWorkflow:
         self._phase = PlanningPhase.READY
         self._status = PlanningStatus.PUBLISHING
         publication = await self._publish_specs(input)
+        attempt = 1
         while publication.status is SpecPublicationStatus.UNKNOWN:
             self._status = PlanningStatus.UNKNOWN
-            if input.parent_workflow_id:
-                await workflow.get_external_workflow_handle(
-                    input.parent_workflow_id
-                ).signal(
-                    "planning_blocked",
-                    publication.reason or "SPEC publication readback is unknown",
-                )
-            try:
-                await workflow.wait_condition(
-                    lambda: (
-                        self._publication_resolution is not None
-                        or self._publication_retry_requested
-                        or self._cancelled
-                    ),
-                    timeout=input.publication_timeout_seconds,
-                    timeout_summary="spec-publication-readback",
-                )
-            except asyncio.TimeoutError:
+            self._publication_reason = publication.reason
+            if attempt >= input.publication_max_attempts:
                 self._status = PlanningStatus.BLOCKED
                 self._publication_reason = (
-                    "SPEC publication readback timed out after "
-                    f"{input.publication_timeout_seconds:g} seconds; "
-                    "recheck operation identities before retry"
+                    f"SPEC publication readback timed out or remained unknown after {attempt} "
+                    f"attempts: {publication.reason}"
                 )
                 if input.parent_workflow_id:
                     await workflow.get_external_workflow_handle(
@@ -166,18 +149,18 @@ class RequirementPlanningWorkflow:
                 return self._planning_result()
             if self._cancelled:
                 return self._cancelled_result()
-            if self._publication_retry_requested:
-                self._publication_retry_requested = False
-                self._publication_resolution = None
-                self._status = PlanningStatus.PUBLISHING
-                publication = await self._publish_specs(input)
-                continue
-            publication = self._publication_resolution
+            backoff = input.publication_retry_backoff_seconds * (2 ** (attempt - 1))
+            if backoff:
+                await workflow.sleep(backoff)
+            if self._cancelled:
+                return self._cancelled_result()
+            # A recovery update may arrive during the backoff. It is treated as
+            # an optional acceleration; normal execution always retries itself.
+            self._publication_retry_requested = False
             self._publication_resolution = None
-            assert publication is not None
-            self._published_specs = publication.issues
-            self._publication_reason = publication.reason
-            break
+            self._status = PlanningStatus.PUBLISHING
+            attempt += 1
+            publication = await self._publish_specs(input)
         if publication.status is not SpecPublicationStatus.VERIFIED:
             self._status = (
                 PlanningStatus.BLOCKED

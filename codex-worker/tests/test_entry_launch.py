@@ -1,7 +1,8 @@
+from acceptance.test_whole_flow import whole_flow_input
+from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from acceptance.test_whole_flow import whole_flow_input
 from temporalio_codex.activities import (
     codex_stage,
     configure_codex_adapter,
@@ -11,10 +12,15 @@ from temporalio_codex.activities import (
     foundation_stage,
     heartbeat_stage,
 )
+from temporalio_codex.candidate_activities import (
+    CandidateCaptureInput,
+    CandidateCaptureResult,
+)
 from temporalio_codex.codex_adapter import FakeCodexAdapter
 from temporalio_codex.delivery_adapter import FakeDeliveryAdapter
-from temporalio_codex.entry import launch_requirement
-from temporalio_codex.entry import stable_run_id
+from temporalio_codex.delivery_models import ReviewEvidence
+from temporalio_codex.delivery_workflows import DeliveryWorkflow
+from temporalio_codex.entry import launch_requirement, stable_run_id
 from temporalio_codex.entry_models import RequirementDeliveryRequest, RequirementSource
 from temporalio_codex.planning_activities import (
     configure_spec_issue_gateway,
@@ -23,6 +29,7 @@ from temporalio_codex.planning_activities import (
     publish_spec_issues,
     publish_ticket_issues,
 )
+from temporalio_codex.planning_models import SourceOrigin
 from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
 from temporalio_codex.spec_issue_adapter import FakeSpecIssueGateway
 from temporalio_codex.summary_activities import (
@@ -34,9 +41,18 @@ from temporalio_codex.summary_workflows import DeliverySummaryWorkflow
 from temporalio_codex.ticket_issue_adapter import FakeTicketIssueGateway
 from temporalio_codex.ticket_workflows import TicketSchedulerWorkflow
 from temporalio_codex.whole_flow_workflows import RequirementDeliveryWorkflow
-from temporalio_codex.delivery_workflows import DeliveryWorkflow
 from temporalio_codex.workflows import CodexRunWorkflow
-from temporalio_codex.planning_models import SourceOrigin
+
+
+@activity.defn(name="capture-codex-candidate")
+async def capture_fake_candidate(input: CandidateCaptureInput) -> CandidateCaptureResult:
+    return CandidateCaptureResult(
+        candidate=input.candidate,
+        review=ReviewEvidence(
+            input.candidate.candidate_sha, "approved", input.operation_id,
+            input.thread_id, input.turn_id,
+        ) if input.review_json is not None else None,
+    )
 
 
 def delivery_request() -> RequirementDeliveryRequest:
@@ -81,6 +97,7 @@ async def test_public_launch_returns_durable_identity_and_adopts_retry() -> None
                     publish_spec_issues,
                     publish_ticket_issues,
                     publish_delivery_summary,
+                    capture_fake_candidate,
                 ],
             ):
                 request = delivery_request()
@@ -131,6 +148,7 @@ async def test_public_launch_rejects_input_drift_for_same_launch_key() -> None:
                     publish_spec_issues,
                     publish_ticket_issues,
                     publish_delivery_summary,
+                    capture_fake_candidate,
                 ],
             ):
                 first = delivery_request()

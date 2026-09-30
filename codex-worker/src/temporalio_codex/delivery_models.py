@@ -4,6 +4,7 @@ from enum import StrEnum
 
 class DeliveryPhase(StrEnum):
     CANDIDATE = "candidate"
+    PUBLISH_CANDIDATE = "publish_candidate"
     ACCEPTANCE = "acceptance"
     REVIEW = "review"
     CI = "ci"
@@ -30,6 +31,23 @@ class DeliveryStatus(StrEnum):
 
 
 @dataclass(frozen=True)
+class CandidateEvidence:
+    repository: str
+    workspace: str
+    base_sha: str
+    candidate_sha: str
+
+
+@dataclass(frozen=True)
+class ReviewEvidence:
+    candidate_sha: str
+    verdict: str
+    operation_id: str
+    thread_id: str
+    turn_id: str
+
+
+@dataclass(frozen=True)
 class DeliveryOperation:
     operation_id: str
     run_id: str
@@ -48,6 +66,7 @@ class DeliveryOperation:
     pull_request_identity: str | None = None
     pull_request_number: int | None = None
     issue_numbers: tuple[int, ...] = ()
+    review_evidence: ReviewEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +103,8 @@ class DeliveryInput:
     automatic: bool = False
     readback_max_attempts: int = 60
     readback_backoff_seconds: float = 5
+    candidate: CandidateEvidence | None = None
+    review_evidence: ReviewEvidence | None = None
 
 
 @dataclass(frozen=True)

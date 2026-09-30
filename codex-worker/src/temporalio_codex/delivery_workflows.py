@@ -52,6 +52,23 @@ class DeliveryWorkflow:
                 outcome=DeliveryOutcome.FAILED,
                 summary="Invalid bounded delivery readback policy",
             )
+        if input.automatic and (not input.candidate or not input.review_evidence):
+            return DeliveryResult(
+                workflow_id=workflow.info().workflow_id,
+                status=DeliveryStatus.FAILED,
+                outcome=DeliveryOutcome.NOT_VERIFIED,
+                summary="Automatic delivery requires frozen implementation and review evidence",
+            )
+        if input.candidate and (
+            input.candidate.repository != input.repository
+            or input.candidate.workspace != input.workspace
+        ):
+            return DeliveryResult(
+                workflow_id=workflow.info().workflow_id,
+                status=DeliveryStatus.FAILED,
+                outcome=DeliveryOutcome.FAILED,
+                summary="Implementation workspace identity does not match delivery",
+            )
         candidate = await self._git(
             DeliveryOperation(
                 operation_id=f"{workflow.info().workflow_id}:candidate",
@@ -60,6 +77,9 @@ class DeliveryWorkflow:
                 repository=input.repository,
                 workspace=input.workspace,
                 base_sha=input.base_sha,
+                candidate_sha=input.candidate.candidate_sha
+                if input.candidate
+                else None,
                 target_branch=input.target_branch,
             )
         )
@@ -79,10 +99,25 @@ class DeliveryWorkflow:
                     candidate_sha=candidate_sha,
                     acceptance_version=input.acceptance_version,
                     acceptance_command=input.acceptance_command,
+                    review_evidence=input.review_evidence,
                 )
             )
             if not await self._accept(receipt):
                 return self._failed()
+
+        publication = await self._git(
+            DeliveryOperation(
+                operation_id=f"{workflow.info().workflow_id}:publish-candidate",
+                run_id=workflow.info().workflow_id,
+                phase=DeliveryPhase.PUBLISH_CANDIDATE,
+                repository=input.repository,
+                workspace=input.workspace,
+                candidate_sha=candidate_sha,
+                candidate_branch=input.candidate_branch,
+            )
+        )
+        if not await self._accept(publication):
+            return self._failed()
 
         pull_request = await self._github(
             DeliveryOperation(

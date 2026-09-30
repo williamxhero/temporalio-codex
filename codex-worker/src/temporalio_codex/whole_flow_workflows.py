@@ -3,21 +3,17 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
-    from temporalio_codex.execution_status import ExecutionProgress
+    from temporalio_codex.activities import delivery_git_stage
+    from temporalio_codex.delivery_models import (
+        CandidateEvidence,
+        ReviewEvidence,
+        DeliveryOperation,
+        DeliveryPhase,
+        DeliveryOutcome,
+    )
     from temporalio_codex.planning_activities import publish_ticket_issues
-    from temporalio_codex.planning_models import GrillAnswer
-    from temporalio_codex.spec_issue_adapter import (
-        SpecPublicationResult,
-        SpecPublicationStatus,
-    )
-    from temporalio_codex.ticket_issue_adapter import (
-        TicketPublicationInput,
-        TicketPublicationStatus,
-    )
-    from temporalio_codex.ticket_scheduler import SchedulerInput, SpecPlan, TicketPlan
     from temporalio_codex.whole_flow_models import (
         WholeFlowInput,
         WholeFlowPhase,
@@ -27,6 +23,16 @@ with workflow.unsafe.imports_passed_through():
         topological_spec_keys,
         validate_delivery_evidence,
         validate_whole_flow_input,
+    )
+    from temporalio_codex.planning_models import GrillAnswer
+    from temporalio_codex.ticket_scheduler import SchedulerInput, SpecPlan, TicketPlan
+    from temporalio_codex.ticket_issue_adapter import (
+        TicketPublicationInput,
+        TicketPublicationStatus,
+    )
+    from temporalio_codex.spec_issue_adapter import (
+        SpecPublicationResult,
+        SpecPublicationStatus,
     )
 
 
@@ -48,44 +54,6 @@ class RequirementDeliveryWorkflow:
         self._cancelled = False
         self._active_child_id: str | None = None
         self._answered_question_ids: list[str] = []
-        self._active_child_run_id: str | None = None
-        self._progress: ExecutionProgress | None = None
-        self._retry_count = 0
-
-    @workflow.signal(name="execution_progress")
-    def execution_progress(self, progress: ExecutionProgress) -> None:
-        if (
-            progress.workflow_id != self._active_child_id
-            or progress.workflow_run_id != self._active_child_run_id
-            or self._paused or self._cancelled
-        ):
-            return
-        try:
-            phase = WholeFlowPhase(progress.phase)
-            status = WholeFlowStatus(progress.status)
-        except ValueError:
-            return
-        self._progress = progress
-        self._retry_count = progress.retry_count
-        self._phase = phase
-        self._status = status
-        self._active_ticket = progress.active_ticket
-        self._next_action = progress.next_action
-
-    async def _execute_child(self, name: str, input, **kwargs):
-        self._progress = None
-        self._retry_count = 0
-        self._status = WholeFlowStatus.DURABLE_WAITING
-        handle = await workflow.start_child_workflow(name, input, **kwargs)
-        self._active_child_run_id = handle.first_execution_run_id
-        try:
-            return await handle
-        finally:
-            self._active_child_run_id = None
-            self._progress = None
-            self._active_ticket = None
-            if not self._paused and not self._cancelled:
-                self._status = WholeFlowStatus.ACTIVE
 
     @workflow.query(name="get_whole_flow_status")
     def get_status(self) -> WholeFlowSnapshot:
@@ -102,15 +70,6 @@ class RequirementDeliveryWorkflow:
             entry_launch_key=self._entry_launch_key,
             entry_input_identity=self._entry_input_identity,
             reason=self._reason,
-            pending_reason=(self._progress.pending_reason if self._progress else
-                            (f"waiting for child execution {self._active_child_id}"
-                             if self._status is WholeFlowStatus.DURABLE_WAITING
-                             else self._reason)),
-            retry_count=self._progress.retry_count if self._progress else self._retry_count,
-            deadline=self._progress.deadline if self._progress else None,
-            timeout_seconds=self._progress.timeout_seconds if self._progress else None,
-            last_error=self._progress.last_error if self._progress else (self._reason or None),
-            workflow_run_id=workflow.info().run_id,
         )
 
     @workflow.update(name="pause")
@@ -182,12 +141,18 @@ class RequirementDeliveryWorkflow:
 
     @workflow.signal(name="planning_blocked")
     async def planning_blocked(self, reason: str) -> None:
-        # Legacy unscoped notifications cannot identify a child execution.
-        return
+        self._phase = WholeFlowPhase.BLOCKED
+        self._status = WholeFlowStatus.NOT_VERIFIED
+        self._reason = reason
+        self._next_action = "recheck SPEC publication identities or retry publication"
 
     @workflow.signal(name="planning_resumed")
     async def planning_resumed(self) -> None:
-        return
+        if self._phase is WholeFlowPhase.BLOCKED:
+            self._phase = WholeFlowPhase.PLANNING
+        self._status = WholeFlowStatus.ACTIVE
+        self._reason = ""
+        self._next_action = "complete Grill and publish SPEC Issues"
 
     @workflow.update(name="retry_spec_publication")
     async def retry_spec_publication(self) -> bool:
@@ -258,7 +223,7 @@ class RequirementDeliveryWorkflow:
         self._next_action = "complete Grill and publish SPEC Issues"
         self._active_child_id = f"{workflow.info().workflow_id}:planning"
         try:
-            planning = await self._execute_child(
+            planning = await workflow.execute_child_workflow(
                 "RequirementPlanningWorkflow",
                 input.planning.to_input(
                     repository=input.repository,
@@ -268,7 +233,7 @@ class RequirementDeliveryWorkflow:
                 id=self._active_child_id,
                 result_type=dict,
             )
-        except Exception as error:  # noqa: BLE001 - child failures become workflow evidence
+        except Exception as error:
             if self._cancelled:
                 return self._cancelled_result()
             return self._failed(f"planning child failed: {error}")
@@ -283,7 +248,9 @@ class RequirementDeliveryWorkflow:
                 else WholeFlowStatus.BLOCKED
             )
             self._reason = reason
-            self._next_action = ""
+            self._next_action = (
+                "recheck SPEC publication identities or retry publication"
+            )
             return WholeFlowResult(
                 workflow_id=workflow.info().workflow_id,
                 phase=self._phase,
@@ -316,6 +283,38 @@ class RequirementDeliveryWorkflow:
                     planning, scheduler_runs, codex_results, delivery_results
                 )
             self._active_spec = spec_key
+            delivery_plan = delivery_by_spec[spec_key].delivery
+            try:
+                prepared = await workflow.execute_activity(
+                    delivery_git_stage,
+                    DeliveryOperation(
+                        operation_id=f"{workflow.info().workflow_id}:prepare:{spec_key}",
+                        run_id=workflow.info().workflow_id,
+                        phase=DeliveryPhase.CANDIDATE,
+                        repository=delivery_plan.repository,
+                        workspace=delivery_plan.workspace,
+                        base_sha=delivery_plan.base_sha,
+                    ),
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+            except Exception as error:
+                return self._failed(
+                    f"candidate workspace preparation failed: {error}", planning
+                )
+            if (
+                prepared.outcome is not DeliveryOutcome.COMPLETED
+                or not prepared.candidate_sha
+            ):
+                return self._failed(
+                    "candidate workspace preparation not verified", planning
+                )
+            candidate = CandidateEvidence(
+                delivery_plan.repository,
+                delivery_plan.workspace,
+                prepared.candidate_sha,
+                prepared.candidate_sha,
+            )
             self._next_action = f"publish tickets for {spec_key}"
             self._phase = WholeFlowPhase.TICKETS
             spec_tickets = tuple(
@@ -349,6 +348,13 @@ class RequirementDeliveryWorkflow:
                                 parent_workflow_id=workflow.info().workflow_id,
                                 parent_workflow_run_id=workflow.info().run_id,
                             ),
+                            stages=tuple(
+                                replace(stage, repository=delivery_plan.workspace)
+                                for stage in codex_by_spec[spec_key]
+                                .to_run_input()
+                                .stages
+                            ),
+                            candidate=candidate,
                             requirement=(
                                 f"{codex_by_spec[spec_key].requirement}\n"
                                 f"Ready ticket: {ticket.key}\n"
@@ -387,39 +393,18 @@ class RequirementDeliveryWorkflow:
             ticket_publication = None
             max_attempts = input.planning.publication_max_attempts
             for attempt in range(1, max_attempts + 1):
-                self._status = WholeFlowStatus.ACTIVE
-                self._retry_count = attempt - 1
-                self._progress = ExecutionProgress(
-                    workflow.info().workflow_id, workflow.info().run_id,
-                    "tickets", next_action=f"publish tickets for {spec_key}",
-                    retry_count=attempt - 1, timeout_seconds=30,
-                    deadline=(workflow.now() + timedelta(seconds=30)).isoformat(),
+                ticket_publication = await workflow.execute_activity(
+                    publish_ticket_issues,
+                    ticket_input,
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
                 )
-                try:
-                    ticket_publication = await workflow.execute_activity(
-                        publish_ticket_issues,
-                        ticket_input,
-                        start_to_close_timeout=timedelta(seconds=30),
-                        retry_policy=RetryPolicy(maximum_attempts=1),
-                    )
-                except ActivityError as error:
-                    return self._failed(f"ticket publication activity failed: {error}", planning)
                 if ticket_publication.status is not TicketPublicationStatus.UNKNOWN:
                     break
                 if attempt < max_attempts:
-                    backoff = input.planning.publication_retry_backoff_seconds * (2 ** (attempt - 1))
-                    self._status = WholeFlowStatus.RETRYING
-                    self._retry_count = attempt
-                    self._progress = ExecutionProgress(
-                        workflow.info().workflow_id, workflow.info().run_id,
-                        "tickets", "retrying", retry_count=attempt,
-                        pending_reason="ticket publication requires readback",
-                        next_action="reconcile ticket publication",
-                        deadline=(workflow.now() + timedelta(seconds=backoff)).isoformat(),
-                        last_error=ticket_publication.reason,
-                    )
                     await workflow.sleep(
-                        backoff
+                        input.planning.publication_retry_backoff_seconds
+                        * (2 ** (attempt - 1))
                     )
             assert ticket_publication is not None
             if ticket_publication.status is not TicketPublicationStatus.VERIFIED:
@@ -439,13 +424,13 @@ class RequirementDeliveryWorkflow:
             )
             self._active_child_id = f"{workflow.info().workflow_id}:tickets:{spec_key}"
             try:
-                scheduler_run = await self._execute_child(
+                scheduler_run = await workflow.execute_child_workflow(
                     "TicketSchedulerWorkflow",
                     scheduler_input,
                     id=self._active_child_id,
                     result_type=dict,
                 )
-            except Exception as error:  # noqa: BLE001 - child failures become workflow evidence
+            except Exception as error:
                 if self._cancelled:
                     return self._cancelled_result(
                         planning, scheduler_runs, codex_results, delivery_results
@@ -481,16 +466,23 @@ class RequirementDeliveryWorkflow:
                     f"{workflow.info().workflow_id}:codex:{plan.spec_key}"
                 )
                 try:
-                    result = await self._execute_child(
+                    result = await workflow.execute_child_workflow(
                         "CodexRunWorkflow",
-                        plan.to_run_input(
-                            parent_workflow_id=workflow.info().workflow_id,
-                            parent_workflow_run_id=workflow.info().run_id,
+                        replace(
+                            plan.to_run_input(
+                                parent_workflow_id=workflow.info().workflow_id,
+                                parent_workflow_run_id=workflow.info().run_id,
+                            ),
+                            stages=tuple(
+                                replace(stage, repository=delivery_plan.workspace)
+                                for stage in plan.to_run_input().stages
+                            ),
+                            candidate=candidate,
                         ),
                         id=self._active_child_id,
                         result_type=dict,
                     )
-                except Exception as error:  # noqa: BLE001 - child failures become workflow evidence
+                except Exception as error:
                     if self._cancelled:
                         return self._cancelled_result(
                             planning, scheduler_runs, codex_results, delivery_results
@@ -511,17 +503,32 @@ class RequirementDeliveryWorkflow:
             self._phase = WholeFlowPhase.DELIVERY
             self._next_action = f"deliver and read back {spec_key}"
             plan = delivery_by_spec[spec_key]
+            final_result = codex_results[-1] if codex_results else {}
+            final_candidate = final_result.get("candidate")
+            final_review = final_result.get("review_evidence")
+            if not final_candidate or not final_review:
+                return self._failed(
+                    "Codex execution has no frozen candidate and approved review evidence",
+                    planning,
+                    {"runs": scheduler_runs},
+                    tuple(codex_results),
+                )
             self._active_child_id = (
                 f"{workflow.info().workflow_id}:delivery:{plan.spec_key}"
             )
             try:
-                result = await self._execute_child(
+                result = await workflow.execute_child_workflow(
                     "DeliveryWorkflow",
-                    replace(plan.delivery, automatic=True),
+                    replace(
+                        plan.delivery,
+                        automatic=True,
+                        candidate=CandidateEvidence(**final_candidate),
+                        review_evidence=ReviewEvidence(**final_review),
+                    ),
                     id=self._active_child_id,
                     result_type=dict,
                 )
-            except Exception as error:  # noqa: BLE001 - child failures become workflow evidence
+            except Exception as error:
                 if self._cancelled:
                     return self._cancelled_result(
                         planning, scheduler_runs, codex_results, delivery_results
@@ -567,13 +574,13 @@ class RequirementDeliveryWorkflow:
         self._next_action = "publish and verify final summary"
         self._active_child_id = f"{workflow.info().workflow_id}:summary"
         try:
-            summary = await self._execute_child(
+            summary = await workflow.execute_child_workflow(
                 "DeliverySummaryWorkflow",
                 replace(input.summary, automatic=True),
                 id=self._active_child_id,
                 result_type=dict,
             )
-        except Exception as error:  # noqa: BLE001 - child failures become workflow evidence
+        except Exception as error:
             if self._cancelled:
                 return self._cancelled_result(
                     planning, scheduler, codex_results, delivery_results
@@ -602,11 +609,6 @@ class RequirementDeliveryWorkflow:
                 f"summary-comment:{summary['comment'].get('comment_id', '')}"
             )
         self._status = WholeFlowStatus.COMPLETED
-        self._next_action = ""
-        self._active_spec = None
-        self._active_ticket = None
-        self._progress = None
-        self._reason = ""
         return WholeFlowResult(
             workflow_id=workflow.info().workflow_id,
             phase=self._phase,
@@ -642,8 +644,6 @@ class RequirementDeliveryWorkflow:
         self._phase = WholeFlowPhase.BLOCKED
         self._status = WholeFlowStatus.BLOCKED
         self._reason = reason
-        self._next_action = ""
-        self._progress = None
         return WholeFlowResult(
             workflow_id=workflow.info().workflow_id,
             phase=self._phase,
@@ -663,8 +663,6 @@ class RequirementDeliveryWorkflow:
         self._phase = WholeFlowPhase.FAILED
         self._status = WholeFlowStatus.FAILED
         self._reason = reason
-        self._next_action = ""
-        self._progress = None
         return WholeFlowResult(
             workflow_id=workflow.info().workflow_id,
             phase=self._phase,

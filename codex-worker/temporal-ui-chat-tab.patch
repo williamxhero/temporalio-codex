@@ -634,10 +634,10 @@ index 0000000..df87936
 +<WorkflowChat />
 diff --git a/tests/integration/workflow-chat.spec.ts b/tests/integration/workflow-chat.spec.ts
 new file mode 100644
-index 0000000..bea4f63
+index 0000000..b6a293a
 --- /dev/null
 +++ b/tests/integration/workflow-chat.spec.ts
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,182 @@
 +import { expect, test } from '@playwright/test';
 +
 +import { mockWorkflowApis } from '~/test-utilities/mock-apis';
@@ -778,11 +778,7 @@ index 0000000..bea4f63
 +
 +test('Chat discards the previous execution when navigating to another run', async ({
 +  page,
-+}, testInfo) => {
-+  test.skip(
-+    testInfo.project.name.includes('mobile'),
-+    'Scope navigation is covered on desktop; mobile bottom navigation obscures the synthetic link.',
-+  );
++}) => {
 +  await mockWorkflowApis(page, mockWorkflow);
 +  const otherRun = '11111111-1111-4111-8111-111111111111';
 +  const requests: URL[] = [];
@@ -809,11 +805,11 @@ index 0000000..bea4f63
 +    const link = document.createElement('a');
 +    link.href = url;
 +    link.textContent = 'Open another execution';
++    link.style.cssText =
++      'position:fixed;top:0;left:0;z-index:9999;background:white;padding:12px;';
 +    document.body.append(link);
 +  }, `/namespaces/default/workflows/${workflowId}/${otherRun}/chat`);
-+  await page
-+    .getByRole('link', { name: 'Open another execution' })
-+    .click({ force: true });
++  await page.getByRole('link', { name: 'Open another execution' }).click();
 +  await expect(
 +    page.getByText('New execution output', { exact: true }),
 +  ).toBeVisible();

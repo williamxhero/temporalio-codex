@@ -16,6 +16,7 @@ with workflow.unsafe.imports_passed_through():
         CodexOperation,
         CodexOutcome,
     )
+    from temporalio_codex.execution_status import ExecutionProgress, report_progress
     from temporalio_codex.models import (
         RunInput,
         RunResult,
@@ -53,11 +54,13 @@ class CodexRunWorkflow:
         self._stage_results: list[StageResult] = []
         self._paused_from: RunStatus | None = None
         self._external_recheck_count = 0
+        self._progress: ExecutionProgress | None = None
         self._candidate = None
         self._review_evidence = None
 
     @workflow.query(name="get_status")
     def get_status(self) -> RunSnapshot:
+        progress = self._progress if self._status is RunStatus.ACTIVE else None
         return RunSnapshot(
             workflow_id=workflow.info().workflow_id,
             status=self._status,
@@ -66,6 +69,14 @@ class CodexRunWorkflow:
             pending_input=self._pending_input,
             stage_results=tuple(self._stage_results),
             external_recheck_count=self._external_recheck_count,
+            pending_reason=self._pending_input or "",
+            next_action=progress.next_action if progress else "",
+            retry_count=progress.retry_count if progress else 0,
+            deadline=progress.deadline if progress else None,
+            timeout_seconds=progress.timeout_seconds if progress else None,
+            last_error=(self._stage_results[-1].summary
+                        if self._status is RunStatus.FAILED and self._stage_results else None),
+            workflow_run_id=workflow.info().run_id,
         )
 
     @workflow.run
@@ -300,6 +311,14 @@ class CodexRunWorkflow:
             )
         answer_number = 0
         while True:
+            self._progress = await report_progress(
+                phase="codex", next_action=f"execute Codex {stage.key} turn",
+                timeout_seconds=stage.start_to_close_timeout_seconds,
+                deadline=(workflow.now() + timedelta(
+                    seconds=stage.start_to_close_timeout_seconds
+                )).isoformat(),
+                retry_count=answer_number,
+            )
             observation = await workflow.execute_activity(
                 codex_stage,
                 CodexOperation(
@@ -317,6 +336,7 @@ class CodexRunWorkflow:
                     parent_workflow_id=input.parent_workflow_id,
                     workflow_run_id=workflow.info().run_id,
                     parent_workflow_run_id=input.parent_workflow_run_id,
+                    namespace=workflow.info().namespace,
                 ),
                 start_to_close_timeout=timedelta(
                     seconds=stage.start_to_close_timeout_seconds

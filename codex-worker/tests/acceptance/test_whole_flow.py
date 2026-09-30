@@ -68,6 +68,7 @@ from temporalio_codex.workflows import CodexRunWorkflow
 from temporalio_codex.delivery_workflows import DeliveryWorkflow
 from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
 from temporalio_codex.summary_workflows import DeliverySummaryWorkflow
+from temporalio_codex.execution_status import ExecutionProgress
 
 
 def spec_drafts() -> tuple[SpecDraft, ...]:
@@ -174,6 +175,8 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
     failure_phase,
     tmp_path,
 ) -> None:
+    handle = None
+    observed_active = []
     def git(cwd, *args):
         return subprocess.run(
             ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True
@@ -224,6 +227,24 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
         workspace = Path(kwargs["cwd"])
 
         async def run():
+            for _ in range(100):
+                state = await handle.query(RequirementDeliveryWorkflow.get_status)
+                if state.active_ticket:
+                    break
+                await asyncio.sleep(0.01)
+            assert state.phase == WholeFlowPhase.CODEX
+            assert state.status == WholeFlowStatus.ACTIVE
+            assert state.active_spec in ("foundation", "follow-up")
+            assert state.active_ticket.startswith(state.active_spec)
+            assert state.deadline and state.timeout_seconds == 30
+            assert "Codex" in state.next_action
+            await handle.signal("execution_progress", ExecutionProgress(
+                "whole-flow-acceptance:tickets:foundation", "stale-run",
+                "planning", "blocked", pending_reason="stale signal",
+            ))
+            unchanged = await handle.query(RequirementDeliveryWorkflow.get_status)
+            assert unchanged == state
+            observed_active.append(state)
             if prompt.startswith("Role: implementation"):
                 ticket = prompt.split("Ready ticket: ", 1)[1].splitlines()[0]
                 (workspace / f"{ticket}-implemented.txt").write_text(
@@ -361,9 +382,17 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
             assert result.status == WholeFlowStatus.FAILED
             assert result.reason
             assert snapshot.status == WholeFlowStatus.FAILED
+            assert snapshot.last_error == result.reason
+            assert snapshot.next_action == ""
+            assert snapshot.deadline is None
             return
         assert result.status == WholeFlowStatus.COMPLETED
         assert result.phase == WholeFlowPhase.COMPLETED
+        assert observed_active
+        assert snapshot.next_action == ""
+        assert snapshot.active_ticket is None
+        assert snapshot.pending_reason == ""
+        assert snapshot.deadline is None
         assert snapshot.completed_specs == ("foundation", "follow-up")
         assert result.delivery_results
         for codex_result in result.codex_results:
@@ -455,6 +484,48 @@ async def test_historical_chat_is_accepted_without_persisting_inline_source() ->
     finally:
         configure_spec_issue_gateway(None)
         configure_ticket_issue_gateway(None)
+
+
+async def test_parent_reports_publication_retry_and_terminal_blocked_status() -> None:
+    configure_spec_issue_gateway(FakeSpecIssueGateway(fail_create=True))
+    input = whole_flow_input()
+    input = replace(input, planning=replace(
+        input.planning, publication_max_attempts=2,
+        publication_retry_backoff_seconds=60,
+    ))
+    try:
+        async with await WorkflowEnvironment.start_time_skipping() as environment:
+            async with Worker(
+                environment.client, task_queue="status-retry",
+                workflows=[RequirementDeliveryWorkflow, RequirementPlanningWorkflow],
+                activities=[prepare_grill, publish_spec_issues],
+            ):
+                handle = await environment.client.start_workflow(
+                    RequirementDeliveryWorkflow.run, input,
+                    id="status-retry", task_queue="status-retry",
+                )
+                for _ in range(100):
+                    snapshot = await handle.query(RequirementDeliveryWorkflow.get_status)
+                    if snapshot.status == WholeFlowStatus.RETRYING:
+                        break
+                    await asyncio.sleep(0.01)
+                assert snapshot.status == WholeFlowStatus.RETRYING
+                assert snapshot.phase == WholeFlowPhase.PLANNING
+                assert snapshot.retry_count == 1
+                assert snapshot.deadline and snapshot.last_error
+                assert snapshot.pending_reason
+                assert "retry" in snapshot.next_action
+                result = await handle.result()
+                terminal = await handle.query(RequirementDeliveryWorkflow.get_status)
+                assert result.status == WholeFlowStatus.BLOCKED
+                assert terminal.status == WholeFlowStatus.BLOCKED
+                assert terminal.last_error == result.reason
+                assert terminal.pending_reason == result.reason
+                assert terminal.next_action == ""
+                assert terminal.deadline is None
+                assert terminal.retry_count == 1
+    finally:
+        configure_spec_issue_gateway(None)
 
 
 def test_whole_flow_rejects_future_cross_spec_blocker_before_starting_children() -> (

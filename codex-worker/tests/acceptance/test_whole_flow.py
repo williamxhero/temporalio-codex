@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
+
 from temporalio_codex.activities import (
     codex_stage,
     configure_codex_adapter,
@@ -19,7 +21,6 @@ from temporalio_codex.activities import (
     foundation_stage,
     heartbeat_stage,
 )
-from temporalio_codex.git_adapter import LocalGitAdapter
 from temporalio_codex.candidate_activities import capture_codex_candidate
 from temporalio_codex.delivery_adapter import FakeDeliveryAdapter
 from temporalio_codex.delivery_models import (
@@ -30,6 +31,7 @@ from temporalio_codex.delivery_models import (
 )
 from temporalio_codex.delivery_workflows import DeliveryWorkflow
 from temporalio_codex.execution_status import ExecutionProgress
+from temporalio_codex.git_adapter import LocalGitAdapter
 from temporalio_codex.openai_adapter import OpenAICodexAdapter
 from temporalio_codex.planning_activities import (
     configure_spec_issue_gateway,
@@ -187,7 +189,11 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
         git(repository, "config", "user.name", "Acceptance")
         git(repository, "config", "user.email", "acceptance@example.invalid")
         (repository / "README").write_text("base\n", encoding="utf-8")
-        git(repository, "add", "README")
+        shutil.copytree(
+            Path(__file__).parents[3] / ".claude" / "skills",
+            repository / ".claude" / "skills",
+        )
+        git(repository, "add", ".")
         git(repository, "commit", "-m", "base")
         remote = tmp_path / f"{plan.spec_key}.git"
         git(tmp_path, "init", "--bare", str(remote))
@@ -216,13 +222,25 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
         final_response="governed change completed",
         error=None,
     )
-    turn = SimpleNamespace(id="turn-acceptance", run=AsyncMock(return_value=sdk_result))
     thread = MagicMock(id="thread-acceptance")
+    observe_turn = None
 
     def sdk_turn(prompt, **kwargs):
         workspace = Path(kwargs["cwd"])
 
         async def run():
+            if observe_turn:
+                await observe_turn()
+            for skill_path in (
+                "implement-spec",
+                "to-tickets",
+                "implement",
+                "tdd",
+                "review",
+            ):
+                assert (
+                    workspace / ".claude" / "skills" / skill_path / "SKILL.md"
+                ).is_file()
             if prompt.startswith("Role: implementation"):
                 ticket = prompt.split("Ready ticket: ", 1)[1].splitlines()[0]
                 (workspace / f"{ticket}-implemented.txt").write_text(
@@ -352,7 +370,9 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
 
                 async def observe_running_turn(*args, **kwargs):
                     for _ in range(100):
-                        state = await handle.query(RequirementDeliveryWorkflow.get_status)
+                        state = await handle.query(
+                            RequirementDeliveryWorkflow.get_status
+                        )
                         if state.active_ticket:
                             break
                         await asyncio.sleep(0.01)
@@ -362,19 +382,27 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
                     assert state.active_ticket.startswith(state.active_spec)
                     assert state.deadline and state.timeout_seconds == 30
                     assert "Codex" in state.next_action
-                    await handle.signal("execution_progress", ExecutionProgress(
-                        "whole-flow-acceptance:tickets:foundation", "stale-run",
-                        "planning", "blocked", pending_reason="stale signal",
-                    ))
-                    unchanged = await handle.query(RequirementDeliveryWorkflow.get_status)
+                    await handle.signal(
+                        "execution_progress",
+                        ExecutionProgress(
+                            "whole-flow-acceptance:tickets:foundation",
+                            "stale-run",
+                            "planning",
+                            "blocked",
+                            pending_reason="stale signal",
+                        ),
+                    )
+                    unchanged = await handle.query(
+                        RequirementDeliveryWorkflow.get_status
+                    )
                     assert unchanged == state
                     observed_active.append(state)
                     return sdk_result
 
-                turn.run.side_effect = observe_running_turn
+                observe_turn = observe_running_turn
                 try:
                     result = await asyncio.wait_for(handle.result(), timeout=30)
-                except asyncio.TimeoutError as error:
+                except TimeoutError as error:
                     snapshot = await handle.query(
                         RequirementDeliveryWorkflow.get_status
                     )
@@ -491,23 +519,32 @@ async def test_historical_chat_is_accepted_without_persisting_inline_source() ->
 async def test_parent_reports_publication_retry_and_terminal_blocked_status() -> None:
     configure_spec_issue_gateway(FakeSpecIssueGateway(fail_create=True))
     input = whole_flow_input()
-    input = replace(input, planning=replace(
-        input.planning, publication_max_attempts=2,
-        publication_retry_backoff_seconds=60,
-    ))
+    input = replace(
+        input,
+        planning=replace(
+            input.planning,
+            publication_max_attempts=2,
+            publication_retry_backoff_seconds=60,
+        ),
+    )
     try:
         async with await WorkflowEnvironment.start_time_skipping() as environment:
             async with Worker(
-                environment.client, task_queue="status-retry",
+                environment.client,
+                task_queue="status-retry",
                 workflows=[RequirementDeliveryWorkflow, RequirementPlanningWorkflow],
                 activities=[prepare_grill, publish_spec_issues],
             ):
                 handle = await environment.client.start_workflow(
-                    RequirementDeliveryWorkflow.run, input,
-                    id="status-retry", task_queue="status-retry",
+                    RequirementDeliveryWorkflow.run,
+                    input,
+                    id="status-retry",
+                    task_queue="status-retry",
                 )
                 for _ in range(100):
-                    snapshot = await handle.query(RequirementDeliveryWorkflow.get_status)
+                    snapshot = await handle.query(
+                        RequirementDeliveryWorkflow.get_status
+                    )
                     if snapshot.status == WholeFlowStatus.RETRYING:
                         break
                     await asyncio.sleep(0.01)

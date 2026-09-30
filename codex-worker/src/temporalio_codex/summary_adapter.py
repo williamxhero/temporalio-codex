@@ -258,7 +258,6 @@ class GhCliSummaryCommentGateway:
     ) -> SummaryCommentRecord:
         record = await self._api(
             "issues",
-            str(input.umbrella_issue_number),
             "comments",
             str(comment_id),
         )
@@ -318,7 +317,11 @@ class GhCliSummaryCommentGateway:
     ) -> SummaryCommentRecord:
         return SummaryCommentRecord(
             comment_id=record["id"],
-            issue_number=input.umbrella_issue_number,
+            issue_number=(
+                int(record["issue_url"].rstrip("/").rsplit("/", 1)[-1])
+                if record.get("issue_url")
+                else input.umbrella_issue_number
+            ),
             operation_id=operation_id,
             body=record.get("body") or "",
         )

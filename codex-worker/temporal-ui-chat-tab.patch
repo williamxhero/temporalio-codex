@@ -497,7 +497,7 @@ index 387740d..a347da7 100644
 +    routeForWorkflowChat,
    } from '$lib/utilities/route-for';
    import { isWorkflowTaskFailure } from '$lib/utilities/workflow-task-failures';
- 
+
 @@ -277,6 +278,15 @@
    />
    <Tabs>
@@ -550,10 +550,10 @@ index c9efdf7..8f03eca 100644
 -import { get } from 'svelte/store';
 -
  import { BROWSER } from 'esm-env';
- 
+
  import { resolve } from '$app/paths';
  import type { ResolvedPathname } from '$app/types';
- 
+
 -import {
 -  eventFilterSort,
 -  workflowViewPreference,
@@ -564,7 +564,7 @@ index c9efdf7..8f03eca 100644
 @@ -396,31 +390,16 @@ export const routeForTimeline = ({
    return toURL(path, queryParams);
  };
- 
+
 +export const routeForWorkflowChat = (
 +  parameters: WorkflowParameters,
 +): ResolvedPathname => {
@@ -598,7 +598,7 @@ index c9efdf7..8f03eca 100644
 -  });
 +  return routeForWorkflowChat(parameters);
  };
- 
+
  export const routeForWorkers = (
 diff --git a/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts b/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts
 index eaac44d..c188f04 100644
@@ -606,7 +606,7 @@ index eaac44d..c188f04 100644
 +++ b/src/routes/(app)/namespaces/[namespace]/workflows/[workflow]/[run]/+page.ts
 @@ -3,5 +3,5 @@ import { redirect } from '@sveltejs/kit';
  import type { PageLoad } from './$types';
- 
+
  export const load: PageLoad = async function ({ url }) {
 -  redirect(302, `${url.pathname}/timeline`);
 +  redirect(302, `${url.pathname}/chat`);

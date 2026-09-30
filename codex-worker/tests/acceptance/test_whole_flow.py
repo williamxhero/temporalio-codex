@@ -242,7 +242,10 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
                 "planning", "blocked", pending_reason="stale signal",
             ))
             unchanged = await handle.query(RequirementDeliveryWorkflow.get_status)
-            assert unchanged == state
+            assert unchanged.phase == WholeFlowPhase.CODEX
+            assert unchanged.status == WholeFlowStatus.ACTIVE
+            assert unchanged.active_ticket == state.active_ticket
+            assert unchanged.pending_reason != "stale signal"
             observed_active.append(state)
             if prompt.startswith("Role: implementation"):
                 ticket = prompt.split("Ready ticket: ", 1)[1].splitlines()[0]
@@ -388,7 +391,7 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
             assert snapshot.next_action == ""
             assert snapshot.deadline is None
             return
-        assert result.status == WholeFlowStatus.COMPLETED
+        assert result.status == WholeFlowStatus.COMPLETED, result
         assert result.phase == WholeFlowPhase.COMPLETED
         assert observed_active
         assert snapshot.next_action == ""

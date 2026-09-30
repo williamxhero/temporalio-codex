@@ -99,6 +99,28 @@ http://127.0.0.1:18000/namespaces/default/workflows/issue-81-sdk-probe-31b083068
 - `make lint-code-fast` was attempted and could not run: `make` is not installed
   on this Windows host.
 
+### Final readback after review fixes
+
+Integration commit `79c969e8f` includes review fixes for compact failure causes,
+command exit and test result summaries, bounded file summaries, streaming
+replacement and plan snapshots. The final focused backend gate reported 54
+passing tests. Those fixtures verify actual command/test/file/error events;
+the historical live execution cannot provide evidence for activity kinds it
+did not perform.
+
+Temporal again listed no running workflows before the final worker restart.
+The previous worker and uv parent identities were rechecked, then the worker
+was restarted from the current root checkout with the same queue, database and
+port. The final uv parent is PID 37248 and Conversation Server listener is PID
+43924. No UI source changed during review, so the staged assets above remain
+the served build.
+
+The desktop/mobile live script was rerun against the final backend. Both passed
+the exact execution URL, context summary, collapsed source/verification,
+explicit expansion, reload, zero horizontal overflow and zero page/asset
+errors checks. The local JSON report and screenshots above now contain this
+final readback. No new live SDK execution or external deployment was needed.
+
 ## Browser verification
 
 In the UI checkout:

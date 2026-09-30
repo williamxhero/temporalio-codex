@@ -79,7 +79,7 @@ async def probe(args: argparse.Namespace) -> dict:
     try:
         result = await asyncio.wait_for(handle.result(), args.timeout + 30)
         evidence["result"] = asdict(result)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         evidence["error"] = "bounded probe timeout; requested cancellation"
         await handle.cancel()
     snapshot = await handle.query(CodexRunWorkflow.get_status)

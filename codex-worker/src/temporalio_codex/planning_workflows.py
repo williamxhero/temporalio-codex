@@ -80,6 +80,14 @@ class RequirementPlanningWorkflow:
                 self._status = PlanningStatus.BLOCKED
                 self._publication_reason = "invalid initial Grill answer"
                 return self._planning_result()
+        if not self._required_questions_answered():
+            answers = self._derive_grill_answers(input)
+            if answers is None or any(not self._record_grill_answer(answer) for answer in answers):
+                self._status = PlanningStatus.BLOCKED
+                self._publication_reason = (
+                    "unable to safely derive required Grill answers from requirement context"
+                )
+                return self._planning_result()
         await workflow.wait_condition(
             lambda: (self._required_questions_answered() and not self._paused)
             or self._cancelled
@@ -88,10 +96,15 @@ class RequirementPlanningWorkflow:
             return self._cancelled_result()
 
         self._phase = PlanningPhase.CONFIRMATION_REQUIRED
-        self._status = PlanningStatus.WAITING_FOR_INPUT
+        self._status = PlanningStatus.ACTIVE
         if input.confirmation_operation_id:
             self._confirmed = True
             self._confirmation_operation_id = input.confirmation_operation_id
+        else:
+            self._confirmed = True
+            self._confirmation_operation_id = (
+                f"planning-confirm:{self._source.source_identity}"
+            )
         await workflow.wait_condition(
             lambda: (self._confirmed and not self._paused) or self._cancelled
         )
@@ -103,6 +116,11 @@ class RequirementPlanningWorkflow:
         if input.publication_operation_id:
             self._publication_requested = True
             self._publication_operation_id = input.publication_operation_id
+        else:
+            self._publication_requested = True
+            self._publication_operation_id = (
+                f"planning-publish:{self._source.source_identity}"
+            )
         await workflow.wait_condition(
             lambda: (self._publication_requested and not self._paused) or self._cancelled
         )
@@ -170,6 +188,22 @@ class RequirementPlanningWorkflow:
         self._phase = PlanningPhase.COMPLETED
         self._status = PlanningStatus.COMPLETED
         return self._planning_result()
+
+    def _derive_grill_answers(self, input: PlanningInput) -> tuple[GrillAnswer, ...] | None:
+        """Derive deterministic answers for every required question without an operator."""
+        answered = {answer.question_number for answer in self._grill.answers}
+        required = tuple(
+            question
+            for question in self._grill.questions
+            if question.required and question.number not in answered
+        )
+        if not required:
+            return ()
+        context = (input.source_text or input.source_reference or "").strip()
+        if not context or not input.source_text:
+            return None
+        answer = context
+        return tuple(GrillAnswer(question.number, answer) for question in required)
 
     async def _publish_specs(self, input: PlanningInput) -> SpecPublicationResult:
         try:

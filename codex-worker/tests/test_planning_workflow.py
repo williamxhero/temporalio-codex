@@ -327,3 +327,25 @@ async def test_activity_failure_enters_readback_instead_of_failing_workflow():
             result = await handle.result()
     assert result.status is PlanningStatus.BLOCKED
     assert "readback timed out" in result.publication_reason
+
+
+async def test_planning_completes_automatically_without_operator_signals() -> None:
+    input = PlanningInput(
+        origin=SourceOrigin.TEXT,
+        source_text="automatically deliver this requirement",
+    )
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="planning-automatic",
+            workflows=[RequirementPlanningWorkflow],
+            activities=[prepare_grill],
+        ):
+            handle = await start_planning(environment, "planning-automatic", input)
+            result = await handle.result()
+
+    assert result.status is PlanningStatus.COMPLETED
+    assert result.phase is PlanningPhase.COMPLETED
+    assert result.grill.decisions == (input.source_text,)
+    assert result.confirmation_operation_id.startswith("planning-confirm:")
+    assert result.publication_operation_id.startswith("planning-publish:")

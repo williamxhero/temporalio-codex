@@ -2,7 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
+from openai_codex import Sandbox
 from temporalio_codex.codex_models import (
     CodexFailure,
     CodexOperation,
@@ -11,6 +11,17 @@ from temporalio_codex.codex_models import (
 )
 from temporalio_codex.conversation_store import ConversationStore
 from temporalio_codex.openai_adapter import OpenAICodexAdapter
+
+
+def test_sandbox_override_is_explicit_and_preserves_read_only(monkeypatch):
+    monkeypatch.delenv("TEMPORALIO_CODEX_SANDBOX", raising=False)
+    assert OpenAICodexAdapter._sandbox(("src",)) is Sandbox.workspace_write
+    monkeypatch.setenv("TEMPORALIO_CODEX_SANDBOX", "full-access")
+    assert OpenAICodexAdapter._sandbox(("src",)) is Sandbox.full_access
+    assert OpenAICodexAdapter._sandbox(("read_only",)) is Sandbox.read_only
+    monkeypatch.setenv("TEMPORALIO_CODEX_SANDBOX", "invalid")
+    with pytest.raises(ValueError):
+        OpenAICodexAdapter._sandbox(("src",))
 
 
 def operation() -> CodexOperation:

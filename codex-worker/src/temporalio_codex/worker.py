@@ -19,34 +19,35 @@ from temporalio_codex.activities import (
 from temporalio_codex.candidate_activities import capture_codex_candidate
 from temporalio_codex.conversation_server import ConversationServer
 from temporalio_codex.conversation_store import ConversationStore
+from temporalio_codex.delivery_workflows import DeliveryWorkflow
+from temporalio_codex.git_adapter import LocalGitAdapter
+from temporalio_codex.github_adapter import GhCliGateway, GitHubDeliveryAdapter
+from temporalio_codex.openai_adapter import OpenAICodexAdapter
+from temporalio_codex.planning_activities import (
+    configure_spec_issue_gateway,
+    configure_ticket_issue_gateway,
+    prepare_grill,
+    publish_spec_issues,
+    publish_ticket_issues,
+)
+from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
+from temporalio_codex.settings import DEFAULT_TARGET_HOST, DEFAULT_TASK_QUEUE
+from temporalio_codex.spec_issue_adapter import GhCliSpecIssueGateway
+from temporalio_codex.spec_workflows import SpecExecutionWorkflow
 from temporalio_codex.summary_activities import (
     configure_summary_gateway,
     publish_delivery_summary,
 )
 from temporalio_codex.summary_adapter import GhCliSummaryCommentGateway
 from temporalio_codex.summary_workflows import DeliverySummaryWorkflow
-from temporalio_codex.github_adapter import GhCliGateway, GitHubDeliveryAdapter
-from temporalio_codex.git_adapter import LocalGitAdapter
-from temporalio_codex.openai_adapter import OpenAICodexAdapter
-from temporalio_codex.settings import DEFAULT_TARGET_HOST, DEFAULT_TASK_QUEUE
-from temporalio_codex.workflows import CodexRunWorkflow
-from temporalio_codex.delivery_workflows import DeliveryWorkflow
-from temporalio_codex.planning_activities import prepare_grill
-from temporalio_codex.planning_activities import (
-    configure_spec_issue_gateway,
-    configure_ticket_issue_gateway,
-    publish_spec_issues,
-    publish_ticket_issues,
-)
-from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
-from temporalio_codex.spec_issue_adapter import GhCliSpecIssueGateway
 from temporalio_codex.ticket_issue_adapter import GhCliTicketIssueGateway
 from temporalio_codex.ticket_workflows import TicketSchedulerWorkflow
 from temporalio_codex.whole_flow_workflows import RequirementDeliveryWorkflow
-from temporalio_codex.spec_workflows import SpecExecutionWorkflow
+from temporalio_codex.workflows import CodexRunWorkflow
 
-
-DEFAULT_CONVERSATION_DB = Path(__file__).resolve().parents[2] / ".tmp" / "codex-conversations.sqlite3"
+DEFAULT_CONVERSATION_DB = (
+    Path(__file__).resolve().parents[2] / ".tmp" / "codex-conversations.sqlite3"
+)
 
 
 async def run_worker(
@@ -115,6 +116,7 @@ def _build_codex_adapter(
         sdk_version = version("openai-codex")
     except (ImportError, PackageNotFoundError):
         return None
+    OpenAICodexAdapter._sandbox(("src",))
     return OpenAICodexAdapter(AsyncCodex, sdk_version, conversation_store)
 
 

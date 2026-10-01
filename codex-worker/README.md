@@ -31,6 +31,14 @@ Set `TEMPORALIO_CODEX_DEFAULT_MODEL` explicitly when the worker's provider
 requires a replacement for the historical `gpt-5-codex` model. Unset values
 and other explicit model names pass through unchanged.
 
+`TEMPORALIO_CODEX_SANDBOX` explicitly selects the SDK sandbox for operations
+that authorize writes. It defaults to `workspace-write`. Use `full-access`
+only for a trusted deployment that authorizes the required test filesystem
+and network access; this removes the SDK sandbox. Read-only operations always
+remain read-only, and candidate capture still enforces authorized artifact
+roots. Invalid values fail at worker startup. Independent review must still
+produce matching approval evidence; environment configuration cannot waive it.
+
 To use an installed artifact, build a wheel with `uv build --wheel`, install
 that wheel into a clean environment, and run the same `temporalio-codex-worker`
 and `temporalio-codex-run` entry points. The installed package does not import

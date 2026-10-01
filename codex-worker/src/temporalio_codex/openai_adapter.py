@@ -514,16 +514,13 @@ class OpenAICodexAdapter:
     def _model_for_operation(model: str) -> str:
         if model != "gpt-5-codex":
             return model
-        return (
-            os.environ.get("TEMPORALIO_CODEX_DEFAULT_MODEL", model).strip()
-            or model
-        )
+        return os.environ.get("TEMPORALIO_CODEX_DEFAULT_MODEL", model).strip() or model
 
     @staticmethod
     def _sandbox(scope: tuple[str, ...]):
         if scope == ("read_only",):
             return Sandbox.read_only
-        return Sandbox.workspace_write
+        return Sandbox(os.environ.get("TEMPORALIO_CODEX_SANDBOX", "workspace-write"))
 
     @staticmethod
     def _observation_from_result(operation, result, capabilities, thread_id):

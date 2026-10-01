@@ -20,9 +20,9 @@ from temporalio.api.workflowservice.v1 import (
     UpdateActivityOptionsRequest,
 )
 from temporalio.client import Client
-from temporalio.service import RPCError, RPCStatusCode
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Replayer
 
 from temporalio_codex.candidate_activities import (
@@ -54,6 +54,7 @@ from temporalio_codex.spec_issue_adapter import (
     SpecPublicationResult,
     SpecPublicationStatus,
 )
+from temporalio_codex.spec_workflows import SpecExecutionWorkflow
 from temporalio_codex.summary_adapter import SummaryPublicationInput
 from temporalio_codex.summary_workflows import DeliverySummaryWorkflow
 from temporalio_codex.ticket_scheduler import (
@@ -71,11 +72,15 @@ from temporalio_codex.whole_flow_models import (
     WholeFlowInput,
     WholeFlowPhase,
     WholeFlowResult,
+    WholeFlowStatus,
 )
 from temporalio_codex.whole_flow_workflows import RequirementDeliveryWorkflow
+from temporalio_codex.workflow_identity import (
+    project_issue_id,
+    project_request_id,
+    project_spec_id,
+)
 from temporalio_codex.workflows import CodexRunWorkflow
-from temporalio_codex.spec_workflows import SpecExecutionWorkflow
-from temporalio_codex.workflow_identity import project_issue_id, project_request_id, project_spec_id
 
 
 def stable_run_id(request: RequirementDeliveryRequest) -> str:
@@ -97,8 +102,12 @@ def previous_stable_run_id(request: RequirementDeliveryRequest) -> str:
         separators=(",", ":"),
     )
     keys = tuple(spec.key for spec in request.execution_plan.scheduler.specs)
-    identifier = project_spec_id(request.repository, keys[0] if len(keys) == 1 else "batch", identity)
-    return identifier if len(keys) == 1 else identifier.rsplit(":spec:", 1)[0] + ":batch"
+    identifier = project_spec_id(
+        request.repository, keys[0] if len(keys) == 1 else "batch", identity
+    )
+    return (
+        identifier if len(keys) == 1 else identifier.rsplit(":spec:", 1)[0] + ":batch"
+    )
 
 
 def legacy_run_id(request: RequirementDeliveryRequest) -> str:
@@ -124,7 +133,9 @@ def _execution_plan(request: RequirementDeliveryRequest):
     )
 
 
-async def _existing_run_id(client: Client, request: RequirementDeliveryRequest) -> str | None:
+async def _existing_run_id(
+    client: Client, request: RequirementDeliveryRequest
+) -> str | None:
     legacy_id = legacy_run_id(request)
     try:
         await client.get_workflow_handle(legacy_id).describe()
@@ -154,15 +165,21 @@ async def launch_requirement(
     else:
         try:
             handle = await client.start_workflow(
-                SpecExecutionWorkflow.run if _execution_plan(request).execution_layout == "spec"
+                SpecExecutionWorkflow.run
+                if _execution_plan(request).execution_layout == "spec"
                 else RequirementDeliveryWorkflow.run,
                 _execution_plan(request),
                 id=run_id,
                 task_queue=request.task_queue,
                 id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
                 id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
-                memo={"project": request.repository, "specs": [spec.key for spec in request.execution_plan.scheduler.specs],
-                      "launch_key": request.launch_key},
+                memo={
+                    "project": request.repository,
+                    "specs": [
+                        spec.key for spec in request.execution_plan.scheduler.specs
+                    ],
+                    "launch_key": request.launch_key,
+                },
             )
             adopted = False
         except WorkflowAlreadyStartedError:
@@ -196,7 +213,9 @@ async def read_status(
     *,
     run_id: str | None = None,
 ) -> EntryStatusSnapshot:
-    resolved_run_id = run_id or await _existing_run_id(client, request) or stable_run_id(request)
+    resolved_run_id = (
+        run_id or await _existing_run_id(client, request) or stable_run_id(request)
+    )
     handle = client.get_workflow_handle(resolved_run_id)
     whole = await handle.query(RequirementDeliveryWorkflow.get_status)
     return EntryStatusSnapshot(
@@ -273,34 +292,57 @@ async def extend_spec_publication(client: Client, run_id: str, seconds: float) -
         or info.status != 1
     ):
         raise ValueError("no active planning child belongs to this delivery run")
-    pending = [item for item in description.pending_activities
-               if item.activity_type.name == "publish-spec-issues"]
+    pending = [
+        item
+        for item in description.pending_activities
+        if item.activity_type.name == "publish-spec-issues"
+    ]
     if len(pending) != 1:
         raise ValueError("expected exactly one pending SPEC publication activity")
     activity = pending[0]
-    previous = activity.activity_options.start_to_close_timeout.ToTimedelta().total_seconds()
+    previous = (
+        activity.activity_options.start_to_close_timeout.ToTimedelta().total_seconds()
+    )
     if seconds < previous:
         raise ValueError("publication recovery must not shorten the active timeout")
     duration = Duration()
     duration.FromTimedelta(timedelta(seconds=seconds))
-    await client.workflow_service.update_activity_options(UpdateActivityOptionsRequest(
-        namespace=client.namespace,
-        execution=info.execution,
-        identity=client.identity,
-        id=activity.activity_id,
-        activity_options=ActivityOptions(start_to_close_timeout=duration),
-        update_mask=FieldMask(paths=["start_to_close_timeout"]),
-    ))
+    await client.workflow_service.update_activity_options(
+        UpdateActivityOptionsRequest(
+            namespace=client.namespace,
+            execution=info.execution,
+            identity=client.identity,
+            id=activity.activity_id,
+            activity_options=ActivityOptions(start_to_close_timeout=duration),
+            update_mask=FieldMask(paths=["start_to_close_timeout"]),
+        )
+    )
     readback = (await handle.describe()).raw_description
-    current = next((item for item in readback.pending_activities
-                    if item.activity_id == activity.activity_id), None)
-    observed = (current.activity_options.start_to_close_timeout.ToTimedelta().total_seconds()
-                if current is not None else None)
+    current = next(
+        (
+            item
+            for item in readback.pending_activities
+            if item.activity_id == activity.activity_id
+        ),
+        None,
+    )
+    observed = (
+        current.activity_options.start_to_close_timeout.ToTimedelta().total_seconds()
+        if current is not None
+        else None
+    )
     if observed != seconds:
-        raise RuntimeError("publication timeout change requires readback; activity may have completed")
-    return {"run_id": run_id, "child_id": child_id, "child_run_id": info.execution.run_id,
-            "activity_id": activity.activity_id, "attempt": current.attempt,
-            "start_to_close_timeout_seconds": observed}
+        raise RuntimeError(
+            "publication timeout change requires readback; activity may have completed"
+        )
+    return {
+        "run_id": run_id,
+        "child_id": child_id,
+        "child_run_id": info.execution.run_id,
+        "activity_id": activity.activity_id,
+        "attempt": current.attempt,
+        "start_to_close_timeout_seconds": observed,
+    }
 
 
 async def resolve_spec_publication(
@@ -343,7 +385,40 @@ async def diagnose_requirement(client: Client, run_id: str) -> EntryStatusSnapsh
     )
 
 
-def _ticket_child_reset_point(history, payload_converter, *, allow_frozen_candidate=False) -> int:
+def _validate_completed_ticket_failure(result, history, payload_converter) -> None:
+    child = next(
+        (
+            event.child_workflow_execution_completed_event_attributes
+            for event in reversed(history.events)
+            if event.event_type
+            == EventType.EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_COMPLETED
+        ),
+        None,
+    )
+    scheduler = (
+        payload_converter.from_payloads(child.result.payloads, [SchedulerResult])[0]
+        if child is not None
+        else None
+    )
+    runs = (result.scheduler or {}).get("runs", ())
+    if (
+        result.phase is not WholeFlowPhase.FAILED
+        or result.status is not WholeFlowStatus.FAILED
+        or scheduler is None
+        or scheduler.status is not SchedulerStatus.BLOCKED
+        or not runs
+        or runs[-1].get("workflow_id") != scheduler.workflow_id
+        or runs[-1].get("status") != scheduler.status.value
+        or result.reason != (scheduler.reason or "ticket scheduling did not complete")
+    ):
+        raise ValueError(
+            "completed execution is not the verified ticket scheduling failure"
+        )
+
+
+def _ticket_child_reset_point(
+    history, payload_converter, *, allow_frozen_candidate=False
+) -> int:
     terminal_child = next(
         (
             event
@@ -360,14 +435,19 @@ def _ticket_child_reset_point(history, payload_converter, *, allow_frozen_candid
         raise ValueError("delivery history has no terminal ticket child")
     attributes_name = terminal_child.WhichOneof("attributes")
     attributes = getattr(terminal_child, attributes_name)
-    if terminal_child.event_type == EventType.EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_COMPLETED:
+    if (
+        terminal_child.event_type
+        == EventType.EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_COMPLETED
+    ):
         result = payload_converter.from_payloads(
             attributes.result.payloads, [SchedulerResult]
         )[0]
         if result.status is not SchedulerStatus.BLOCKED or (
             result.completed_tickets and not allow_frozen_candidate
         ):
-            raise ValueError("completed ticket child is not an unfinished blocked scheduler")
+            raise ValueError(
+                "completed ticket child is not an unfinished blocked scheduler"
+            )
         if result.codex_results and not allow_frozen_candidate:
             raise ValueError(
                 "ticket child has external Codex results; authoritative readback is required before reset"
@@ -383,7 +463,10 @@ def _ticket_child_reset_point(history, payload_converter, *, allow_frozen_candid
         ),
         None,
     )
-    if start_event is None or start_event.workflow_type.name != "TicketSchedulerWorkflow":
+    if (
+        start_event is None
+        or start_event.workflow_type.name != "TicketSchedulerWorkflow"
+    ):
         raise ValueError("terminated child is not a TicketSchedulerWorkflow")
     reset_point = initiated_event_id - 1
     point_event = next(
@@ -403,18 +486,29 @@ async def _read_interrupted_operation(operation: CodexOperation, conversation_db
     fingerprint = hashlib.sha256(
         json.dumps(asdict(operation), sort_keys=True).encode()
     ).hexdigest()
-    with sqlite3.connect(Path(conversation_db).resolve().as_uri() + "?mode=ro", uri=True) as connection:
+    with sqlite3.connect(
+        Path(conversation_db).resolve().as_uri() + "?mode=ro", uri=True
+    ) as connection:
         row = connection.execute(
             "SELECT thread_id,turn_id,fingerprint FROM codex_operation_ledger "
             "WHERE namespace=? AND workflow_id=? AND workflow_run_id=? AND operation_id=?",
-            (operation.namespace, operation.run_id, operation.workflow_run_id, operation.operation_id),
+            (
+                operation.namespace,
+                operation.run_id,
+                operation.workflow_run_id,
+                operation.operation_id,
+            ),
         ).fetchone()
     if row is None or row[2] != fingerprint or not all(row[:2]):
-        raise ValueError("interrupted operation ledger does not match the durable activity input")
+        raise ValueError(
+            "interrupted operation ledger does not match the durable activity input"
+        )
     async with AsyncCodex() as codex:
         thread = await codex.thread_resume(row[0], include_turns=True)
         readback = await thread.read(include_turns=True)
-    _validate_interrupted_readback(readback.thread, row[0], row[1], operation.repository)
+    _validate_interrupted_readback(
+        readback.thread, row[0], row[1], operation.repository
+    )
     return row[0], row[1]
 
 
@@ -426,9 +520,14 @@ def _validate_interrupted_readback(thread, thread_id, turn_id, repository):
         or Path(str(cwd)).resolve() != Path(repository).resolve()
         or len(turns) != 1
         or getattr(turns[0].status, "value", turns[0].status) != "interrupted"
-        or any(getattr(turn.status, "value", turn.status) == "inProgress" for turn in thread.turns)
+        or any(
+            getattr(turn.status, "value", turn.status) == "inProgress"
+            for turn in thread.turns
+        )
     ):
-        raise ValueError("external readback does not prove the exact implementation turn was interrupted")
+        raise ValueError(
+            "external readback does not prove the exact implementation turn was interrupted"
+        )
 
 
 def _validate_known_model_failure(thread, thread_id, turn_id, repository, model):
@@ -439,7 +538,10 @@ def _validate_known_model_failure(thread, thread_id, turn_id, repository, model)
         or Path(str(cwd)).resolve() != Path(repository).resolve()
         or len(turns) != 1
         or getattr(turns[0].status, "value", turns[0].status) != "failed"
-        or any(getattr(turn.status, "value", turn.status) == "inProgress" for turn in thread.turns)
+        or any(
+            getattr(turn.status, "value", turn.status) == "inProgress"
+            for turn in thread.turns
+        )
     ):
         raise ValueError("external readback does not prove the exact model failure")
     error = getattr(turns[0], "error", None)
@@ -449,7 +551,10 @@ def _validate_known_model_failure(thread, thread_id, turn_id, repository, model)
 
 
 async def _freeze_implementation_for_recovery(
-    client: Client, history, *, interrupted_conversation_db: str | None = None,
+    client: Client,
+    history,
+    *,
+    interrupted_conversation_db: str | None = None,
 ):
     scheduler_event = next(
         event.child_workflow_execution_completed_event_attributes
@@ -481,27 +586,36 @@ async def _freeze_implementation_for_recovery(
             event.event_id: event.activity_task_scheduled_event_attributes
             for event in candidate_history.events
             if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
-            and event.activity_task_scheduled_event_attributes.activity_type.name == "codex-stage"
+            and event.activity_task_scheduled_event_attributes.activity_type.name
+            == "codex-stage"
         }
         has_unresolved_codex = any(
             event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED
-            and event.activity_task_completed_event_attributes.scheduled_event_id in scheduled_codex
+            and event.activity_task_completed_event_attributes.scheduled_event_id
+            in scheduled_codex
             and (
-                (observation := converter.from_payloads(
-                    event.activity_task_completed_event_attributes.result.payloads,
-                    [CodexObservation],
-                )[0]).outcome is CodexOutcome.UNKNOWN
+                (
+                    observation := converter.from_payloads(
+                        event.activity_task_completed_event_attributes.result.payloads,
+                        [CodexObservation],
+                    )[0]
+                ).outcome
+                is CodexOutcome.UNKNOWN
                 or observation.readback_required
             )
             for event in candidate_history.events
         )
-        if any(
-            event.event_type in {
-                EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED,
-                EventType.EVENT_TYPE_ACTIVITY_TASK_TIMED_OUT,
-            }
-            for event in candidate_history.events
-        ) or has_unresolved_codex:
+        if (
+            any(
+                event.event_type
+                in {
+                    EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED,
+                    EventType.EVENT_TYPE_ACTIVITY_TASK_TIMED_OUT,
+                }
+                for event in candidate_history.events
+            )
+            or has_unresolved_codex
+        ):
             child = candidate_child
             child_history = candidate_history
             break
@@ -548,10 +662,19 @@ async def _freeze_implementation_for_recovery(
                                 rejected_sha = review.get("candidate_sha")
                     except (TypeError, ValueError, AttributeError):
                         pass
+            started_input = converter.from_payloads(
+                candidate_history.events[
+                    0
+                ].workflow_execution_started_event_attributes.input.payloads,
+                [RunInput],
+            )[0]
+            frozen = (
+                capture.candidate if capture is not None else started_input.candidate
+            )
             if (
-                capture is not None
+                frozen is not None
                 and rejected_sha
-                and capture.candidate.candidate_sha == rejected_sha
+                and frozen.candidate_sha == rejected_sha
             ):
                 child = candidate_child
                 child_history = candidate_history
@@ -560,7 +683,9 @@ async def _freeze_implementation_for_recovery(
         raise ValueError("candidate recovery requires a failed Codex child")
     converter = client.data_converter.payload_converter
     input = converter.from_payloads(
-        child_history.events[0].workflow_execution_started_event_attributes.input.payloads,
+        child_history.events[
+            0
+        ].workflow_execution_started_event_attributes.input.payloads,
         [RunInput],
     )[0]
     scheduled = {
@@ -592,8 +717,13 @@ async def _freeze_implementation_for_recovery(
             done = event.activity_task_completed_event_attributes
             activity_type = scheduled[done.scheduled_event_id].activity_type.name
             if activity_type == "codex-stage":
-                observed = converter.from_payloads(done.result.payloads, [CodexObservation])[0]
-                if observed.outcome is not CodexOutcome.COMPLETED or observed.readback_required:
+                observed = converter.from_payloads(
+                    done.result.payloads, [CodexObservation]
+                )[0]
+                if (
+                    observed.outcome is not CodexOutcome.COMPLETED
+                    or observed.readback_required
+                ):
                     unresolved_external = True
                     continue
                 if observed.role.value == "implementation":
@@ -625,17 +755,20 @@ async def _freeze_implementation_for_recovery(
         == "capture-codex-candidate"
     )
     dirty_capture_failure = (
-        capture_failure and failures[0].failure.message == "candidate workspace is dirty"
+        capture_failure
+        and failures[0].failure.message == "candidate workspace is dirty"
     )
     scope_capture_failure = (
         capture_failure
-        and failures[0].failure.message == "candidate changes exceed the authorized scope"
+        and failures[0].failure.message
+        == "candidate changes exceed the authorized scope"
         and implementation is not None
         and implementation_capture is None
     )
     rejected_review_capture_failure = (
         capture_failure
-        and failures[0].failure.message in {
+        and failures[0].failure.message
+        in {
             "Activity task failed",
             "review approval evidence is missing or does not match candidate SHA",
         }
@@ -651,22 +784,31 @@ async def _freeze_implementation_for_recovery(
     )
     pre_frozen_review_failure = (
         pre_frozen_candidate is not None
-        and capture_failure
+        and (capture_failure or (not failures and not timeouts))
         and review_rejected
         and implementation_capture is None
+        and review_candidate_sha == pre_frozen_candidate.candidate_sha
     )
     interrupted_operation = None
     interrupted_ids = None
     if pre_frozen_candidate and not failures and len(timeouts) == 1:
         timed_out = scheduled[timeouts[0].scheduled_event_id]
-        operation = converter.from_payloads(timed_out.input.payloads, [CodexOperation])[0]
+        operation = converter.from_payloads(timed_out.input.payloads, [CodexOperation])[
+            0
+        ]
         pre_frozen_recovery = operation.role.value == "planning"
-    if pre_frozen_candidate and interrupted_conversation_db and not failures and not timeouts:
+    if (
+        pre_frozen_candidate
+        and interrupted_conversation_db
+        and not failures
+        and not timeouts
+    ):
         scheduled_codex = {
             event.event_id: event.activity_task_scheduled_event_attributes
             for event in child_history.events
             if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
-            and event.activity_task_scheduled_event_attributes.activity_type.name == "codex-stage"
+            and event.activity_task_scheduled_event_attributes.activity_type.name
+            == "codex-stage"
         }
         for event in child_history.events:
             if event.event_type != EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED:
@@ -680,19 +822,32 @@ async def _freeze_implementation_for_recovery(
                 event.activity_task_completed_event_attributes.result.payloads,
                 [CodexObservation],
             )[0]
-            if observed.outcome is not CodexOutcome.UNKNOWN and not observed.readback_required:
+            if (
+                observed.outcome is not CodexOutcome.UNKNOWN
+                and not observed.readback_required
+            ):
                 continue
-            operation = converter.from_payloads(scheduled_event.input.payloads, [CodexOperation])[0]
+            operation = converter.from_payloads(
+                scheduled_event.input.payloads, [CodexOperation]
+            )[0]
             if operation.model != "gpt-5-codex":
                 continue
             fingerprint = hashlib.sha256(
                 json.dumps(asdict(operation), sort_keys=True).encode()
             ).hexdigest()
-            with sqlite3.connect(Path(interrupted_conversation_db).resolve().as_uri() + "?mode=ro", uri=True) as connection:
+            with sqlite3.connect(
+                Path(interrupted_conversation_db).resolve().as_uri() + "?mode=ro",
+                uri=True,
+            ) as connection:
                 row = connection.execute(
                     "SELECT thread_id,turn_id,fingerprint FROM codex_operation_ledger "
                     "WHERE namespace=? AND workflow_id=? AND workflow_run_id=? AND operation_id=?",
-                    (operation.namespace, operation.run_id, operation.workflow_run_id, operation.operation_id),
+                    (
+                        operation.namespace,
+                        operation.run_id,
+                        operation.workflow_run_id,
+                        operation.operation_id,
+                    ),
                 ).fetchone()
             if row is None or row[2] != fingerprint or not all(row[:2]):
                 continue
@@ -709,7 +864,9 @@ async def _freeze_implementation_for_recovery(
     if interrupted_conversation_db and len(timeouts) == 1 and not failures:
         timed_out = scheduled[timeouts[0].scheduled_event_id]
         if timed_out.activity_type.name == "codex-stage":
-            operation = converter.from_payloads(timed_out.input.payloads, [CodexOperation])[0]
+            operation = converter.from_payloads(
+                timed_out.input.payloads, [CodexOperation]
+            )[0]
             if (
                 operation.role.value == "implementation"
                 and operation.run_id == child.workflow_execution.workflow_id
@@ -718,10 +875,14 @@ async def _freeze_implementation_for_recovery(
                 and input.candidate is not None
                 and operation.repository == input.candidate.workspace
             ):
-                interrupted_ids = await _read_interrupted_operation(operation, interrupted_conversation_db)
+                interrupted_ids = await _read_interrupted_operation(
+                    operation, interrupted_conversation_db
+                )
                 interrupted_operation = operation
     if unresolved_external and not known_model_failure_recovery:
-        raise ValueError("candidate recovery refuses unresolved external Codex outcomes")
+        raise ValueError(
+            "candidate recovery refuses unresolved external Codex outcomes"
+        )
     if not (
         dirty_capture_failure
         or scope_capture_failure
@@ -736,35 +897,51 @@ async def _freeze_implementation_for_recovery(
             "candidate recovery requires a verified frozen candidate or capture failure"
         )
     if input.candidate is None:
-        raise ValueError("candidate recovery has no completed implementation and candidate identity")
+        raise ValueError(
+            "candidate recovery has no completed implementation and candidate identity"
+        )
     if pre_frozen_recovery and implementation is None and interrupted_operation is None:
-        result = await capture_codex_candidate(CandidateCaptureInput(
-            candidate=pre_frozen_candidate,
-            operation_id=f"{child.workflow_execution.workflow_id}:pre-frozen-candidate",
-        ))
+        result = await capture_codex_candidate(
+            CandidateCaptureInput(
+                candidate=pre_frozen_candidate,
+                operation_id=f"{child.workflow_execution.workflow_id}:pre-frozen-candidate",
+            )
+        )
         return result.candidate, (
             result.candidate.candidate_sha != result.candidate.base_sha
         )
     if pre_frozen_review_failure:
-        result = await capture_codex_candidate(CandidateCaptureInput(
-            candidate=pre_frozen_candidate,
-            operation_id=f"{child.workflow_execution.workflow_id}:rejected-review-recovery",
-        ))
+        result = await capture_codex_candidate(
+            CandidateCaptureInput(
+                candidate=pre_frozen_candidate,
+                operation_id=f"{child.workflow_execution.workflow_id}:rejected-review-recovery",
+            )
+        )
         return result.candidate, False
     if completed_rejected_review:
         return implementation_capture.candidate, False
     if known_model_failure_recovery:
         return pre_frozen_candidate, False
-    stage = next(stage for stage in input.stages if stage.role.value == "implementation")
-    result = await capture_codex_candidate(CandidateCaptureInput(
-        candidate=input.candidate,
-        operation_id=(interrupted_operation or implementation).operation_id,
-        thread_id=interrupted_ids[0] if interrupted_ids else implementation.thread_id or "",
-        turn_id=interrupted_ids[1] if interrupted_ids else implementation.turn_id or "",
-        allowed_scope=stage.allowed_scope,
-    ))
+    stage = next(
+        stage for stage in input.stages if stage.role.value == "implementation"
+    )
+    result = await capture_codex_candidate(
+        CandidateCaptureInput(
+            candidate=input.candidate,
+            operation_id=(interrupted_operation or implementation).operation_id,
+            thread_id=interrupted_ids[0]
+            if interrupted_ids
+            else implementation.thread_id or "",
+            turn_id=interrupted_ids[1]
+            if interrupted_ids
+            else implementation.turn_id or "",
+            allowed_scope=stage.allowed_scope,
+        )
+    )
     return replace(input.candidate, candidate_sha=result.candidate.candidate_sha), (
-        dirty_capture_failure or scope_capture_failure or interrupted_operation is not None
+        dirty_capture_failure
+        or scope_capture_failure
+        or interrupted_operation is not None
     )
 
 
@@ -782,7 +959,9 @@ async def recover_failed_requirement(
     try:
         int(expected_input_identity, 16)
     except ValueError as error:
-        raise ValueError("expected input identity must be a SHA-256 hex digest") from error
+        raise ValueError(
+            "expected input identity must be a SHA-256 hex digest"
+        ) from error
     handle = client.get_workflow_handle(workflow_id)
     description = (await handle.describe()).raw_description
     info = description.workflow_execution_info
@@ -808,9 +987,12 @@ async def recover_failed_requirement(
             started.input.payloads, [WholeFlowInput]
         )[0]
         if payload.entry_input_identity != expected_input_identity:
-            raise ValueError("failed execution input identity differs from recovery evidence")
+            raise ValueError(
+                "failed execution input identity differs from recovery evidence"
+            )
         reset_point = _ticket_child_reset_point(
-            history, client.data_converter.payload_converter,
+            history,
+            client.data_converter.payload_converter,
             allow_frozen_candidate=freeze_candidate,
         )
         replay_history = history
@@ -829,16 +1011,16 @@ async def recover_failed_requirement(
             result = client.data_converter.payload_converter.from_payloads(
                 completed.result.payloads, [WholeFlowResult]
             )[0]
-            if (
-                result.phase is not WholeFlowPhase.FAILED
-                or result.reason != "ticket scheduling did not complete"
-            ):
-                raise ValueError(
-                    "completed execution is not the verified ticket scheduling failure"
-                )
+            _validate_completed_ticket_failure(
+                result,
+                history,
+                client.data_converter.payload_converter,
+            )
             replay_history = type(history)(
                 workflow_id=history.workflow_id,
-                events=[event for event in history.events if event.event_id <= reset_point]
+                events=[
+                    event for event in history.events if event.event_id <= reset_point
+                ],
             )
         workflows = [
             RequirementDeliveryWorkflow,
@@ -850,8 +1032,13 @@ async def recover_failed_requirement(
         ]
         await Replayer(workflows=workflows).replay_workflow(replay_history)
         if freeze_candidate:
-            recovered_candidate, recovery_review_only = await _freeze_implementation_for_recovery(
-                client, history, interrupted_conversation_db=interrupted_conversation_db,
+            (
+                recovered_candidate,
+                recovery_review_only,
+            ) = await _freeze_implementation_for_recovery(
+                client,
+                history,
+                interrupted_conversation_db=interrupted_conversation_db,
             )
         reset = await client.workflow_service.reset_workflow_execution(
             ResetWorkflowExecutionRequest(
@@ -886,7 +1073,9 @@ async def recover_failed_requirement(
             started.input.payloads, [WholeFlowInput]
         )[0]
         if payload.entry_input_identity != expected_input_identity:
-            raise ValueError("active execution input identity differs from recovery evidence")
+            raise ValueError(
+                "active execution input identity differs from recovery evidence"
+            )
     else:
         raise ValueError(
             f"delivery execution is {info.status}; expected the source failure or its active reset run"
@@ -905,7 +1094,8 @@ async def recover_failed_requirement(
             ).raw_description
             child_info = child_description.workflow_execution_info
             if (
-                child_info.status == WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_RUNNING
+                child_info.status
+                == WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_RUNNING
                 and child_info.type.name == "TicketSchedulerWorkflow"
                 and child_info.parent_execution.workflow_id == workflow_id
                 and child_info.parent_execution.run_id == run_id
@@ -927,9 +1117,8 @@ async def recover_failed_requirement(
         await handle.signal("recover_ticket_execution", operation_id)
     else:
         await handle.signal(
-            "recover_ticket_execution", args=[
-                operation_id, recovered_candidate, recovery_review_only
-            ]
+            "recover_ticket_execution",
+            args=[operation_id, recovered_candidate, recovery_review_only],
         )
     return {
         "workflow_id": workflow_id,
@@ -944,7 +1133,9 @@ async def recover_failed_requirement(
         "next_action": snapshot.next_action,
         "recovery_signal_sent": True,
         "recovery_operation_id": operation_id,
-        "frozen_candidate": asdict(recovered_candidate) if recovered_candidate else None,
+        "frozen_candidate": asdict(recovered_candidate)
+        if recovered_candidate
+        else None,
         "recovery_review_only": recovery_review_only,
     }
 
@@ -960,25 +1151,41 @@ async def diagnose_details(client: Client, run_id: str) -> dict:
             child.workflow_id, run_id=child.run_id
         )
         description = (await child_handle.describe()).raw_description
-        planning = (await child_handle.query("get_planning_status")
-                    if description.workflow_execution_info.type.name == "RequirementPlanningWorkflow"
-                    else None)
-        scheduler = (await child_handle.query("get_scheduler_status")
-                     if description.workflow_execution_info.type.name == "TicketSchedulerWorkflow"
-                     else None)
-        result["pending_children"].append({
-            "workflow_id": child.workflow_id, "run_id": child.run_id,
-            "planning": planning,
-            "scheduler": scheduler,
-            "pending_activities": [{
-                "activity_id": item.activity_id, "type": item.activity_type.name,
-                "attempt": item.attempt, "state": item.state,
-                "maximum_attempts": item.maximum_attempts,
-                "last_started_time": str(item.last_started_time.ToDatetime()),
-                "next_attempt_schedule_time": str(item.next_attempt_schedule_time.ToDatetime()),
-                "start_to_close_timeout_seconds": item.activity_options.start_to_close_timeout.ToTimedelta().total_seconds(),
-            } for item in description.pending_activities],
-        })
+        planning = (
+            await child_handle.query("get_planning_status")
+            if description.workflow_execution_info.type.name
+            == "RequirementPlanningWorkflow"
+            else None
+        )
+        scheduler = (
+            await child_handle.query("get_scheduler_status")
+            if description.workflow_execution_info.type.name
+            == "TicketSchedulerWorkflow"
+            else None
+        )
+        result["pending_children"].append(
+            {
+                "workflow_id": child.workflow_id,
+                "run_id": child.run_id,
+                "planning": planning,
+                "scheduler": scheduler,
+                "pending_activities": [
+                    {
+                        "activity_id": item.activity_id,
+                        "type": item.activity_type.name,
+                        "attempt": item.attempt,
+                        "state": item.state,
+                        "maximum_attempts": item.maximum_attempts,
+                        "last_started_time": str(item.last_started_time.ToDatetime()),
+                        "next_attempt_schedule_time": str(
+                            item.next_attempt_schedule_time.ToDatetime()
+                        ),
+                        "start_to_close_timeout_seconds": item.activity_options.start_to_close_timeout.ToTimedelta().total_seconds(),
+                    }
+                    for item in description.pending_activities
+                ],
+            }
+        )
     return result
 
 
@@ -1006,13 +1213,17 @@ async def _run_command(args: argparse.Namespace) -> object:
     if args.command == "retry-publication":
         return await retry_spec_publication(client, args.run_id)
     if args.command == "extend-publication":
-        return await extend_spec_publication(client, args.run_id, args.publication_timeout_seconds)
+        return await extend_spec_publication(
+            client, args.run_id, args.publication_timeout_seconds
+        )
     if args.command == "resolve-publication":
         return await resolve_spec_publication(
             client, args.run_id, load_publication_result(args.publication_file)
         )
     if args.command == "answer":
-        return await answer_requirement(client, args.run_id, args.question_id, args.value)
+        return await answer_requirement(
+            client, args.run_id, args.question_id, args.value
+        )
     if args.details:
         return await diagnose_details(client, args.run_id)
     return await diagnose_requirement(client, args.run_id)
@@ -1057,18 +1268,31 @@ def main() -> None:
         parser.error("recover-failed requires --source-run-id")
     if args.command == "recover-failed" and not args.input_identity:
         parser.error("recover-failed requires --input-identity")
-    if args.interrupted_conversation_db and (args.command != "recover-failed" or not args.freeze_candidate):
-        parser.error("--interrupted-conversation-db requires recover-failed --freeze-candidate")
+    if args.interrupted_conversation_db and (
+        args.command != "recover-failed" or not args.freeze_candidate
+    ):
+        parser.error(
+            "--interrupted-conversation-db requires recover-failed --freeze-candidate"
+        )
     if args.command not in {"launch", "recover-failed"} and not args.run_id:
         parser.error(f"{args.command} requires --run-id")
     if args.command == "answer" and (not args.question_id or not args.value):
         parser.error("answer requires --question-id and --value")
     if args.command == "resolve-publication" and not args.publication_file:
         parser.error("resolve-publication requires --publication-file")
-    if args.command == "extend-publication" and args.publication_timeout_seconds is None:
+    if (
+        args.command == "extend-publication"
+        and args.publication_timeout_seconds is None
+    ):
         parser.error("extend-publication requires --publication-timeout-seconds")
     result = asyncio.run(_run_command(args))
-    print(json.dumps(asdict(result) if hasattr(result, "__dataclass_fields__") else result, default=str, sort_keys=True))
+    print(
+        json.dumps(
+            asdict(result) if hasattr(result, "__dataclass_fields__") else result,
+            default=str,
+            sort_keys=True,
+        )
+    )
 
 
 def load_publication_result(path: str) -> SpecPublicationResult:
@@ -1133,9 +1357,13 @@ def load_request(path: str) -> RequirementDeliveryRequest:
         ),
         confirmation_operation_id=planning_payload.get("confirmation_operation_id"),
         publication_operation_id=planning_payload.get("publication_operation_id"),
-        publication_timeout_seconds=planning_payload.get("publication_timeout_seconds", 300.0),
+        publication_timeout_seconds=planning_payload.get(
+            "publication_timeout_seconds", 300.0
+        ),
         publication_max_attempts=planning_payload.get("publication_max_attempts", 3),
-        publication_retry_backoff_seconds=planning_payload.get("publication_retry_backoff_seconds", 1.0),
+        publication_retry_backoff_seconds=planning_payload.get(
+            "publication_retry_backoff_seconds", 1.0
+        ),
     )
     scheduler_payload = plan_payload["scheduler"]
     scheduler = SchedulerInput(
@@ -1154,7 +1382,8 @@ def load_request(path: str) -> RequirementDeliveryRequest:
             for item in scheduler_payload["tickets"]
         ),
         completion_operations=tuple(
-            (item[0], item[1]) for item in scheduler_payload.get("completion_operations", ())
+            (item[0], item[1])
+            for item in scheduler_payload.get("completion_operations", ())
         ),
     )
     codex = tuple(SpecCodexPlan(**item) for item in plan_payload["codex"])

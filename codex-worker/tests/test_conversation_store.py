@@ -1,8 +1,31 @@
 from dataclasses import replace
 
 import pytest
-
 from temporalio_codex.conversation_store import ConversationEvent, ConversationStore
+
+
+@pytest.mark.parametrize("command,name", [
+    ('"C:\\' + 'very-long-directory\\' * 12 + 'pwsh.exe" -Command "git status"', "pwsh.exe"),
+    ("'/usr/local/bin/python' script.py", "python"),
+    ("git status --short", "git"),
+])
+def test_compact_command_name_survives_summary_truncation(tmp_path, command, name):
+    store = ConversationStore(tmp_path / "command-name.db")
+    try:
+        store.append(replace(
+            event(workflow_id="workflow", scope_workflow_id="workflow", operation_id="op", kind="tool_delta"),
+            text="command output",
+            detail={"command": command, "item_type": "commandExecution", "method": "item/completed", "exit_code": 0},
+        ))
+        turn = store.snapshot("workflow", include_timeline=True)["conversations"][0]["turns"][0]
+        activity = turn["messages"][0]["activity"]
+        assert activity["commandName"] == name
+        assert "detail" not in activity
+        assert activity["text"] == ""
+        full = store.snapshot("workflow", include_timeline=True, include_details=True)["conversations"][0]["turns"][0]
+        assert full["messages"][0]["activity"]["detail"]["command"] == command
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("final", [None, "**Result**\n\nFull answer\nwith details."])
@@ -425,6 +448,166 @@ def test_snapshot_keeps_multiple_turns_in_one_codex_thread(tmp_path) -> None:
         store.close()
 
 
+def test_thread_snapshot_preserves_prompt_activity_and_response_order(tmp_path) -> None:
+    store = ConversationStore(tmp_path / "timeline.db")
+    try:
+        base = {
+            "workflow_id": "workflow",
+            "scope_workflow_id": "workflow",
+            "workflow_run_id": "run-1",
+            "scope_workflow_run_id": "run-1",
+            "operation_id": "op-1",
+            "stage": "implementation",
+            "role": "implementation",
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+        }
+        store.append(ConversationEvent(**base, kind="user_input", text="prompt"))
+        store.append(
+            ConversationEvent(
+                **base,
+                kind="assistant_delta",
+                text="before ",
+                event_id="assistant-1",
+            )
+        )
+        store.append(
+            ConversationEvent(
+                **base,
+                kind="tool_delta",
+                text="read README.md",
+                detail={"method": "item/completed", "item_type": "commandExecution"},
+                event_id="tool-1",
+            )
+        )
+        store.append(
+            ConversationEvent(
+                **base,
+                kind="assistant_final",
+                text="after",
+                event_id="assistant-final",
+            )
+        )
+
+        full_turn = store.snapshot(
+            "workflow",
+            "run-1",
+            include_timeline=True,
+            include_details=True,
+        )["conversations"][0]["turns"][0]
+        assert [
+            (message["type"], message.get("text")) for message in full_turn["messages"]
+        ] == [
+            ("user", "prompt"),
+            ("assistant", "before "),
+            ("activity", None),
+            ("assistant", "after"),
+        ]
+        assert full_turn["messages"][2]["activity"]["id"] == "tool-1"
+
+        compact_turn = store.snapshot("workflow", "run-1", include_timeline=True)[
+            "conversations"
+        ][0]["turns"][0]
+        assert compact_turn["messages"][0]["text"] == ""
+        assert compact_turn["messages"][2]["activity"]["text"] == ""
+        assert full_turn["messages"][0]["text"] == "prompt"
+        assert full_turn["messages"][2]["activity"]["text"] == "read README.md"
+    finally:
+        store.close()
+
+
+def test_consecutive_reasoning_is_grouped_on_separate_lines(tmp_path) -> None:
+    store = ConversationStore(tmp_path / "reasoning-timeline.db")
+    base = {
+        "workflow_id": "workflow",
+        "scope_workflow_id": "workflow",
+        "workflow_run_id": "run-1",
+        "scope_workflow_run_id": "run-1",
+        "operation_id": "op-1",
+        "stage": "implementation",
+        "role": "implementation",
+        "thread_id": "thread-1",
+        "turn_id": "turn-1",
+    }
+    try:
+        store.append(
+            ConversationEvent(
+                **base,
+                kind="reasoning_delta",
+                text="Inspect the current state",
+                event_id="reasoning-1",
+            )
+        )
+        store.append(
+            ConversationEvent(
+                **base,
+                kind="reasoning_delta",
+                text="Then verify the result",
+                event_id="reasoning-2",
+            )
+        )
+
+        turn = store.snapshot(
+            "workflow", "run-1", include_timeline=True, include_details=True
+        )["conversations"][0]["turns"][0]
+        assert len(turn["activities"]) == 1
+        assert turn["activities"][0]["summary"] == (
+            "Inspect the current state\nThen verify the result"
+        )
+        assert turn["activities"][0]["text"] == (
+            "Inspect the current state\nThen verify the result"
+        )
+        assert turn["working"][0]["text"] == (
+            "Inspect the current state\nThen verify the result"
+        )
+        assert len(turn["messages"]) == 1
+    finally:
+        store.close()
+
+
+def test_thread_snapshot_cache_reuses_stable_execution_and_invalidates_on_append(
+    tmp_path,
+):
+    store = ConversationStore(tmp_path / "snapshot-cache.db")
+    try:
+        first_event = ConversationEvent(
+            workflow_id="workflow",
+            scope_workflow_id="workflow",
+            operation_id="op-1",
+            stage="implementation",
+            role="implementation",
+            thread_id="thread-1",
+            turn_id="turn-1",
+            kind="user_input",
+            text="prompt",
+            workflow_run_id="run-1",
+            scope_workflow_run_id="run-1",
+        )
+        store.append(first_event)
+
+        first = store.snapshot("workflow", "run-1", include_timeline=True)
+        assert store.snapshot("workflow", "run-1", include_timeline=True) is first
+
+        store.append(
+            replace(
+                first_event,
+                kind="assistant_final",
+                text="response",
+                event_id="response",
+            )
+        )
+        updated = store.snapshot("workflow", "run-1", include_timeline=True)
+
+        assert updated is not first
+        assert updated["cursor"] > first["cursor"]
+        assert (
+            updated["conversations"][0]["turns"][0]["messages"][-1]["text"]
+            == "response"
+        )
+    finally:
+        store.close()
+
+
 def test_snapshot_filters_workflow_execution_and_parent_execution(tmp_path) -> None:
     store = ConversationStore(tmp_path / "conversations.sqlite3")
     try:
@@ -608,8 +791,8 @@ def test_snapshot_exposes_readable_activity_summaries_and_preserves_details(tmp_
             {
                 "id": "event:1",
                 "category": "plan",
-                "summary": "inspect filesrun tests",
-                "text": "inspect filesrun tests",
+            "summary": "inspect files\nrun tests",
+            "text": "inspect files\nrun tests",
             },
             {
                 "id": "command-1",
@@ -627,8 +810,8 @@ def test_snapshot_exposes_readable_activity_summaries_and_preserves_details(tmp_
             },
         ]
         assert turn["working"] == [
-            {"kind": "plan", "text": "inspect filesrun tests"},
-            {"kind": "tool", "text": "uv run pytest tests/acceptanceSDK_PROBE_OK"},
+            {"kind": "plan", "text": "inspect files\nrun tests"},
+            {"kind": "tool", "text": "uv run pytest tests/acceptance\nSDK_PROBE_OK"},
         ]
     finally:
         store.close()

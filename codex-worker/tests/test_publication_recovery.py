@@ -57,7 +57,7 @@ async def test_parent_retry_accepts_live_blocked_planning_child(monkeypatch):
     import temporalio_codex.whole_flow_workflows as module
     external = SimpleNamespace(signal=AsyncMock())
     monkeypatch.setattr(module.workflow, "info", lambda: SimpleNamespace(workflow_id="delivery"))
-    monkeypatch.setattr(module.workflow, "get_external_workflow_handle", lambda _: external)
+    monkeypatch.setattr(module.workflow, "get_external_workflow_handle", lambda _, **kwargs: external)
     parent = RequirementDeliveryWorkflow()
     parent._active_child_id = "delivery:planning"
     parent._active_child_run_id = "child-run"

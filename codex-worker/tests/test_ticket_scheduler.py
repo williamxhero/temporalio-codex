@@ -1,12 +1,15 @@
 import asyncio
 
+from temporalio import workflow
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from temporalio_codex.activities import foundation_stage
+from temporalio_codex.delivery_models import CandidateEvidence
 from temporalio_codex.models import RunInput, StageDefinition
 from temporalio_codex.ticket_scheduler import (
     SchedulerInput,
+    SchedulerResult,
     SchedulerStatus,
     SpecPlan,
     TicketPlan,
@@ -35,6 +38,45 @@ def reverse_dependency_scheduler_input() -> SchedulerInput:
             TicketPlan("first-a", "first"),
         ),
     )
+
+
+@workflow.defn
+class SchedulerConfigurationParent:
+    @workflow.run
+    async def run(self) -> SchedulerResult:
+        workflow_id = workflow.info().workflow_id
+        run_id = workflow.info().run_id
+        handle = await workflow.start_child_workflow(
+            TicketSchedulerWorkflow.run,
+            SchedulerInput(
+                specs=(SpecPlan("first"),),
+                tickets=(
+                    TicketPlan("first-a", "first"),
+                    TicketPlan("first-b", "first", ("first-a",)),
+                ),
+            ),
+            id=f"{workflow_id}:tickets:first",
+            task_queue=workflow.info().task_queue,
+            result_type=SchedulerResult,
+        )
+        await handle.signal(
+            "configure_codex_runs",
+            tuple(
+                (
+                    ticket_key,
+                    RunInput(
+                        f"implement {ticket_key}",
+                        (StageDefinition(key="foundation"),),
+                        parent_workflow_id=workflow_id,
+                        parent_workflow_run_id=run_id,
+                        automatic=True,
+                        candidate=CandidateEvidence("repo", "workspace", "base", "base"),
+                    ),
+                )
+                for ticket_key in ("first-a", "first-b")
+            ),
+        )
+        return await handle
 
 
 async def wait_for_frontier(handle, frontier):
@@ -198,6 +240,29 @@ async def test_ready_ticket_runs_codex_and_completes_without_update() -> None:
                 task_queue="ticket-automatic-codex",
             )
             result = await handle.result()
+
+    assert result.status is SchedulerStatus.COMPLETED
+    assert result.completed_tickets == ("first-a", "first-b")
+    assert len(result.codex_results) == 2
+
+
+async def test_legacy_scheduler_can_be_configured_by_parent_and_run_dependent_tickets() -> None:
+    async with await WorkflowEnvironment.start_time_skipping() as environment:
+        async with Worker(
+            environment.client,
+            task_queue="ticket-parent-configure",
+            workflows=[
+                SchedulerConfigurationParent,
+                TicketSchedulerWorkflow,
+                CodexRunWorkflow,
+            ],
+            activities=[foundation_stage],
+        ):
+            result = await environment.client.execute_workflow(
+                SchedulerConfigurationParent.run,
+                id="ticket-parent-configure",
+                task_queue="ticket-parent-configure",
+            )
 
     assert result.status is SchedulerStatus.COMPLETED
     assert result.completed_tickets == ("first-a", "first-b")

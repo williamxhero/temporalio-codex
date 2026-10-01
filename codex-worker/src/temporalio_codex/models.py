@@ -49,6 +49,7 @@ class RunInput:
     automatic: bool = False
     automatic_input_max_attempts: int = 1
     candidate: CandidateEvidence | None = None
+    operation_prefix: str = ""
 
 
 @dataclass(frozen=True)

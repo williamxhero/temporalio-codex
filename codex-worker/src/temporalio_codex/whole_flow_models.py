@@ -132,6 +132,9 @@ class WholeFlowInput:
     entry_contract_version: str | None = None
     entry_launch_key: str | None = None
     entry_input_identity: str | None = None
+    execution_layout: str = "legacy"
+    published_planning: dict | None = None
+    defer_summary: bool = False
 
 
 @dataclass(frozen=True)
@@ -186,6 +189,10 @@ def topological_spec_keys(input: SchedulerInput) -> tuple[str, ...]:
 
 def validate_whole_flow_input(input: WholeFlowInput) -> tuple[str, ...]:
     errors = list(validate_scheduler_graph(input.scheduler))
+    if input.execution_layout not in ("legacy", "spec", "project"):
+        errors.append("unknown execution layout")
+    if input.execution_layout == "spec" and len(input.scheduler.specs) != 1:
+        errors.append("SPEC execution requires exactly one SPEC")
     if any(
         not math.isfinite(plan.start_to_close_timeout_seconds)
         or plan.start_to_close_timeout_seconds <= 0

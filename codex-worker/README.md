@@ -1,5 +1,24 @@
 # Temporal Codex Worker
 
+The delivery entrypoint now creates one `SpecExecutionWorkflow` for a single
+SPEC. Ticket execution, Codex turns and delivery stages run inside that Workflow.
+Every SPEC execution uses its GitHub Issue number in the Workflow ID, for
+example `stock_advisor:#325`. The project name comes from the Codex project
+directory, and ticket Issues remain part of their SPEC Workflow.
+Repeated launches adopt the recorded execution, including historical IDs.
+See [SPEC execution repair](docs/spec-workflow-repair.md) for compatibility and
+verification rules.
+
+The default conversation database is the absolute worker package path
+`.tmp/codex-conversations.sqlite3`, independent of the shell working directory.
+Set `--conversation-db` or `TEMPORALIO_CODEX_CONVERSATION_DB` explicitly for an
+installed package or another deployment. Import a historical database and link
+recorded descendants without resetting executions:
+
+```text
+uv run python scripts/repair-conversation-history.py --database .tmp/codex-conversations.sqlite3 --source ../.tmp/issue81-live-conversations.sqlite3
+```
+
 Install the development environment with `uv sync --extra dev` and run the
 foundation tests with `uv run pytest`.
 
@@ -7,6 +26,10 @@ The package contains the external Temporal Worker workflow and Activity seam.
 For a source checkout, start a local Server with `temporal server start-dev`,
 then start the Worker with `uv run temporalio-codex-worker`. Submit a run from
 another terminal with `uv run temporalio-codex-run --requirement "..."`.
+
+Set `TEMPORALIO_CODEX_DEFAULT_MODEL` explicitly when the worker's provider
+requires a replacement for the historical `gpt-5-codex` model. Unset values
+and other explicit model names pass through unchanged.
 
 To use an installed artifact, build a wheel with `uv build --wheel`, install
 that wheel into a clean environment, and run the same `temporalio-codex-worker`
@@ -111,3 +134,21 @@ timeout; changing worker source cannot update that scheduled command.
 `retry-publication` is for publication awaiting readback. Check existing GitHub
 operation identities first; retries adopt existing issues. Never start a new
 top-level run to recover a partially published plan.
+
+For a failed requirement delivery whose history replays with the current
+workflow definitions, `recover-failed` verifies the source run and persisted
+input identity, then uses Temporal `ResetWorkflowExecution` at the last
+completed workflow task before the failed child was started. Supply the
+existing Workflow ID, source run ID, and input identity from durable evidence:
+
+```text
+uv run temporalio-codex-delivery recover-failed \
+  --run-id <workflow-id> \
+  --source-run-id <failed-run-id> \
+  --input-identity <persisted-input-identity>
+```
+
+The command rejects non-failed source executions, mismatched inputs, and active
+runs that are not Temporal resets of the specified source run. A successful
+reset receipt is not delivery completion; continue checking status and the
+workflow's implementation, acceptance, review, and delivery evidence.

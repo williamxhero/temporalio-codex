@@ -50,6 +50,7 @@
 codex-worker/.pytest_cache/
 codex-worker/**/__pycache__/
 codex-worker/src/*.egg-info/
+codex-worker/build/
 
 # Ignoring AI agent files
 .agents/

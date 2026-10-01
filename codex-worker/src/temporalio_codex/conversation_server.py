@@ -82,6 +82,8 @@ class ConversationServer:
             workflow_id = params.get("workflow_id", [""])[0].strip()
             workflow_run_id = params.get("run_id", [""])[0].strip() or None
             namespace = params.get("namespace", [""])[0].strip()
+            view = params.get("view", [""])[0].strip()
+            include_details = params.get("details", [""])[0].strip() == "1"
             if parsed.path in {
                 "/api/v1/codex/conversations",
                 "/api/v1/codex/stream",
@@ -102,11 +104,21 @@ class ConversationServer:
                 await self._write_json(
                     writer,
                     self.store.snapshot(
-                        workflow_id, workflow_run_id, namespace=namespace
+                        workflow_id,
+                        workflow_run_id,
+                        namespace=namespace,
+                        include_timeline=view == "thread",
+                        include_details=include_details,
                     ),
                 )
             elif parsed.path == "/api/v1/codex/stream":
-                await self._stream(writer, workflow_id, workflow_run_id, namespace)
+                await self._stream(
+                    writer,
+                    workflow_id,
+                    workflow_run_id,
+                    namespace,
+                    include_timeline=view == "thread",
+                )
             else:
                 await self._write_response(writer, 404, b"not found", "text/plain")
         except (ConnectionError, asyncio.IncompleteReadError):
@@ -131,9 +143,14 @@ class ConversationServer:
         workflow_id: str,
         workflow_run_id: str | None,
         namespace: str,
+        *,
+        include_timeline: bool = False,
     ) -> None:
         snapshot = self.store.snapshot(
-            workflow_id, workflow_run_id, namespace=namespace
+            workflow_id,
+            workflow_run_id,
+            namespace=namespace,
+            include_timeline=include_timeline,
         )
         writer.write(
             (
@@ -156,7 +173,10 @@ class ConversationServer:
             await asyncio.sleep(0.5)
             try:
                 snapshot = self.store.snapshot(
-                    workflow_id, workflow_run_id, namespace=namespace
+                    workflow_id,
+                    workflow_run_id,
+                    namespace=namespace,
+                    include_timeline=include_timeline,
                 )
             except (sqlite3.Error, OSError):
                 writer.write(b'event: unavailable\ndata: {"status":"unavailable"}\n\n')

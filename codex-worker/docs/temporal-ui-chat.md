@@ -12,6 +12,15 @@ SSE snapshot also triggers reconciliation. Workflow status uses the existing
 Temporal UI `getQuery` decoder for `get_status`; ordinary workflows without that
 query retain the generic empty state.
 
+The initial reader subscribes to the execution-scoped SSE endpoint directly;
+the stream's first event supplies the snapshot, so the page does not wait for a
+separate history request before subscribing. `view=thread` returns messages and
+activity summaries in persisted event order, omitting prompt and raw activity
+payloads. Expanding a prompt or activity fetches `details=1` for the same
+namespace, Workflow ID, and Run ID. Conversation snapshots are cached by scope
+and database revision, so the stream's 500 ms change checks avoid rebuilding an
+unchanged history.
+
 ## Build and restart
 
 Temporal UI caches `index.html` at startup while serving assets from disk.
@@ -120,6 +129,102 @@ the exact execution URL, context summary, collapsed source/verification,
 explicit expansion, reload, zero horizontal overflow and zero page/asset
 errors checks. The local JSON report and screenshots above now contain this
 final readback. No new live SDK execution or external deployment was needed.
+
+## Fast thread reader deployment (2026-10-01)
+
+The reader now receives its initial conversation snapshot from the first SSE
+event. The backend caches snapshots by execution scope and database revision;
+the UI requests prompt and activity details only when expanded. Prompt, Codex
+messages, and activity summaries are returned in persisted event order.
+
+The versioned deployment script staged and served assets from
+`.tmp/temporal-ui-builds/20261001-104950-852`, preserving
+`.tmp/temporal.db`. No Workflow was running during the restart, and no new
+Workflow was started. Both Worker queues (`codex-worker` and
+`issue-81-live-probe`) now share `.tmp/issue81-live-conversations.sqlite3`,
+which is the database read by the UI's Conversation Server on port 18001.
+
+On the historical Issue 81 execution, the default thread response is about
+1.2 KB and omits the full prompt; `details=1` returns the deferred content.
+The response contains `user`, `assistant`, `activity`, then `assistant`
+messages. Focused Conversation Store and Server tests passed (37); Ruff passed.
+The production UI build and startup asset checks passed, and the deployed
+desktop page rendered the existing execution with the collapsed Prompt and
+Verification details and the inline activity timeline.
+
+## Timeline cleanup deployment (2026-10-01)
+
+The Chat timeline now groups adjacent activities with the same category into
+one entry, joining their summaries with newlines. Adjacent Reasoning and Command
+entries therefore read as one block. Command details and output remain hidden
+until expanded. When Temporal reports a terminal execution while the captured
+turn still says `running`, the UI labels the turn `Stopped` and suppresses its
+animated generating cursor.
+
+Command and Test remain separate timeline categories. Their summaries no longer
+print the command line or test output. Opening `Detail` shows each captured
+record as a `Command` block followed by its `Output` block, with multiple
+records kept in chronological order. Context, Command, and Test now use one
+compact row for the colored category, a short summary, and the `Detail` control.
+Context summaries omit the redundant `Read context:` prefix; command summaries
+remove the shell launcher and pass/fail suffix and are capped at 88 characters.
+Adjacent Test records use a green check-circle for passed results and a red
+cross-circle when any record fails. Other or in-progress results use a neutral
+clock marker. Agent responses that contain adjacent code-review JSON documents
+(`candidate_sha`, `findings`, and `verdict`) render as a compact findings table;
+duplicate findings appear once and the original JSON remains under `Detail`.
+Other JSON responses render as
+`{...}` with their raw content behind `Detail`. The timeline's vertical gaps and
+response line height are reduced for a denser thread view. Assistant replies are
+labeled `Agent` in the timeline.
+
+The versioned UI build was deployed to
+`.tmp/temporal-ui-builds/20261001-124614-661`, preserving the existing
+`.tmp/temporal.db` and conversation database. The historical Issue 81 snapshot
+still returns the completed turn and its 1,185-byte conversation payload.
+Conversation Store and Server tests passed (38), Ruff passed, desktop browser
+tests passed (8), and mobile browser tests passed (2) on an earlier build. The
+final Command/Test detail and compact summary checks passed on desktop and
+mobile (4 tests). Svelte check reported zero errors and 59 existing warnings.
+No new workflow was started.
+
+## JSON and compact timeline deployment (2026-10-01)
+
+The updated UI was rebuilt and served from
+`.tmp/temporal-ui-builds/20261001-132933-504` on port 18000 with the existing
+`.tmp/temporal.db`. The deployment script validated the staged HTML and all
+startup assets after restart. No workflow or conversation data was changed.
+The Agent title, compact spacing, JSON review summary, generic JSON detail
+collapse, and result-colored Test icons were covered by the desktop and mobile
+browser checks (20 passed on the deployed build). Expanded detail blocks occupy
+a full line. Prettier, ESLint
+(zero errors, two existing warnings), Stylelint, and Svelte check (zero errors,
+59 existing warnings) passed. `make lint-code-fast` remains unavailable because
+this Windows host has no `make` command.
+
+## Command and Context summary refinement (2026-10-01)
+
+Context entries use `Read <filename>` as their summary, with the full captured
+context available under `Detail`. Command and Test summaries show the executable
+basename, such as `pwsh.exe`, instead of the shell invocation or full command
+line. The category, short summary, and `Detail` control share one row. Compact
+timeline responses expose only the command basename; the full command and
+output remain available in the expanded detail response. Older events whose
+stored summary was already truncated can still show the executable name when
+the full command is present in persisted detail; records without that detail
+fall back to the short category label.
+
+The UI was rebuilt and deployed to
+`.tmp/temporal-ui-builds/20261001-135917-919` on port 18000 with the existing
+Temporal database. The UI endpoint returned 200, the Conversation API health
+check passed, and the historical Issue 81 thread still returned its completed
+four-message timeline. Four focused desktop and mobile browser tests passed;
+39 Conversation Store tests passed. The running Worker process was left intact.
+
+The current Conversation API readback also returns `commandName: pwsh.exe` for
+captured command and test records with full command details. The historical
+Requirement Delivery thread returned 10 activity messages, 9 with executable
+names; no Workflow was running during the final audit.
 
 ## Browser verification
 

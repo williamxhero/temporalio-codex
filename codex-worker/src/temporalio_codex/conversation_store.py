@@ -5,6 +5,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,6 +40,7 @@ class ConversationStore:
             check_same_thread=False,
         )
         self._connection.row_factory = sqlite3.Row
+        self._snapshots: OrderedDict[tuple, tuple[int, dict[str, Any]]] = OrderedDict()
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS codex_conversation_events (
@@ -129,7 +131,81 @@ class ConversationStore:
             self._connection.execute(
                 "ALTER TABLE codex_operation_ledger ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''"
             )
+        self._connection.execute(
+            "CREATE TABLE IF NOT EXISTS codex_execution_scopes (namespace TEXT NOT NULL,"
+            "scope_workflow_id TEXT NOT NULL,scope_run_id TEXT NOT NULL,workflow_id TEXT NOT NULL,run_id TEXT NOT NULL,"
+            "PRIMARY KEY(namespace,scope_workflow_id,scope_run_id,workflow_id,run_id))"
+        )
+        self._connection.execute(
+            "CREATE TABLE IF NOT EXISTS codex_history_imports (source_path TEXT NOT NULL,source_sequence INTEGER NOT NULL,"
+            "PRIMARY KEY(source_path,source_sequence))"
+        )
         self._connection.commit()
+
+    def link_execution(
+        self, scope_workflow_id: str, scope_run_id: str,
+        workflow_id: str, run_id: str, *, namespace: str = "default",
+    ) -> None:
+        if not all(value.strip() for value in (namespace, scope_workflow_id, scope_run_id, workflow_id, run_id)):
+            raise ValueError("execution scope requires exact namespace and run identities")
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO codex_execution_scopes VALUES (?,?,?,?,?)",
+                (namespace, scope_workflow_id, scope_run_id, workflow_id, run_id),
+            )
+
+    def import_history(self, source_path: str | Path) -> dict[str, int]:
+        source_path = Path(source_path).resolve(strict=True)
+        if source_path == self.path.resolve():
+            raise ValueError("cannot import the active conversation database into itself")
+        source = sqlite3.connect(source_path.as_uri() + "?mode=ro", uri=True)
+        source.row_factory = sqlite3.Row
+        try:
+            events = [dict(row) for row in source.execute("SELECT * FROM codex_conversation_events ORDER BY sequence")]
+            ledgers = [dict(row) for row in source.execute("SELECT * FROM codex_operation_ledger")]
+        finally:
+            source.close()
+        imported = {"events": 0, "operations": 0}
+        with self._lock, self._connection:
+            for ledger in ledgers:
+                key = tuple(ledger[column] for column in ("namespace", "workflow_id", "workflow_run_id", "operation_id"))
+                current = self._connection.execute(
+                    "SELECT * FROM codex_operation_ledger WHERE namespace=? AND workflow_id=? AND workflow_run_id=? AND operation_id=?", key,
+                ).fetchone()
+                if current is not None:
+                    for column in ("fingerprint", "thread_id", "turn_id", "observation_json"):
+                        if current[column] and ledger.get(column) and current[column] != ledger[column]:
+                            raise ValueError(f"conflicting operation ledger: {key}")
+                    self._connection.execute(
+                        "UPDATE codex_operation_ledger SET thread_id=COALESCE(thread_id,?),turn_id=COALESCE(turn_id,?),"
+                        "observation_json=COALESCE(observation_json,?),fingerprint=CASE WHEN fingerprint='' THEN ? ELSE fingerprint END "
+                        "WHERE namespace=? AND workflow_id=? AND workflow_run_id=? AND operation_id=?",
+                        (ledger["thread_id"], ledger["turn_id"], ledger["observation_json"], ledger.get("fingerprint", ""), *key),
+                    )
+                else:
+                    self._connection.execute(
+                        "INSERT INTO codex_operation_ledger VALUES (?,?,?,?,?,?,?,?)",
+                        (*key, ledger["thread_id"], ledger["turn_id"], ledger["observation_json"], ledger.get("fingerprint", "")),
+                    )
+                    imported["operations"] += 1
+            for event in events:
+                origin = (str(source_path), event["sequence"])
+                if self._connection.execute(
+                    "SELECT 1 FROM codex_history_imports WHERE source_path=? AND source_sequence=?", origin,
+                ).fetchone():
+                    continue
+                event.pop("sequence")
+                event.setdefault("namespace", "default")
+                for column in ("workflow_run_id", "scope_workflow_run_id", "event_id"):
+                    event.setdefault(column, None)
+                columns = tuple(event)
+                cursor = self._connection.execute(
+                    f"INSERT OR IGNORE INTO codex_conversation_events ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                    tuple(event.values()),
+                )
+                imported["events"] += cursor.rowcount
+                self._connection.execute("INSERT INTO codex_history_imports VALUES (?,?)", origin)
+        return imported
 
     def claim_operation(
         self, key: tuple[str, str, str, str], fingerprint: str = ""
@@ -215,8 +291,23 @@ class ConversationStore:
         workflow_run_id: str | None = None,
         *,
         namespace: str = "default",
+        include_timeline: bool = False,
+        include_details: bool = False,
     ) -> dict[str, Any]:
         with self._lock:
+            data_version = self._connection.execute("PRAGMA data_version").fetchone()[0]
+            revision = (data_version, self._connection.total_changes)
+            key = (
+                namespace,
+                workflow_id,
+                workflow_run_id,
+                include_timeline,
+                include_details,
+            )
+            cached = self._snapshots.get(key)
+            if cached is not None and cached[0] == revision:
+                self._snapshots.move_to_end(key)
+                return cached[1]
             rows = self._connection.execute(
                 """
                 SELECT sequence, namespace, workflow_id, operation_id, stage, role,
@@ -236,8 +327,14 @@ class ConversationStore:
                         ? IS NULL
                         OR scope_workflow_run_id = ?
                     )
+                ) OR EXISTS (
+                    SELECT 1 FROM codex_execution_scopes s
+                    WHERE s.namespace=codex_conversation_events.namespace
+                      AND s.scope_workflow_id=? AND (? IS NULL OR s.scope_run_id=?)
+                      AND s.workflow_id=codex_conversation_events.workflow_id
+                      AND s.run_id=codex_conversation_events.workflow_run_id
                 ))
-                ORDER BY sequence ASC
+                ORDER BY created_at ASC, sequence ASC
                 """,
                 (
                     namespace,
@@ -247,13 +344,25 @@ class ConversationStore:
                     workflow_id,
                     workflow_run_id,
                     workflow_run_id,
+                    workflow_id,
+                    workflow_run_id,
+                    workflow_run_id,
                 ),
             ).fetchall()
 
-        return {
-            "cursor": int(rows[-1]["sequence"]) if rows else 0,
-            "conversations": _build_conversations(rows),
-        }
+            snapshot = {
+                "cursor": max((int(row["sequence"]) for row in rows), default=0),
+                "conversations": _build_conversations(
+                    rows,
+                    include_timeline=include_timeline,
+                    include_details=include_details,
+                ),
+            }
+            self._snapshots[key] = (revision, snapshot)
+            self._snapshots.move_to_end(key)
+            while len(self._snapshots) > 16:
+                self._snapshots.popitem(last=False)
+            return snapshot
 
     def close(self) -> None:
         with self._lock:
@@ -264,7 +373,12 @@ class ConversationStore:
             self._connection.execute("SELECT 1").fetchone()
 
 
-def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+def _build_conversations(
+    rows: list[sqlite3.Row],
+    *,
+    include_timeline: bool = False,
+    include_details: bool = False,
+) -> list[dict[str, Any]]:
     conversations: dict[str, dict[str, Any]] = {}
     operation_groups: dict[tuple, str] = {}
     turns: dict[tuple, dict[str, Any]] = {}
@@ -324,6 +438,8 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
                 "status": "queued",
                 "updatedAt": row["created_at"],
             }
+            if include_timeline:
+                turn["messages"] = []
             turns[operation_key] = turn
             conversation["turns"].append(turn)
         if row["turn_id"]:
@@ -338,13 +454,19 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
             else:
                 turn["input"] = text
             turn["status"] = "running"
+            if include_timeline and text:
+                _append_message(turn, {"type": "user", "text": text}, row)
         elif kind == "assistant_delta":
             turn["output"] += text
             turn["status"] = "running"
+            if include_timeline and text:
+                _append_message(turn, {"type": "assistant", "text": text}, row)
         elif kind == "assistant_final":
             if text:
                 turn["output"] = text
                 final_turns.add(operation_key)
+                if include_timeline:
+                    _append_final_message(turn, text, row)
             turn["status"] = "completed"
         elif kind in {"reasoning_delta", "plan_delta", "tool_delta"} and text:
             working_kind = {
@@ -355,17 +477,28 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
             if not turn["working"] or turn["working"][-1]["kind"] != working_kind:
                 turn["working"].append({"kind": working_kind, "text": text})
             else:
-                turn["working"][-1]["text"] += text
-            _append_activity(
-                turn["activities"],
-                _activity_for_event(
-                    kind,
-                    text,
-                    _detail_from_row(row),
-                    event_id=row["event_id"],
-                    sequence=row["sequence"],
-                ),
+                turn["working"][-1]["text"] += f"\n{text}"
+            activity = _activity_for_event(
+                kind,
+                text,
+                _detail_from_row(row),
+                event_id=row["event_id"],
+                sequence=row["sequence"],
             )
+            stored_activity = _append_activity(
+                turn["activities"],
+                activity,
+            )
+            if include_timeline and not any(
+                message.get("activity") is stored_activity
+                for message in turn["messages"]
+                if message["type"] == "activity"
+            ):
+                _append_message(
+                    turn,
+                    {"type": "activity", "activity": stored_activity},
+                    row,
+                )
         elif kind == "turn_started":
             turn["status"] = "running"
         elif kind == "turn_completed":
@@ -375,16 +508,27 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
             if text and not turn["output"]:
                 turn["output"] = text
             if text:
-                _append_activity(
-                    turn["activities"],
-                    _activity_for_event(
-                        kind,
-                        text,
-                        _detail_from_row(row),
-                        event_id=row["event_id"],
-                        sequence=row["sequence"],
-                    ),
+                activity = _activity_for_event(
+                    kind,
+                    text,
+                    _detail_from_row(row),
+                    event_id=row["event_id"],
+                    sequence=row["sequence"],
                 )
+                stored_activity = _append_activity(
+                    turn["activities"],
+                    activity,
+                )
+                if include_timeline and not any(
+                    message.get("activity") is stored_activity
+                    for message in turn["messages"]
+                    if message["type"] == "activity"
+                ):
+                    _append_message(
+                        turn,
+                        {"type": "activity", "activity": stored_activity},
+                        row,
+                    )
         elif kind == "history_error":
             turn["status"] = "failed"
 
@@ -403,7 +547,68 @@ def _build_conversations(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
             turn["displayOutput"] = (
                 errors[-1]["summary"] if errors else _error_cause(turn["output"])
             )
+        if include_timeline and not include_details:
+            _compact_timeline_turn(turn)
     return list(conversations.values())
+
+
+def _append_message(
+    turn: dict[str, Any], message: dict[str, Any], row: sqlite3.Row
+) -> None:
+    messages = turn["messages"]
+    if (
+        messages
+        and message["type"] == "assistant"
+        and messages[-1]["type"] == "assistant"
+    ):
+        messages[-1]["text"] += message["text"]
+        return
+    message.update(
+        id=f"message:{row['sequence']}",
+        sequence=row["sequence"],
+        createdAt=row["created_at"],
+    )
+    messages.append(message)
+
+
+def _append_final_message(turn: dict[str, Any], text: str, row: sqlite3.Row) -> None:
+    messages = turn["messages"]
+    if (
+        messages
+        and messages[-1]["type"] == "assistant"
+        and messages[-1]["text"].strip() == text.strip()
+    ):
+        return
+    if messages and messages[-1]["type"] == "assistant":
+        messages[-1]["text"] = text
+    else:
+        _append_message(turn, {"type": "assistant", "text": text}, row)
+
+
+def _compact_timeline_turn(turn: dict[str, Any]) -> None:
+    """Keep the thread reader fast without changing the retained audit record."""
+    for message in turn["messages"]:
+        if message["type"] == "user":
+            message["text"] = ""
+        elif message["type"] == "assistant":
+            message["text"], _ = _display_output(message["text"])
+        if message["type"] == "activity":
+            activity = message["activity"]
+            detail = activity.get("detail")
+            command = detail.get("command") if isinstance(detail, dict) else None
+            command_name = _command_name(command) if isinstance(command, str) else ""
+            message["activity"] = {
+                "id": activity["id"],
+                "category": activity["category"],
+                "summary": activity["summary"],
+                "text": "",
+                "hasDetails": bool(activity["text"] or activity.get("detail")),
+                **({"commandName": command_name} if command_name else {}),
+            }
+    turn.pop("input", None)
+    turn.pop("output", None)
+    turn.pop("working", None)
+    turn.pop("activities", None)
 
 
 _TEST_COMMAND = re.compile(
@@ -495,7 +700,7 @@ def _activity_for_event(
 
 def _append_activity(
     activities: list[dict[str, Any]], activity: dict[str, Any]
-) -> None:
+) -> dict[str, Any]:
     detail = activity.get("detail")
     item_id = detail.get("item_id") if isinstance(detail, dict) else None
     method = detail.get("method", "") if isinstance(detail, dict) else ""
@@ -509,9 +714,9 @@ def _append_activity(
                 existing.update(
                     {key: value for key, value in activity.items() if key != "id"}
                 )
-                return
+                return existing
         activities.append(activity)
-        return
+        return activity
     if not item_id and activities and isinstance(detail, dict):
         previous = activities[-1]
         previous_detail = previous.get("detail", {})
@@ -526,7 +731,7 @@ def _append_activity(
             previous_method = previous_detail.get("method", "")
             if previous_method in _OUTPUT_DELTA_METHODS and method == previous_method:
                 previous["text"] += activity["text"]
-                return
+                return previous
             if (
                 previous_method in _OUTPUT_DELTA_METHODS
                 and method == "item/completed"
@@ -535,7 +740,7 @@ def _append_activity(
                 previous.update(
                     {key: value for key, value in activity.items() if key != "id"}
                 )
-                return
+                return previous
     if item_id:
         for existing in reversed(activities):
             existing_detail = existing.get("detail")
@@ -552,7 +757,7 @@ def _append_activity(
                     existing["summary"] = _activity_summary(
                         existing["text"].splitlines()[0]
                     )
-                return
+                return existing
     if (
         activities
         and activity["category"] in {"plan", "reasoning"}
@@ -563,8 +768,8 @@ def _append_activity(
             and activities[-1]["detail"].get("method") == "turn/plan/updated"
         )
     ):
-        activities[-1]["text"] += activity["text"]
-        activities[-1]["summary"] = _activity_summary(activities[-1]["text"])
+        activities[-1]["text"] += f"\n{activity['text']}"
+        activities[-1]["summary"] += f"\n{activity['summary']}"
         if "detail" in activity:
             previous_detail = activities[-1].get("detail")
             if previous_detail is None:
@@ -577,8 +782,9 @@ def _append_activity(
                 )
                 details.append(activity["detail"])
                 activities[-1]["detail"] = details
-        return
+        return activities[-1]
     activities.append(activity)
+    return activity
 
 
 def _is_command_completion(activity: dict[str, Any], detail: dict[str, Any]) -> bool:
@@ -696,6 +902,14 @@ def _command_text(detail: dict[str, Any], text: str) -> str:
     if isinstance(command, str) and command.strip():
         return command.strip()
     return next((line.strip() for line in text.splitlines() if line.strip()), "")
+
+
+def _command_name(command: str) -> str:
+    executable = re.match(r'''^(?:"([^"]+)"|'([^']+)'|(\S+))''', command.strip())
+    if executable is None:
+        return ""
+    value = next(part for part in executable.groups() if part is not None)
+    return value.replace("\\", "/").rsplit("/", 1)[-1]
 
 
 def _display_output(output: str) -> tuple[str, list[str]]:

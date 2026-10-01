@@ -16,6 +16,7 @@ class CandidateCaptureInput:
     operation_id: str = ""
     thread_id: str = ""
     turn_id: str = ""
+    allowed_scope: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,31 @@ async def capture_codex_candidate(
     )
     if Path(repo_common).resolve() != Path(work_common).resolve():
         raise GitCommandError("implemented candidate belongs to a different repository")
+    head = await adapter._git(workspace, "rev-parse", "HEAD^{commit}")
+    await adapter._git(
+        workspace, "merge-base", "--is-ancestor", input.candidate.base_sha, head
+    )
+    if input.allowed_scope and input.expected_sha is None and input.review_json is None:
+        changed = await adapter._git(
+            workspace, "ls-files", "--modified", "--others", "--exclude-standard", "-z"
+        )
+        staged = await adapter._git(workspace, "diff", "--cached", "--name-only", "-z")
+        paths = tuple(dict.fromkeys(
+            path for path in (*changed.split("\0"), *staged.split("\0")) if path
+        ))
+        roots = tuple(root.replace("\\", "/").rstrip("/") for root in input.allowed_scope)
+        if any(not root or root.startswith("/") or ".." in root.split("/")
+               or root == "read_only" for root in roots):
+            raise GitCommandError("candidate capture requires repository-relative write scope")
+        if any(not any(path == root or path.startswith(f"{root}/") for root in roots)
+               for path in paths):
+            raise GitCommandError("candidate changes exceed the authorized scope")
+        if paths:
+            await adapter._git(workspace, "add", "--", *paths)
+            await adapter._git(workspace, "diff", "--cached", "--check")
+            await adapter._git(
+                workspace, "commit", "-m", f"Implement candidate {input.operation_id}"
+            )
     sha = await adapter._git(workspace, "rev-parse", "HEAD^{commit}")
     await adapter._git(
         workspace, "merge-base", "--is-ancestor", input.candidate.base_sha, sha

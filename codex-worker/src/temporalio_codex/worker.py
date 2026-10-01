@@ -43,6 +43,10 @@ from temporalio_codex.spec_issue_adapter import GhCliSpecIssueGateway
 from temporalio_codex.ticket_issue_adapter import GhCliTicketIssueGateway
 from temporalio_codex.ticket_workflows import TicketSchedulerWorkflow
 from temporalio_codex.whole_flow_workflows import RequirementDeliveryWorkflow
+from temporalio_codex.spec_workflows import SpecExecutionWorkflow
+
+
+DEFAULT_CONVERSATION_DB = Path(__file__).resolve().parents[2] / ".tmp" / "codex-conversations.sqlite3"
 
 
 async def run_worker(
@@ -56,7 +60,7 @@ async def run_worker(
         conversation_db
         or os.environ.get(
             "TEMPORALIO_CODEX_CONVERSATION_DB",
-            str(Path(".tmp") / "codex-conversations.sqlite3"),
+            str(DEFAULT_CONVERSATION_DB),
         )
     )
     conversation_server = ConversationServer(store, port=conversation_port)
@@ -81,6 +85,7 @@ async def run_worker(
                 TicketSchedulerWorkflow,
                 DeliverySummaryWorkflow,
                 RequirementDeliveryWorkflow,
+                SpecExecutionWorkflow,
             ],
             activities=[
                 capture_codex_candidate,

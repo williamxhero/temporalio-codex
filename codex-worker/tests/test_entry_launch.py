@@ -1,5 +1,9 @@
+from dataclasses import replace
+
+import pytest
 from acceptance.test_whole_flow import whole_flow_input
 from temporalio import activity
+from temporalio.api.enums.v1 import EventType
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -17,6 +21,7 @@ from temporalio_codex.candidate_activities import (
     CandidateCaptureResult,
 )
 from temporalio_codex.codex_adapter import FakeCodexAdapter
+from temporalio_codex.codex_models import CodexRole
 from temporalio_codex.delivery_adapter import FakeDeliveryAdapter
 from temporalio_codex.delivery_models import ReviewEvidence
 from temporalio_codex.delivery_workflows import DeliveryWorkflow
@@ -31,7 +36,7 @@ from temporalio_codex.planning_activities import (
 )
 from temporalio_codex.planning_models import SourceOrigin
 from temporalio_codex.planning_workflows import RequirementPlanningWorkflow
-from temporalio_codex.spec_issue_adapter import FakeSpecIssueGateway
+from temporalio_codex.spec_issue_adapter import FakeSpecIssueGateway, SpecIssueRecord
 from temporalio_codex.summary_activities import (
     configure_summary_gateway,
     publish_delivery_summary,
@@ -42,6 +47,7 @@ from temporalio_codex.ticket_issue_adapter import FakeTicketIssueGateway
 from temporalio_codex.ticket_workflows import TicketSchedulerWorkflow
 from temporalio_codex.whole_flow_workflows import RequirementDeliveryWorkflow
 from temporalio_codex.workflows import CodexRunWorkflow
+from temporalio_codex.spec_workflows import SpecExecutionWorkflow
 
 
 @activity.defn(name="capture-codex-candidate")
@@ -55,8 +61,24 @@ async def capture_fake_candidate(input: CandidateCaptureInput) -> CandidateCaptu
     )
 
 
-def delivery_request() -> RequirementDeliveryRequest:
+def delivery_request(*, single_spec: bool = False) -> RequirementDeliveryRequest:
     plan = whole_flow_input()
+    if single_spec:
+        spec = plan.scheduler.specs[0]
+        plan = replace(
+            plan,
+            planning=replace(
+                plan.planning,
+                specs=(replace(plan.planning.specs[0], number=325),),
+            ),
+            scheduler=replace(
+                plan.scheduler,
+                specs=(spec,),
+                tickets=tuple(ticket for ticket in plan.scheduler.tickets if ticket.spec_key == spec.key),
+            ),
+            codex=(replace(plan.codex[0], repository="D:/WILL/temporalio-codex-proj"),),
+            deliveries=plan.deliveries[:1],
+        )
     source = RequirementSource(SourceOrigin.TEXT, text=plan.planning.source_text)
     return RequirementDeliveryRequest(
         source=source,
@@ -68,10 +90,30 @@ def delivery_request() -> RequirementDeliveryRequest:
     )
 
 
-async def test_public_launch_returns_durable_identity_and_adopts_retry() -> None:
-    configure_codex_adapter(FakeCodexAdapter({}))
+class ApprovedCodexAdapter(FakeCodexAdapter):
+    async def execute(self, operation):
+        observation = await super().execute(operation)
+        if operation.role is CodexRole.REVIEW:
+            return replace(observation, summary='{"verdict":"approved","findings":[]}')
+        return observation
+
+
+@pytest.mark.parametrize("single_spec", [False, True])
+async def test_public_launch_returns_durable_identity_and_adopts_retry(single_spec: bool) -> None:
+    configure_codex_adapter(ApprovedCodexAdapter({}))
     configure_delivery_adapters(FakeDeliveryAdapter(), FakeDeliveryAdapter())
-    configure_spec_issue_gateway(FakeSpecIssueGateway())
+    spec_gateway = FakeSpecIssueGateway(
+        issues={
+            "existing-spec-325": SpecIssueRecord(
+                number=325,
+                issue_id=1_000_000_325,
+                title="[SPEC foundation] Foundation acceptance",
+                operation_id="existing-spec-325",
+                parent_issue_number=43,
+            ),
+        } if single_spec else {},
+    )
+    configure_spec_issue_gateway(spec_gateway)
     configure_ticket_issue_gateway(FakeTicketIssueGateway())
     configure_summary_gateway(FakeSummaryCommentGateway())
     try:
@@ -81,6 +123,7 @@ async def test_public_launch_returns_durable_identity_and_adopts_retry() -> None
                 task_queue="entry-launch-test",
                 workflows=[
                     RequirementDeliveryWorkflow,
+                    SpecExecutionWorkflow,
                     RequirementPlanningWorkflow,
                     TicketSchedulerWorkflow,
                     CodexRunWorkflow,
@@ -100,17 +143,41 @@ async def test_public_launch_returns_durable_identity_and_adopts_retry() -> None
                     capture_fake_candidate,
                 ],
             ):
-                request = delivery_request()
+                request = delivery_request(single_spec=single_spec)
                 first = await launch_requirement(environment.client, request)
-                result = await environment.client.get_workflow_handle(first.run_id).result()
+                handle = environment.client.get_workflow_handle(first.run_id)
+                result = await handle.result()
+                history = await handle.fetch_history()
                 retry = await launch_requirement(environment.client, request)
 
         assert first.adopted is False
         assert retry.adopted is True
         assert retry.run_id == first.run_id
         assert retry.input_identity == request.input_identity
-        assert retry.status.completed_specs == ("foundation", "follow-up")
+        expected_specs = ("foundation",) if single_spec else ("foundation", "follow-up")
+        assert retry.status.completed_specs == expected_specs
         assert result["status"] == "completed"
+        if single_spec:
+            assert first.run_id == "temporalio-codex-proj:#325"
+            assert not any(
+                event.event_type == EventType.EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED
+                for event in history.events
+            )
+            assert tuple(spec_gateway.issues.values()) == (
+                spec_gateway.issues["existing-spec-325"],
+            )
+        else:
+            spec_children = [
+                event.start_child_workflow_execution_initiated_event_attributes
+                for event in history.events
+                if event.event_type == EventType.EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED
+                and event.start_child_workflow_execution_initiated_event_attributes.workflow_type.name
+                == "SpecExecutionWorkflow"
+            ]
+            assert len(spec_children) == len(expected_specs)
+            assert {child.workflow_id for child in spec_children} == {
+                "foundation:#100", "follow-up:#101",
+            }
     finally:
         configure_codex_adapter(None)
         configure_delivery_adapters(None, None)
@@ -120,7 +187,7 @@ async def test_public_launch_returns_durable_identity_and_adopts_retry() -> None
 
 
 async def test_public_launch_rejects_input_drift_for_same_launch_key() -> None:
-    configure_codex_adapter(FakeCodexAdapter({}))
+    configure_codex_adapter(ApprovedCodexAdapter({}))
     configure_delivery_adapters(FakeDeliveryAdapter(), FakeDeliveryAdapter())
     configure_spec_issue_gateway(FakeSpecIssueGateway())
     configure_ticket_issue_gateway(FakeTicketIssueGateway())
@@ -132,6 +199,7 @@ async def test_public_launch_rejects_input_drift_for_same_launch_key() -> None:
                 task_queue="entry-launch-test",
                 workflows=[
                     RequirementDeliveryWorkflow,
+                    SpecExecutionWorkflow,
                     RequirementPlanningWorkflow,
                     TicketSchedulerWorkflow,
                     CodexRunWorkflow,

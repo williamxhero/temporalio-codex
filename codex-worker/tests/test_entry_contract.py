@@ -43,7 +43,7 @@ def test_public_request_binds_source_identity_and_contract_version() -> None:
     assert value.contract_version == ENTRY_CONTRACT_VERSION
     assert value.execution_plan.planning.source_text == value.source.text
     assert value.input_identity
-    assert stable_run_id(value).startswith("requirement-delivery-")
+    assert stable_run_id(value) == "foundation:request:#43"
 
 
 def test_same_launch_key_has_stable_run_id_but_input_drift_has_new_identity() -> None:

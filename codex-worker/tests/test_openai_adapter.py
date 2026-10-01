@@ -40,6 +40,13 @@ def adapter_for(result):
     return OpenAICodexAdapter(lambda: codex, "0.155.1"), codex, thread
 
 
+def test_model_replacement_requires_explicit_worker_configuration(monkeypatch):
+    monkeypatch.delenv("TEMPORALIO_CODEX_DEFAULT_MODEL", raising=False)
+    assert OpenAICodexAdapter._model_for_operation("gpt-5-codex") == "gpt-5-codex"
+    monkeypatch.setenv("TEMPORALIO_CODEX_DEFAULT_MODEL", "gpt-6.1-sol")
+    assert OpenAICodexAdapter._model_for_operation("explicit-model") == "explicit-model"
+
+
 class StreamingTurn:
     id = "turn-stream"
 
@@ -51,7 +58,10 @@ class StreamingTurn:
             yield event
 
 
-async def test_production_adapter_maps_completed_turn_without_live_call() -> None:
+async def test_production_adapter_uses_configured_model_for_legacy_codex_alias(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TEMPORALIO_CODEX_DEFAULT_MODEL", "gpt-6.1-sol")
     result = SimpleNamespace(
         id="turn-1",
         status=SimpleNamespace(value="completed"),
@@ -67,7 +77,9 @@ async def test_production_adapter_maps_completed_turn_without_live_call() -> Non
     assert observation.turn_id == "turn-1"
     assert observation.summary == "plan complete"
     codex.thread_start.assert_awaited_once()
+    assert codex.thread_start.call_args.kwargs["model"] == "gpt-6.1-sol"
     thread.turn.assert_called_once()
+    assert thread.turn.call_args.kwargs["model"] == "gpt-6.1-sol"
 
 
 async def test_stream_deltas_are_persisted_as_one_conversation_turn(tmp_path) -> None:

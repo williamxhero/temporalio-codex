@@ -61,12 +61,14 @@ async def test_sse_updates_and_reconnect_with_exact_execution(tmp_path):
             reader, writer = await asyncio.open_connection(server.host, server.port)
             writers.append(writer)
             writer.write(
-                b"GET /api/v1/codex/stream?namespace=default&workflow_id=child&run_id=run HTTP/1.1\r\n\r\n"
+                b"GET /api/v1/codex/stream?namespace=default&workflow_id=child&run_id=run&view=thread HTTP/1.1\r\n\r\n"
             )
             await writer.drain()
             assert b"200 OK" in await reader.readuntil(b"\r\n\r\n")
             initial = await asyncio.wait_for(reader.readuntil(b"\n\n"), 2)
             if reconnect:
+                payload = json.loads(initial.split(b"data: ", 1)[1])
+                assert payload["conversations"][0]["turns"][0]["messages"]
                 assert b"answer" in initial
             else:
                 store.append(

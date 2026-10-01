@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 from datetime import timedelta
 
@@ -159,6 +160,34 @@ class CodexRunWorkflow:
                         and stage_result.outcome is StageOutcome.COMPLETED
                         and stage.role.value in ("implementation", "review")
                     ):
+                        if stage.role.value == "review" and workflow.patched("codex-review-verdict-gate"):
+                            try:
+                                review_proof = json.loads(stage_result.summary)
+                            except (TypeError, ValueError):
+                                review_proof = None
+                            if (
+                                not isinstance(review_proof, dict)
+                                or review_proof.get("verdict") != "approved"
+                            ):
+                                stage_result = replace(
+                                    stage_result,
+                                    outcome=StageOutcome.FAILED,
+                                    summary=(
+                                        "Independent review rejected candidate: "
+                                        f"{stage_result.summary}"
+                                    ),
+                                    failure="review_rejected",
+                                )
+                        if stage_result.outcome is not StageOutcome.COMPLETED:
+                            self._stage_results.append(stage_result)
+                            self._status = RunStatus.FAILED
+                            return RunResult(
+                                workflow_id=workflow.info().workflow_id,
+                                status=self._status,
+                                outcome=stage_result.outcome,
+                                stage=stage_result.stage,
+                                summary=stage_result.summary,
+                            )
                         captured = await workflow.execute_activity(
                             capture_codex_candidate,
                             CandidateCaptureInput(
@@ -172,6 +201,9 @@ class CodexRunWorkflow:
                                 operation_id=stage_result.operation_id or "",
                                 thread_id=stage_result.thread_id or "",
                                 turn_id=stage_result.turn_id or "",
+                                allowed_scope=stage.allowed_scope
+                                if stage.role.value == "implementation"
+                                else (),
                             ),
                             start_to_close_timeout=timedelta(seconds=30),
                             retry_policy=RetryPolicy(maximum_attempts=1),
@@ -299,7 +331,7 @@ class CodexRunWorkflow:
         answer: str | None,
     ) -> StageResult:
         assert stage.role is not None
-        operation_id = f"{workflow.info().workflow_id}:{stage.key}:{stage.role.value}"
+        operation_id = f"{workflow.info().workflow_id}:{input.operation_prefix}{stage.key}:{stage.role.value}"
         thread_id = stage.thread_id
         prompt = self._codex_prompt(input.requirement, stage, answer)
         if self._candidate and stage.role.value == "review":
@@ -467,6 +499,9 @@ class CodexRunWorkflow:
             self._status = RunStatus.CANCELLED
 
     async def _wait_if_paused(self) -> None:
+        checkpoint = workflow.get_signal_handler("component_checkpoint")
+        if checkpoint is not None:
+            await checkpoint()
         if self._status is not RunStatus.PAUSED:
             return
         await workflow.wait_condition(

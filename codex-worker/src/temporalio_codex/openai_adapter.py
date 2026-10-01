@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -101,7 +102,7 @@ class OpenAICodexAdapter:
                 approval_mode=self._approval_mode(operation.approval_policy),
                 cwd=operation.repository,
                 effort=ReasoningEffort(operation.effort),
-                model=operation.model,
+                model=self._model_for_operation(operation.model),
                 sandbox=self._sandbox(operation.allowed_scope),
                 output_schema=operation.output_schema,
             )
@@ -491,13 +492,13 @@ class OpenAICodexAdapter:
             return await codex.thread_resume(
                 operation.thread_id,
                 cwd=operation.repository,
-                model=operation.model,
+                model=self._model_for_operation(operation.model),
                 sandbox=self._sandbox(operation.allowed_scope),
             )
         return await codex.thread_start(
             approval_mode=self._approval_mode(operation.approval_policy),
             cwd=operation.repository,
-            model=operation.model,
+            model=self._model_for_operation(operation.model),
             sandbox=self._sandbox(operation.allowed_scope),
         )
 
@@ -508,6 +509,15 @@ class OpenAICodexAdapter:
         if policy == "auto_review":
             return ApprovalMode.auto_review
         raise ValueError(f"unsupported approval policy: {policy}")
+
+    @staticmethod
+    def _model_for_operation(model: str) -> str:
+        if model != "gpt-5-codex":
+            return model
+        return (
+            os.environ.get("TEMPORALIO_CODEX_DEFAULT_MODEL", model).strip()
+            or model
+        )
 
     @staticmethod
     def _sandbox(scope: tuple[str, ...]):

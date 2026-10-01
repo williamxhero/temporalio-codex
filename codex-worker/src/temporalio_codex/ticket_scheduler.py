@@ -36,6 +36,7 @@ class SchedulerInput:
     parent_workflow_id: str | None = None
     parent_workflow_run_id: str | None = None
     automatic: bool = False
+    inline_codex: bool = False
 
 
 @dataclass(frozen=True)

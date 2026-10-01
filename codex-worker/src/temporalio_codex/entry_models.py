@@ -92,6 +92,8 @@ class RequirementDeliveryRequest:
             if not normalized or normalized.startswith("/") or ".." in normalized.split("/"):
                 raise ValueError("artifact roots must be non-empty repository-relative paths")
         planning = self.execution_plan.planning
+        if self.execution_plan.published_planning is not None or self.execution_plan.defer_summary:
+            raise ValueError("publication readback and deferred summary are internal coordinator fields")
         if planning.origin is not self.source.origin:
             raise ValueError("execution plan source origin does not match request source")
         planning_value = planning.source_text or planning.source_reference or ""
@@ -100,6 +102,17 @@ class RequirementDeliveryRequest:
 
     @property
     def input_identity(self) -> str:
+        execution_plan = asdict(self.execution_plan)
+        for spec in execution_plan["planning"]["specs"]:
+            if spec.get("number") is None:
+                spec.pop("number", None)
+        if self.execution_plan.execution_layout == "legacy":
+            for key in ("execution_layout", "published_planning", "defer_summary"):
+                execution_plan.pop(key)
+            execution_plan["scheduler"].pop("inline_codex")
+            for _, run_input in execution_plan["scheduler"]["codex_runs"]:
+                if not run_input["operation_prefix"]:
+                    run_input.pop("operation_prefix")
         payload = {
             "contract_version": self.contract_version,
             "source_identity": self.source.identity,
@@ -109,7 +122,7 @@ class RequirementDeliveryRequest:
             "task_queue": self.task_queue,
             "launch_key": self.launch_key,
             "metadata": tuple(self.metadata),
-            "execution_plan": asdict(self.execution_plan),
+            "execution_plan": execution_plan,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

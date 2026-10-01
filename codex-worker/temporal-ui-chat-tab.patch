@@ -39,7 +39,7 @@ index 0000000..da581da
 +});
 diff --git a/src/lib/components/workflow/workflow-chat-message.svelte b/src/lib/components/workflow/workflow-chat-message.svelte
 new file mode 100644
-index 0000000..d779461
+index 0000000..8b34a75
 --- /dev/null
 +++ b/src/lib/components/workflow/workflow-chat-message.svelte
 @@ -0,0 +1,110 @@
@@ -66,7 +66,7 @@ index 0000000..d779461
 +
 +<style>
 +  .chat-markdown :global(p) {
-+    margin: 0 0 0.75rem;
++    margin: 0 0 0.375rem;
 +  }
 +
 +  .chat-markdown :global(p:last-child) {
@@ -76,7 +76,7 @@ index 0000000..d779461
 +  .chat-markdown :global(h1),
 +  .chat-markdown :global(h2),
 +  .chat-markdown :global(h3) {
-+    margin: 1rem 0 0.5rem;
++    margin: 0.5rem 0 0.25rem;
 +    font-weight: 600;
 +    line-height: 1.3;
 +  }
@@ -91,7 +91,7 @@ index 0000000..d779461
 +
 +  .chat-markdown :global(ul),
 +  .chat-markdown :global(ol) {
-+    margin: 0.75rem 0;
++    margin: 0.375rem 0;
 +    padding-left: 1.5rem;
 +  }
 +
@@ -104,11 +104,11 @@ index 0000000..d779461
 +  }
 +
 +  .chat-markdown :global(li) {
-+    margin: 0.25rem 0;
++    margin: 0.125rem 0;
 +  }
 +
 +  .chat-markdown :global(pre) {
-+    margin: 0.75rem 0;
++    margin: 0.375rem 0;
 +    overflow-x: auto;
 +    border: 1px solid var(--color-border-secondary);
 +    border-radius: 0.5rem;
@@ -135,7 +135,7 @@ index 0000000..d779461
 +  }
 +
 +  .chat-markdown :global(blockquote) {
-+    margin: 0.75rem 0;
++    margin: 0.375rem 0;
 +    border-left: 3px solid var(--color-border-brand);
 +    padding-left: 0.75rem;
 +  }
@@ -155,35 +155,43 @@ index 0000000..d779461
 +</style>
 diff --git a/src/lib/components/workflow/workflow-chat.svelte b/src/lib/components/workflow/workflow-chat.svelte
 new file mode 100644
-index 0000000..145235f
+index 0000000..2a97925
 --- /dev/null
 +++ b/src/lib/components/workflow/workflow-chat.svelte
-@@ -0,0 +1,509 @@
+@@ -0,0 +1,1055 @@
 +<script lang="ts">
 +  import { untrack } from 'svelte';
 +
 +  import { page } from '$app/state';
 +
++  import WorkflowChatMessage from '$lib/components/workflow/workflow-chat-message.svelte';
 +  import {
-+    IconCodex,
-+    IconSpinner,
-+    IconTerminal,
-+    IconFileImport,
 +    IconCheckCircle,
 +    IconClock,
++    IconCodex,
++    IconFileImport,
++    IconSpinner,
++    IconTerminal,
 +    IconWarning,
++    IconXmarkCircleSolid,
 +  } from '$lib/io/icon';
-+  import WorkflowChatMessage from '$lib/components/workflow/workflow-chat-message.svelte';
 +  import { getQuery } from '$lib/services/query-service';
++  import { workflowRun } from '$lib/stores/workflow-run';
 +
 +  type WorkingItem = { kind: string; text: string };
 +  type Activity = {
 +    id: string;
++    groupedIds?: string[];
 +    category: string;
 +    summary: string;
++    commandName?: string;
 +    text: string;
-+    detail?: Record<string, unknown>;
++    hasDetails?: boolean;
++    detail?: Record<string, unknown> | Record<string, unknown>[];
 +  };
++  type TimelineMessage =
++    | { type: 'user' | 'assistant'; text: string }
++    | { type: 'activity'; activity: Activity };
 +  type Turn = {
 +    id: string;
 +    turnId?: string;
@@ -192,6 +200,7 @@ index 0000000..145235f
 +    displayOutput?: string;
 +    verificationMarkers?: string[];
 +    activities?: Activity[];
++    messages?: TimelineMessage[];
 +    working?: WorkingItem[];
 +    status: 'queued' | 'running' | 'completed' | 'failed';
 +    updatedAt: number;
@@ -242,6 +251,69 @@ index 0000000..145235f
 +      text: item.text,
 +    }));
 +
++  const groupAdjacentActivities = (messages: TimelineMessage[]) => {
++    const grouped: TimelineMessage[] = [];
++    for (const message of messages) {
++      const previous = grouped.at(-1);
++      if (
++        message.type === 'activity' &&
++        previous?.type === 'activity' &&
++        previous.activity.category === message.activity.category
++      ) {
++        const groupedIds = [
++          ...(previous.activity.groupedIds ?? [previous.activity.id]),
++          ...(message.activity.groupedIds ?? [message.activity.id]),
++        ];
++        grouped[grouped.length - 1] = {
++          type: 'activity',
++          activity: {
++            ...previous.activity,
++            groupedIds,
++            summary: [previous.activity.summary, message.activity.summary]
++              .filter(Boolean)
++              .join('\n'),
++            commandName: [
++              previous.activity.commandName ?? previous.activity.summary,
++              message.activity.commandName ?? message.activity.summary,
++            ].join('\n'),
++            text: '',
++            hasDetails: Boolean(
++              previous.activity.hasDetails ||
++              previous.activity.text ||
++              previous.activity.detail ||
++              message.activity.hasDetails ||
++              message.activity.text ||
++              message.activity.detail,
++            ),
++          },
++        };
++      } else {
++        grouped.push(message);
++      }
++    }
++    return grouped;
++  };
++
++  const turnMessages = (turn: Turn): TimelineMessage[] => {
++    const messages = turn.messages?.length
++      ? turn.messages
++      : [
++          ...(turn.input ? [{ type: 'user' as const, text: turn.input }] : []),
++          ...turnActivities(turn)
++            .filter((activity) => activity.category !== 'verification')
++            .map((activity) => ({ type: 'activity' as const, activity })),
++          ...((turn.displayOutput ?? turn.output)
++            ? [
++                {
++                  type: 'assistant' as const,
++                  text: turn.displayOutput ?? turn.output,
++                },
++              ]
++            : []),
++        ];
++    return groupAdjacentActivities(messages);
++  };
++
 +  const activityIcon = (category: string) =>
 +    category === 'context' || category === 'file'
 +      ? IconFileImport
@@ -253,50 +325,304 @@ index 0000000..145235f
 +            ? IconWarning
 +            : IconClock;
 +
++  const testResult = (activity: Activity) => {
++    const results = activity.summary.split('\n').map((summary) => {
++      if (
++        /\bFailed\s*\(exit\s+-?\d+\)|\b[1-9]\d*\s+(?:failed|errors?)\b/i.test(
++          summary,
++        )
++      ) {
++        return 'failed';
++      }
++      if (/\bPassed\s*\(exit\s+0\)/i.test(summary)) return 'passed';
++      return 'unknown';
++    });
++    if (results.includes('failed')) return 'failed';
++    return results.length > 0 && results.every((result) => result === 'passed')
++      ? 'passed'
++      : 'unknown';
++  };
++
 +  const detailLabel = (category: string) =>
 +    category === 'context'
-+      ? 'Context source'
++      ? 'Detail'
 +      : category === 'error'
 +        ? 'Error details'
-+        : category === 'command' || category === 'test'
-+          ? 'Command output'
-+          : category === 'file'
-+            ? 'File details'
-+            : 'Recorded output';
++        : category === 'file'
++          ? 'File details'
++          : 'Recorded output';
 +
-+  const turnLabel = (status: Turn['status']) =>
-+    status === 'running'
-+      ? 'In progress'
-+      : status === 'failed'
-+        ? 'Failed'
-+        : status === 'queued'
-+          ? 'Queued'
-+          : 'Completed';
++  const isCompactActivity = (category: string) =>
++    category === 'context' || category === 'command' || category === 'test';
++
++  const activityCategoryColor = (category: string) =>
++    category === 'context'
++      ? 'text-information'
++      : category === 'command'
++        ? 'text-brand'
++        : category === 'test'
++          ? 'text-success'
++          : 'text-secondary';
++
++  const activityDetailRecords = (activity: Activity) =>
++    Array.isArray(activity.detail)
++      ? activity.detail
++      : activity.detail
++        ? [activity.detail]
++        : [];
++
++  const commandForActivity = (activity: Activity) =>
++    activityDetailRecords(activity).find(
++      (detail) =>
++        typeof detail.command === 'string' && detail.command.trim().length > 0,
++    )?.command ?? activity.summary;
++
++  const briefActivitySummary = (activity: Activity) => {
++    const lines = (
++      activity.category === 'context'
++        ? activity.summary
++        : (activity.commandName ?? activity.summary)
++    )
++      .split('\n')
++      .map((line) => {
++        if (activity.category === 'context') {
++          return line.replace(/^(?:Read context:|Read)\s*/i, '').trim();
++        }
++        const executable = line
++          .trim()
++          .match(/^(?:"([^"]+)"|'([^']+)'|([^\s]+))/);
++        const name =
++          (executable?.[1] ?? executable?.[2] ?? executable?.[3] ?? '')
++            .split(/[\\/]/)
++            .filter(Boolean)
++            .at(-1) ?? '';
++        if (/\.{3,}$/.test(name)) return 'Command';
++        return name.length > 24 ? `${name.slice(0, 21)}...` : name;
++      })
++      .filter(Boolean);
++    const unique = [...new Set(lines)];
++    if (activity.category === 'context') return `Read ${unique.join(', ')}`;
++    return (
++      unique.slice(0, 2).join(' · ') +
++      (unique.length > 2 ? ` (+${unique.length - 2})` : '')
++    );
++  };
++
++  const outputForActivity = (activity: Activity) =>
++    activityDetailRecords(activity).find(
++      (detail) =>
++        typeof detail.aggregated_output === 'string' &&
++        detail.aggregated_output.length > 0,
++    )?.aggregated_output ?? activity.text;
++
++  const jsonDocuments = (content: string): unknown[] | undefined => {
++    const trimmed = content.trim();
++    if (!trimmed) return undefined;
++    try {
++      return [JSON.parse(trimmed) as unknown];
++    } catch {
++      const documents: unknown[] = [];
++      let start = -1;
++      let depth = 0;
++      let inString = false;
++      let escaped = false;
++      for (let index = 0; index < trimmed.length; index += 1) {
++        const character = trimmed[index];
++        if (start < 0) {
++          if (/\s/.test(character)) continue;
++          if (character !== '{') return undefined;
++          start = index;
++          depth = 1;
++          continue;
++        }
++        if (inString) {
++          if (escaped) escaped = false;
++          else if (character === '\\') escaped = true;
++          else if (character === '"') inString = false;
++          continue;
++        }
++        if (character === '"') inString = true;
++        else if (character === '{' || character === '[') depth += 1;
++        else if (character === '}' || character === ']') depth -= 1;
++        if (depth === 0) {
++          try {
++            documents.push(
++              JSON.parse(trimmed.slice(start, index + 1)) as unknown,
++            );
++          } catch {
++            return undefined;
++          }
++          start = -1;
++        }
++      }
++      return start < 0 && documents.length > 0 ? documents : undefined;
++    }
++  };
++
++  type ReviewDocument = {
++    candidate_sha: string;
++    findings: string[];
++    verdict: string;
++  };
++
++  const reviewDocuments = (content: string): ReviewDocument[] | undefined => {
++    const documents = jsonDocuments(content);
++    if (
++      !documents?.length ||
++      !documents.every((document) => {
++        if (
++          document === null ||
++          typeof document !== 'object' ||
++          Array.isArray(document)
++        ) {
++          return false;
++        }
++        const record = document as Record<string, unknown>;
++        return (
++          typeof record.candidate_sha === 'string' &&
++          Array.isArray(record.findings) &&
++          record.findings.every((finding) => typeof finding === 'string') &&
++          typeof record.verdict === 'string'
++        );
++      })
++    ) {
++      return undefined;
++    }
++    return documents.map((document) => {
++      const record = document as Record<string, unknown>;
++      return {
++        candidate_sha: record.candidate_sha as string,
++        findings: record.findings as string[],
++        verdict: record.verdict as string,
++      };
++    });
++  };
++
++  const reviewFindingState = (finding: string) =>
++    /not yet completed|not completed|incomplete/i.test(finding)
++      ? 'incomplete'
++      : /in progress/i.test(finding)
++        ? 'active'
++        : 'pending';
++
++  const reviewFindings = (reviews: ReviewDocument[]) => [
++    ...new Set(reviews.flatMap((review) => review.findings)),
++  ];
++
++  const terminalExecutionStatuses = new Set([
++    'completed',
++    'failed',
++    'blocked',
++    'cancelled',
++    'canceled',
++    'terminated',
++    'timed_out',
++    'timeout',
++  ]);
++
++  const turnIsActive = (turn: Turn, execution: string | undefined) =>
++    turn.status === 'running' &&
++    !(execution && terminalExecutionStatuses.has(execution.toLowerCase()));
++
++  const turnLabel = (status: Turn['status'], execution: string | undefined) =>
++    status === 'running' &&
++    execution &&
++    terminalExecutionStatuses.has(execution.toLowerCase())
++      ? 'Stopped'
++      : status === 'running'
++        ? 'In progress'
++        : status === 'failed'
++          ? 'Failed'
++          : status === 'queued'
++            ? 'Queued'
++            : 'Completed';
 +
 +  let conversations = $state<Conversation[]>([]);
++  let expandedTurns = $state<Record<string, Turn>>({});
++  let loadingDetails = $state<Record<string, boolean>>({});
++  let activeScope = '';
 +  let loading = $state(true);
 +  let connection = $state('connecting');
 +  let executionStatus = $state<ExecutionStatus | undefined>();
 +  const conversationOrigin = 'http://127.0.0.1:18001';
-+  const emptyMessage = $derived(
-+    executionStatus?.phase === 'planning'
-+      ? 'Planning is in progress. No Codex conversation has started yet.'
-+      : executionStatus?.phase === 'spec_publication'
-+        ? 'Publishing SPECs. No Codex conversation has started yet.'
-+        : executionStatus?.phase === 'tickets'
-+          ? 'Preparing tickets. No Codex conversation has been recorded yet.'
-+          : executionStatus?.status === 'completed'
-+            ? 'This execution completed without recorded Codex conversations.'
-+            : executionStatus?.status === 'failed' ||
-+                executionStatus?.status === 'blocked'
-+              ? 'This execution stopped before a Codex conversation was recorded.'
-+              : 'No Codex conversation has been recorded for this execution yet.',
++  const workflowType = $derived($workflowRun.workflow?.name ?? '');
++  const utilityWorkflow = $derived(
++    [
++      'RequirementPlanningWorkflow',
++      'DeliveryWorkflow',
++      'DeliverySummaryWorkflow',
++    ].includes(workflowType),
 +  );
++  const parentChatUrl = $derived.by(() => {
++    const parent = $workflowRun.workflow?.parent;
++    if (!parent?.workflowId || !parent.runId) return '';
++    return `/namespaces/${encodeURIComponent(page.params.namespace)}/workflows/${encodeURIComponent(parent.workflowId)}/${encodeURIComponent(parent.runId)}/chat`;
++  });
++  const statusQueries: Record<string, string> = {
++    RequirementDeliveryWorkflow: 'get_whole_flow_status',
++    SpecExecutionWorkflow: 'get_whole_flow_status',
++    TicketSchedulerWorkflow: 'get_scheduler_status',
++    RequirementPlanningWorkflow: 'get_planning_status',
++    DeliveryWorkflow: 'get_delivery_status',
++    DeliverySummaryWorkflow: 'get_summary_publication_status',
++  };
++  const emptyMessage = $derived(
++    utilityWorkflow
++      ? 'This historical execution contains orchestration activities. Agent conversations belong to its parent execution.'
++      : executionStatus?.phase === 'planning'
++        ? 'Planning is in progress. No Codex conversation has started yet.'
++        : executionStatus?.phase === 'spec_publication'
++          ? 'Publishing SPECs. No Codex conversation has started yet.'
++          : executionStatus?.phase === 'tickets'
++            ? 'Preparing tickets. No Codex conversation has been recorded yet.'
++            : executionStatus?.status === 'completed'
++              ? 'This execution completed without recorded Codex conversations.'
++              : executionStatus?.status === 'failed' ||
++                  executionStatus?.status === 'blocked'
++                ? 'This execution stopped before a Codex conversation was recorded.'
++                : 'No Codex conversation has been recorded for this execution yet.',
++  );
++
++  const loadTurnDetails = async (turn: Turn) => {
++    if (expandedTurns[turn.id] || loadingDetails[turn.id]) return;
++    loadingDetails = { ...loadingDetails, [turn.id]: true };
++    const { namespace, workflow: workflowId, run: runId } = page.params;
++    const scope = `${namespace}:${workflowId}:${runId}`;
++    const parameters = new URLSearchParams({
++      namespace,
++      workflow_id: workflowId,
++      run_id: runId,
++      view: 'thread',
++      details: '1',
++    });
++    try {
++      const response = await fetch(
++        `${conversationOrigin}/api/v1/codex/conversations?${parameters}`,
++      );
++      if (!response.ok) throw new Error('Conversation details unavailable');
++      const snapshot = (await response.json()) as Snapshot;
++      if (activeScope !== scope) return;
++      const fullTurn = snapshot.conversations
++        .flatMap((conversation) => conversation.turns)
++        .find((candidate) => candidate.id === turn.id);
++      if (fullTurn) expandedTurns = { ...expandedTurns, [turn.id]: fullTurn };
++    } catch {
++      // Keep the compact thread readable when optional evidence is unavailable.
++    } finally {
++      if (activeScope === scope) {
++        const { [turn.id]: _, ...remaining } = loadingDetails;
++        loadingDetails = remaining;
++      }
++    }
++  };
 +
 +  $effect(() => {
 +    const { namespace, workflow: workflowId, run: runId } = page.params;
++    activeScope = `${namespace}:${workflowId}:${runId}`;
 +    return untrack(() => {
 +      conversations = [];
++      expandedTurns = {};
++      loadingDetails = {};
 +      executionStatus = undefined;
 +      loading = true;
 +      connection = 'connecting';
@@ -305,8 +631,8 @@ index 0000000..145235f
 +        namespace,
 +        workflow_id: workflowId,
 +        run_id: runId,
++        view: 'thread',
 +      });
-+      const endpoint = `${conversationOrigin}/api/v1/codex/conversations?${parameters}`;
 +      const streamEndpoint = `${conversationOrigin}/api/v1/codex/stream?${parameters}`;
 +      let stream: EventSource | undefined;
 +      let retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -330,12 +656,11 @@ index 0000000..145235f
 +      const recover = () => {
 +        if (controller.signal.aborted || retryTimer) return;
 +        stream?.close();
-+        loading = false;
 +        connection = 'reconnecting';
 +        const delay = Math.min(1000 * 2 ** attempts++, 15000);
 +        retryTimer = setTimeout(() => {
 +          retryTimer = undefined;
-+          void load();
++          subscribe();
 +        }, delay);
 +      };
 +
@@ -358,25 +683,13 @@ index 0000000..145235f
 +        });
 +      };
 +
-+      const load = async () => {
-+        try {
-+          const response = await fetch(endpoint, { signal: controller.signal });
-+          if (!response.ok)
-+            throw new Error(`Conversation service returned ${response.status}`);
-+          applySnapshot((await response.json()) as Snapshot);
-+          if (!controller.signal.aborted) subscribe();
-+        } catch {
-+          recover();
-+        }
-+      };
-+
 +      const pollStatus = async () => {
 +        try {
 +          const status = await getQuery(
 +            {
 +              namespace,
 +              workflow: { id: workflowId, runId },
-+              queryType: 'get_status',
++              queryType: statusQueries[workflowType] ?? 'get_status',
 +            },
 +            controller.signal,
 +          );
@@ -395,7 +708,7 @@ index 0000000..145235f
 +          statusTimer = setTimeout(() => void pollStatus(), 5000);
 +      };
 +
-+      void load();
++      subscribe();
 +      void pollStatus();
 +      return () => {
 +        controller.abort();
@@ -407,7 +720,7 @@ index 0000000..145235f
 +  });
 +</script>
 +
-+<section class="flex min-h-[28rem] flex-col gap-6" data-testid="workflow-chat">
++<section class="flex min-h-[28rem] flex-col gap-3" data-testid="workflow-chat">
 +  {#if executionStatus}
 +    <div
 +      class="flex flex-wrap gap-x-4 gap-y-1 text-sm text-secondary"
@@ -466,16 +779,21 @@ index 0000000..145235f
 +      class="border border-dashed border-primary px-6 py-12 text-center text-sm text-secondary"
 +    >
 +      {emptyMessage}
++      {#if utilityWorkflow && parentChatUrl}
++        <a class="ml-2 text-primary underline" href={parentChatUrl}
++          >Parent Chat</a
++        >
++      {/if}
 +    </div>
 +  {:else}
-+    <div class="flex flex-col gap-12">
++    <div class="flex flex-col gap-6">
 +      {#each conversations as conversation (conversation.id)}
 +        <article
-+          class="flex flex-col gap-6"
++          class="flex flex-col gap-3"
 +          data-thread-id={conversation.threadId ?? conversation.id}
 +        >
 +          <header
-+            class="flex flex-wrap items-start gap-3 border-b border-primary pb-4"
++            class="flex flex-wrap items-start gap-3 border-b border-primary pb-2"
 +          >
 +            <span
 +              class="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-secondary text-primary"
@@ -504,7 +822,7 @@ index 0000000..145235f
 +          </header>
 +
 +          {#each conversation.turns as turn, turnIndex (turn.id)}
-+            <section class="flex flex-col gap-4" data-testid="codex-turn">
++            <section class="flex flex-col gap-2" data-testid="codex-turn">
 +              <div
 +                class="flex items-center justify-between gap-3 text-xs text-secondary"
 +              >
@@ -512,7 +830,7 @@ index 0000000..145235f
 +                  >Turn {turnIndex + 1}</span
 +                >
 +                <div class="flex flex-wrap items-center justify-end gap-3">
-+                  <span>{turnLabel(turn.status)}</span>
++                  <span>{turnLabel(turn.status, executionStatus?.status)}</span>
 +                  <details class="min-w-0">
 +                    <summary class="cursor-pointer select-none"
 +                      >Turn details</summary
@@ -524,95 +842,306 @@ index 0000000..145235f
 +                </div>
 +              </div>
 +
-+              {#if turn.input}
-+                <details
-+                  class="max-w-4xl text-sm text-secondary"
-+                  data-testid="codex-prompt"
-+                >
-+                  <summary class="cursor-pointer select-none"
-+                    >Prompt · implementation context</summary
++              {#each turnMessages(turn) as message, messageIndex (`${message.type}:${messageIndex}`)}
++                {@const fullTurn = expandedTurns[turn.id]}
++                {#if message.type === 'user'}
++                  <details
++                    class="max-w-4xl text-sm text-secondary"
++                    data-testid="codex-prompt"
++                    ontoggle={(event) =>
++                      event.currentTarget instanceof HTMLDetailsElement &&
++                      event.currentTarget.open &&
++                      void loadTurnDetails(turn)}
 +                  >
-+                  <div
-+                    class="mt-3 min-w-0 border-l border-primary pl-4 leading-6 text-primary"
++                    <summary class="cursor-pointer select-none">Prompt</summary>
++                    <div
++                      class="mt-1.5 min-w-0 border-l border-primary pl-4 leading-5 text-primary"
++                    >
++                      {#if fullTurn?.input}
++                        <WorkflowChatMessage content={fullTurn.input} />
++                      {:else if loadingDetails[turn.id]}
++                        <span>Loading prompt…</span>
++                      {/if}
++                    </div>
++                  </details>
++                {:else if message.type === 'activity'}
++                  {@const activity = message.activity}
++                  {@const result =
++                    activity.category === 'test'
++                      ? testResult(activity)
++                      : undefined}
++                  {@const ActivityIcon =
++                    result === 'failed'
++                      ? IconXmarkCircleSolid
++                      : result === 'unknown'
++                        ? IconClock
++                        : activityIcon(activity.category)}
++                  {@const groupedIds = activity.groupedIds ?? [activity.id]}
++                  {@const fullActivities =
++                    fullTurn?.activities?.filter((item) =>
++                      groupedIds.includes(item.id),
++                    ) ?? []}
++                  {@const fullActivityText = fullActivities
++                    .map((item) => item.text)
++                    .filter(Boolean)
++                    .join('\n')}
++                  <ol
++                    class="flex min-w-0 max-w-4xl flex-col border-l border-primary pl-4 text-sm"
++                    data-testid="codex-activity"
++                    aria-label="Activity timeline"
 +                  >
-+                    <WorkflowChatMessage content={turn.input} />
-+                  </div>
-+                </details>
-+              {/if}
-+
-+              {#if turnActivities(turn).length}
-+                <ol
-+                  class="flex min-w-0 max-w-4xl flex-col gap-4 border-l border-primary pl-4 text-sm"
-+                  data-testid="codex-activity"
-+                  aria-label="Activity timeline"
-+                >
-+                  {#each turnActivities(turn).filter((activity) => activity.category !== 'verification') as activity (activity.id)}
-+                    {@const ActivityIcon = activityIcon(activity.category)}
 +                    <li class="flex min-w-0 gap-3">
-+                      <ActivityIcon
-+                        class="mt-0.5 h-4 w-4 shrink-0 text-secondary"
-+                      />
++                      <span
++                        class="mt-0.5 shrink-0"
++                        data-testid="activity-icon"
++                        aria-label={result
++                          ? `Test ${result}`
++                          : activity.category}
++                        title={result
++                          ? `Test ${result}`
++                          : stageTitle(activity.category)}
++                      >
++                        <ActivityIcon
++                          class={`h-4 w-4 ${result === 'passed' ? 'text-success' : result === 'failed' ? 'text-danger' : 'text-secondary'}`}
++                        />
++                      </span>
 +                      <div class="min-w-0 flex-1">
-+                        <div class="mb-0.5 text-xs text-secondary">
-+                          {stageTitle(activity.category)}
-+                        </div>
-+                        <p class="activity-summary font-medium text-primary">
-+                          {activity.category === 'error'
-+                            ? errorSummary(activity.summary)
-+                            : activity.summary}
-+                        </p>
-+                        {#if activity.text}
-+                          <details class="mt-1 text-xs text-secondary">
-+                            <summary class="cursor-pointer select-none"
++                        {#if isCompactActivity(activity.category)}
++                          <details
++                            class="compact-activity min-w-0 text-sm"
++                            ontoggle={(event) =>
++                              event.currentTarget instanceof
++                                HTMLDetailsElement &&
++                              event.currentTarget.open &&
++                              void loadTurnDetails(turn)}
++                          >
++                            <summary
++                              class="flex min-w-0 cursor-pointer select-none items-baseline gap-2"
++                              data-testid="compact-activity-summary"
++                            >
++                              <span
++                                class={`shrink-0 font-semibold ${activityCategoryColor(activity.category)}`}
++                              >
++                                {stageTitle(activity.category)}
++                              </span>
++                              <span
++                                class="min-w-0 truncate text-secondary"
++                                data-testid="activity-brief"
++                              >
++                                {briefActivitySummary(activity)}
++                              </span>
++                              <span
++                                class="shrink-0 text-xs text-tertiary hover:text-primary"
++                              >
++                                <span class="detail-chevron" aria-hidden="true"
++                                  >&gt;</span
++                                > Detail
++                              </span>
++                            </summary>
++                            {#if activity.category === 'context' && fullActivityText}
++                              <pre
++                                class="raw-output mt-2 text-sm text-primary">{fullActivityText}</pre>
++                            {:else if fullActivities.length && activity.category !== 'context'}
++                              {#each fullActivities as item (item.id)}
++                                <div class="mt-2">
++                                  <div class="font-medium">Command</div>
++                                  <pre
++                                    class="raw-output mt-1 text-sm text-primary">{commandForActivity(
++                                      item,
++                                    )}</pre>
++                                  <div class="mt-2 font-medium">Output</div>
++                                  <pre
++                                    class="raw-output mt-1 text-sm text-primary">{outputForActivity(
++                                      item,
++                                    )}</pre>
++                                </div>
++                              {/each}
++                            {:else if loadingDetails[turn.id]}
++                              <span>Loading details…</span>
++                            {/if}
++                            {#if fullActivities.some((item) => item.detail)}
++                              <details class="mt-1 text-xs text-secondary">
++                                <summary class="cursor-pointer select-none"
++                                  >Technical metadata</summary
++                                >
++                                <pre
++                                  class="raw-output mt-2 text-sm text-primary">{JSON.stringify(
++                                    fullActivities
++                                      .map((item) => item.detail)
++                                      .filter(Boolean),
++                                    null,
++                                    2,
++                                  )}</pre>
++                              </details>
++                            {/if}
++                          </details>
++                        {:else}
++                          <div class="mb-0.5 text-xs text-secondary">
++                            {stageTitle(activity.category)}
++                          </div>
++                          <p class="activity-summary font-medium text-primary">
++                            {activity.category === 'error'
++                              ? errorSummary(activity.summary)
++                              : activity.summary}
++                          </p>
++                        {/if}
++                        {#if !isCompactActivity(activity.category) && (activity.text || activity.hasDetails)}
++                          <details
++                            class="mt-1 text-xs text-secondary"
++                            ontoggle={(event) =>
++                              event.currentTarget instanceof
++                                HTMLDetailsElement &&
++                              event.currentTarget.open &&
++                              void loadTurnDetails(turn)}
++                          >
++                            <summary
++                              class="cursor-pointer select-none hover:text-primary"
 +                              >{detailLabel(activity.category)}</summary
 +                            >
-+                            <pre
-+                              class="raw-output mt-2 text-sm text-primary">{activity.text}</pre>
++                            {#if fullActivityText}
++                              <pre
++                                class="raw-output mt-2 text-sm text-primary">{fullActivityText}</pre>
++                            {:else if loadingDetails[turn.id]}
++                              <span>Loading details…</span>
++                            {/if}
 +                          </details>
 +                        {/if}
-+                        {#if activity.detail && Object.keys(activity.detail).length}
-+                          <details class="mt-1 text-xs text-secondary">
++                        {#if !isCompactActivity(activity.category) && activity.detail && Object.keys(activity.detail).length}
++                          <details
++                            class="mt-1 text-xs text-secondary"
++                            ontoggle={(event) =>
++                              event.currentTarget instanceof
++                                HTMLDetailsElement &&
++                              event.currentTarget.open &&
++                              void loadTurnDetails(turn)}
++                          >
 +                            <summary class="cursor-pointer select-none"
 +                              >Technical metadata</summary
 +                            >
-+                            <pre
-+                              class="raw-output mt-2 text-sm text-primary">{JSON.stringify(
-+                                activity.detail,
-+                                null,
-+                                2,
-+                              )}</pre>
++                            {#if fullActivities.some((item) => item.detail)}
++                              <pre
++                                class="raw-output mt-2 text-sm text-primary">{JSON.stringify(
++                                  fullActivities
++                                    .map((item) => item.detail)
++                                    .filter(Boolean),
++                                  null,
++                                  2,
++                                )}</pre>
++                            {:else if loadingDetails[turn.id]}
++                              <span>Loading details…</span>
++                            {/if}
 +                          </details>
 +                        {/if}
 +                      </div>
 +                    </li>
-+                  {/each}
-+                </ol>
-+              {/if}
-+
-+              {#if turn.displayOutput ?? turn.output}
-+                <div class="flex gap-3" data-testid="codex-response">
-+                  <span
-+                    class="mt-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-secondary text-primary"
-+                  >
-+                    <IconCodex class="h-4 w-4" />
-+                  </span>
-+                  <div
-+                    class="min-w-0 max-w-4xl flex-1 text-sm leading-7 text-primary"
-+                  >
-+                    <div class="mb-2 text-sm font-semibold text-primary">
-+                      Codex
++                  </ol>
++                {:else}
++                  {@const reviews = reviewDocuments(message.text)}
++                  {@const isJson = jsonDocuments(message.text) !== undefined}
++                  <div class="flex gap-3" data-testid="codex-response">
++                    <span
++                      class="mt-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-secondary text-primary"
++                    >
++                      <IconCodex class="h-4 w-4" />
++                    </span>
++                    <div
++                      class="min-w-0 max-w-4xl flex-1 text-sm leading-5 text-primary"
++                    >
++                      <div class="mb-1 text-sm font-semibold text-primary">
++                        Agent
++                      </div>
++                      {#if reviews}
++                        <div
++                          class="flex flex-col gap-1"
++                          data-testid="codex-review-summary"
++                        >
++                          <div class="text-xs text-secondary">
++                            Code review · {reviews.length} updates · Verdict:
++                            <span
++                              class={`font-semibold ${reviews.at(-1)?.verdict === 'approved' ? 'text-success' : reviews.at(-1)?.verdict === 'rejected' ? 'text-danger' : 'text-secondary'}`}
++                              >{reviews.at(-1)?.verdict}</span
++                            >
++                          </div>
++                          <table class="w-full max-w-3xl text-left text-sm">
++                            <thead class="text-xs text-tertiary">
++                              <tr>
++                                <th class="py-1 pr-4 font-medium">Finding</th>
++                                <th class="py-1 font-medium">State</th>
++                              </tr>
++                            </thead>
++                            <tbody>
++                              {#each reviewFindings(reviews) as finding, findingIndex (`${findingIndex}:${finding}`)}
++                                {@const state = reviewFindingState(finding)}
++                                <tr class="border-t border-primary">
++                                  <td class="py-2 pr-4 text-primary">
++                                    {finding}
++                                  </td>
++                                  <td class="py-2">
++                                    {#if state === 'incomplete'}
++                                      <span
++                                        class="inline-flex items-center gap-1 text-danger"
++                                      >
++                                        <IconWarning class="h-4 w-4" />
++                                        <span class="sr-only">Incomplete</span>
++                                      </span>
++                                    {:else if state === 'active'}
++                                      <span
++                                        class="inline-flex items-center gap-1 text-success"
++                                      >
++                                        <IconCheckCircle class="h-4 w-4" />
++                                        <span class="sr-only">In progress</span>
++                                      </span>
++                                    {:else}
++                                      <span
++                                        class="inline-flex items-center gap-1 text-secondary"
++                                      >
++                                        <IconClock class="h-4 w-4" />
++                                        <span class="sr-only">Pending</span>
++                                      </span>
++                                    {/if}
++                                  </td>
++                                </tr>
++                              {/each}
++                            </tbody>
++                          </table>
++                          <details class="text-xs text-tertiary">
++                            <summary
++                              class="cursor-pointer select-none hover:text-primary"
++                              >Detail</summary
++                            >
++                            <pre
++                              class="raw-output mt-2 text-sm text-primary">{message.text}</pre>
++                          </details>
++                        </div>
++                      {:else if isJson}
++                        <div
++                          class="json-summary flex min-w-0 flex-wrap items-baseline gap-2 text-sm"
++                          data-testid="codex-json-summary"
++                        >
++                          <span class="font-mono text-secondary">{'{...}'}</span
++                          >
++                          <details class="min-w-0 text-xs text-tertiary">
++                            <summary
++                              class="cursor-pointer select-none hover:text-primary"
++                              >Detail</summary
++                            >
++                            <pre
++                              class="raw-output mt-2 text-sm text-primary">{message.text}</pre>
++                          </details>
++                        </div>
++                      {:else}
++                        <WorkflowChatMessage content={message.text} />
++                      {/if}
++                      {#if turnIsActive(turn, executionStatus?.status)}
++                        <span
++                          class="mt-2 inline-block h-4 w-1 animate-pulse bg-content-primary"
++                          data-testid="codex-generating-cursor"
++                        ></span>
++                      {/if}
 +                    </div>
-+                    <WorkflowChatMessage
-+                      content={turn.displayOutput ?? turn.output}
-+                    />
-+                    {#if turn.status === 'running'}
-+                      <span
-+                        class="mt-2 inline-block h-4 w-1 animate-pulse bg-content-primary"
-+                      ></span>
-+                    {/if}
 +                  </div>
-+                </div>
-+              {/if}
++                {/if}
++              {/each}
 +              {#if (turn.verificationMarkers?.length ?? 0) || turnActivities(turn).some((activity) => activity.category === 'verification')}
 +                <details
 +                  class="min-w-0 max-w-4xl text-xs text-secondary"
@@ -641,7 +1170,7 @@ index 0000000..145235f
 +                  {/each}
 +                </details>
 +              {/if}
-+              {#if !(turn.displayOutput ?? turn.output) && turn.status === 'running'}
++              {#if !(turn.displayOutput ?? turn.output) && turnIsActive(turn, executionStatus?.status)}
 +                <div
 +                  class="flex items-center gap-3 text-sm text-secondary"
 +                  role="status"
@@ -663,9 +1192,26 @@ index 0000000..145235f
 +    overflow-wrap: anywhere;
 +  }
 +
++  .activity-summary {
++    white-space: pre-line;
++  }
++
 +  .raw-output {
 +    max-width: 100%;
 +    white-space: pre-wrap;
++  }
++
++  .detail-chevron {
++    display: inline-block;
++  }
++
++  .compact-activity[open] .detail-chevron {
++    transform: rotate(90deg);
++  }
++
++  .json-summary > details[open] {
++    display: block;
++    flex-basis: 100%;
 +  }
 +</style>
 diff --git a/src/lib/i18n/locales/en/workflows.ts b/src/lib/i18n/locales/en/workflows.ts
@@ -828,11 +1374,11 @@ index 0000000..df87936
 +<WorkflowChat />
 diff --git a/tests/integration/workflow-chat.spec.ts b/tests/integration/workflow-chat.spec.ts
 new file mode 100644
-index 0000000..9090749
+index 0000000..7b769d5
 --- /dev/null
 +++ b/tests/integration/workflow-chat.spec.ts
-@@ -0,0 +1,477 @@
-+import { expect, test } from '@playwright/test';
+@@ -0,0 +1,873 @@
++import { expect, type Route, test } from '@playwright/test';
 +
 +import { mockWorkflowApis } from '~/test-utilities/mock-apis';
 +import { mockWorkflow } from '~/test-utilities/mocks/workflow';
@@ -840,7 +1386,7 @@ index 0000000..9090749
 +const { workflowId, runId } = mockWorkflow.workflowExecutionInfo.execution;
 +const workflowUrl = `/namespaces/default/workflows/${workflowId}/${runId}`;
 +
-+const snapshot = (output: string, cursor: number) => ({
++const snapshot = (output: string, cursor: number, ordered = false) => ({
 +  cursor,
 +  conversations: [
 +    {
@@ -861,10 +1407,95 @@ index 0000000..9090749
 +            { kind: 'reasoning_summary', text: 'Use bounded retries' },
 +            { kind: 'tool_output', text: 'Tests passed' },
 +          ],
++          activities: [
++            {
++              id: 'activity-1',
++              category: 'tool',
++              summary: 'Tool activity recorded',
++              text: 'Tests passed',
++            },
++          ],
++          messages: ordered
++            ? [
++                {
++                  id: 'message:1',
++                  type: 'user',
++                  text: 'Implement the selected ticket',
++                },
++                {
++                  id: 'message:2',
++                  type: 'activity',
++                  activity: {
++                    id: 'activity-1',
++                    category: 'tool',
++                    summary: 'Tool activity recorded',
++                    text: 'Tests passed',
++                  },
++                },
++                { id: 'message:3', type: 'assistant', text: output },
++              ]
++            : undefined,
 +        },
 +      ],
 +    },
 +  ],
++});
++
++const respondWithSnapshot = async (route: Route, data: unknown) => {
++  if (new URL(route.request().url()).pathname.endsWith('/stream')) {
++    await route.fulfill({
++      contentType: 'text/event-stream',
++      body: `event: conversations\ndata: ${JSON.stringify(data)}\n\n`,
++    });
++  } else {
++    await route.fulfill({ json: data });
++  }
++};
++
++test('SPEC Chat reads business failure from the whole flow query', async ({
++  page,
++}) => {
++  await mockWorkflowApis(page, {
++    ...mockWorkflow,
++    workflowExecutionInfo: {
++      ...mockWorkflow.workflowExecutionInfo,
++      type: { name: 'SpecExecutionWorkflow' },
++    },
++  });
++  await page.route('**/query/get_whole_flow_status**', async (route) => {
++    await route.fulfill({
++      json: {
++        queryResult: {
++          payloads: [
++            {
++              metadata: { encoding: 'anNvbi9wbGFpbg==' },
++              data: Buffer.from(
++                JSON.stringify({
++                  phase: 'failed',
++                  status: 'failed',
++                  last_error: 'Candidate preparation failed',
++                }),
++              ).toString('base64'),
++            },
++          ],
++        },
++      },
++    });
++  });
++  await page.route('http://127.0.0.1:18001/**', async (route) => {
++    await respondWithSnapshot(route, { conversations: [], cursor: 0 });
++  });
++  await page.goto(workflowUrl);
++  const status = page.getByTestId('workflow-chat').getByTestId('execution-status');
++  await expect(status).toContainText('failed');
++  await expect(status).toContainText(
++    'Candidate preparation failed',
++  );
++  await expect(
++    page.getByText(
++      'This execution stopped before a Codex conversation was recorded.',
++    ),
++  ).toBeVisible();
 +});
 +
 +test('Chat keeps recorded messages through stream interruption and recovers automatically', async ({
@@ -883,7 +1514,7 @@ index 0000000..9090749
 +    } else if (url.pathname.endsWith('/stream')) {
 +      await route.fulfill({
 +        contentType: 'text/event-stream',
-+        body: `event: conversations\ndata: ${JSON.stringify(snapshot(recovered ? 'Recovered response' : 'Streamed response', recovered ? 3 : 2))}\n\n`,
++        body: `event: conversations\ndata: ${JSON.stringify(snapshot(recovered ? 'Recovered response' : 'Streamed response', recovered ? 3 : 2, true))}\n\n`,
 +      });
 +    } else {
 +      await route.fulfill({
@@ -901,6 +1532,25 @@ index 0000000..9090749
 +  await expect(
 +    page.getByText('Tool activity recorded', { exact: true }),
 +  ).toBeVisible();
++  const threadOrder = await page
++    .getByTestId('codex-turn')
++    .locator(':scope > *')
++    .evaluateAll((items) =>
++      items.map((item) =>
++        item.hasAttribute('data-testid')
++          ? item.getAttribute('data-testid')
++          : item.tagName,
++      ),
++    );
++  expect(threadOrder.indexOf('codex-prompt')).toBeLessThan(
++    threadOrder.indexOf('codex-activity'),
++  );
++  expect(threadOrder.indexOf('codex-activity')).toBeLessThan(
++    threadOrder.indexOf('codex-response'),
++  );
++  await expect(page.getByTestId('codex-prompt').locator('summary')).toHaveText(
++    'Prompt',
++  );
 +  await page
 +    .getByTestId('codex-activity')
 +    .getByText('Recorded output', { exact: true })
@@ -969,7 +1619,7 @@ index 0000000..9090749
 +        },
 +      ],
 +    });
-+    await route.fulfill({ json: data });
++    await respondWithSnapshot(route, data);
 +  });
 +  await page.goto(workflowUrl);
 +  await expect(page.getByText('Failed', { exact: true })).toBeVisible();
@@ -1001,6 +1651,37 @@ index 0000000..9090749
 +  ).toBeVisible();
 +});
 +
++test('Chat stops the generating cursor when the execution has ended', async ({
++  page,
++}) => {
++  await mockWorkflowApis(page, mockWorkflow);
++  await page.route('**/query/get_status**', async (route) => {
++    await route.fulfill({
++      json: {
++        queryResult: {
++          payloads: [
++            {
++              metadata: { encoding: 'anNvbi9wbGFpbg==' },
++              data: Buffer.from(
++                JSON.stringify({ status: 'completed' }),
++              ).toString('base64'),
++            },
++          ],
++        },
++      },
++    });
++  });
++  await page.route('http://127.0.0.1:18001/**', async (route) => {
++    const data = snapshot('Last recorded response', 1);
++    data.conversations[0].turns[0].status = 'running';
++    await respondWithSnapshot(route, data);
++  });
++
++  await page.goto(workflowUrl);
++  await expect(page.getByText('Stopped', { exact: true })).toBeVisible();
++  await expect(page.getByTestId('codex-generating-cursor')).toHaveCount(0);
++});
++
 +test('Chat shows readable activities while keeping internal context and raw output collapsed', async ({
 +  page,
 +}) => {
@@ -1019,19 +1700,19 @@ index 0000000..9090749
 +        },
 +        {
 +          id: 'test',
-+          category: 'command',
-+          summary: 'uv run pytest tests/acceptance',
++          category: 'test',
++          summary: 'uv run pytest tests/acceptance | Passed (exit 0)',
 +          text: 'RAW_TEST_OUTPUT',
 +          detail: { exit_code: 0 },
 +        },
 +      ],
 +    });
-+    await route.fulfill({ json: data });
++    await respondWithSnapshot(route, data);
 +  });
 +  await page.goto(workflowUrl);
 +
 +  await expect(page.getByRole('heading', { name: 'Implement' })).toBeVisible();
-+  await expect(page.getByText('Codex', { exact: true })).toBeVisible();
++  await expect(page.getByText('Agent', { exact: true })).toBeVisible();
 +  await expect(page.getByTestId('codex-response')).toContainText(
 +    'A clear final response',
 +  );
@@ -1041,11 +1722,24 @@ index 0000000..9090749
 +  );
 +  await expect(page.getByText('Implement the selected ticket')).toBeHidden();
 +  await expect(
-+    page.getByText('Read context: SKILL.md, README.md', { exact: true }),
++    page.getByText('Read SKILL.md, README.md', { exact: true }),
 +  ).toBeVisible();
++  const activityRows = page.getByTestId('codex-activity');
++  await expect(activityRows.nth(0).locator('.text-information')).toHaveText(
++    'Context',
++  );
 +  await expect(
-+    page.getByText('uv run pytest tests/acceptance', { exact: true }),
-+  ).toBeVisible();
++    page.getByText('Read SKILL.md, README.md', { exact: true }),
++  ).toHaveClass(/text-secondary/);
++  await expect(activityRows.nth(0).locator('.text-tertiary')).toHaveText(
++    '> Detail',
++  );
++  await expect(
++    activityRows.nth(1).getByText('Test', { exact: true }),
++  ).toHaveClass(/text-success/);
++  await expect(activityRows.nth(1).locator('.text-tertiary')).toHaveText(
++    '> Detail',
++  );
 +  await expect(
 +    page.getByText('SECRET_SKILL_SOURCE', { exact: true }),
 +  ).toBeHidden();
@@ -1054,14 +1748,265 @@ index 0000000..9090749
 +    'SDK_PROBE_OK',
 +  );
 +  await expect(page.getByText('SDK_PROBE_OK', { exact: true })).toBeHidden();
-+  await page.getByText('Context source', { exact: true }).click();
++  await activityRows.nth(0).locator('details > summary').first().click();
 +  await expect(
 +    page.getByText('SECRET_SKILL_SOURCE', { exact: true }),
 +  ).toBeVisible();
-+  await page.getByText('Command output', { exact: true }).click();
++  await activityRows.nth(1).locator('details > summary').first().click();
 +  await expect(
 +    page.getByText('RAW_TEST_OUTPUT', { exact: true }),
 +  ).toBeVisible();
++});
++
++test('Chat groups adjacent activities by category and collapses command details', async ({
++  page,
++}, testInfo) => {
++  await mockWorkflowApis(page, mockWorkflow);
++  const data = snapshot('Completed the checks', 1, true);
++  const turn = data.conversations[0].turns[0];
++  const activities = [
++    {
++      id: 'reasoning-1',
++      category: 'reasoning',
++      summary: 'Check the current state',
++      text: 'Private reasoning detail one',
++      hasDetails: true,
++    },
++    {
++      id: 'reasoning-2',
++      category: 'reasoning',
++      summary: 'Confirm the expected behavior',
++      text: 'Private reasoning detail two',
++      hasDetails: true,
++    },
++    {
++      id: 'command-1',
++      category: 'command',
++      summary:
++        '"C:\\Users\\will\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\native...',
++      commandName: 'pwsh.exe',
++      text: '',
++      hasDetails: true,
++    },
++    {
++      id: 'command-2',
++      category: 'command',
++      summary:
++        '"C:\\Users\\will\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\native...',
++      text: '',
++      hasDetails: true,
++    },
++    {
++      id: 'test-1',
++      category: 'test',
++      summary: 'uv run pytest tests/acceptance -m "not live" | Passed (exit 0)',
++      text: 'SDK_PROBE_OK',
++      hasDetails: true,
++    },
++  ];
++  turn.activities = activities;
++  turn.messages = [
++    { id: 'message:1', type: 'user', text: turn.input },
++    ...activities.map((activity, index) => ({
++      id: `message:${index + 2}`,
++      type: 'activity' as const,
++      activity,
++    })),
++    { id: 'message:6', type: 'assistant', text: turn.output },
++  ];
++  await page.route('http://127.0.0.1:18001/**', async (route) => {
++    const response = snapshot('Completed the checks', 1, true);
++    const responseTurn = response.conversations[0].turns[0];
++    responseTurn.activities = new URL(route.request().url()).searchParams.get(
++      'details',
++    )
++      ? [
++          { ...activities[0], text: 'Private reasoning detail one' },
++          { ...activities[1], text: 'Private reasoning detail two' },
++          { ...activities[2], text: 'Private command output one' },
++          { ...activities[3], text: 'Private command output two' },
++          { ...activities[4], text: 'Private test output' },
++        ]
++      : activities;
++    responseTurn.messages = turn.messages;
++    await respondWithSnapshot(route, response);
++  });
++
++  await page.goto(workflowUrl);
++  const rows = page.getByTestId('codex-activity');
++  await expect(rows).toHaveCount(3);
++  await expect(rows.nth(0).locator('.activity-summary')).toHaveText(
++    'Check the current state\nConfirm the expected behavior',
++  );
++  await expect(rows.nth(1)).toContainText('Command');
++  await expect(rows.nth(1).getByTestId('activity-brief')).toHaveText(
++    'pwsh.exe · Command',
++  );
++  await expect(rows.nth(1)).not.toContainText('git status --short');
++  await expect(rows.nth(1)).not.toContainText('Passed (exit 0)');
++  await expect(rows.nth(2)).toContainText('Test');
++  await expect(rows.nth(2).getByTestId('activity-brief')).toHaveText('uv');
++  for (const row of [rows.nth(1), rows.nth(2)]) {
++    const positions = await row
++      .getByTestId('compact-activity-summary')
++      .locator(':scope > span')
++      .evaluateAll((items) =>
++        items.map((item) => item.getBoundingClientRect().top),
++      );
++    expect(Math.max(...positions) - Math.min(...positions)).toBeLessThan(5);
++  }
++  await rows
++    .nth(1)
++    .screenshot({ path: testInfo.outputPath('compact-command.png') });
++  const commandDetails = rows.nth(1).locator('details');
++  await expect(commandDetails).not.toHaveAttribute('open', '');
++  await expect(
++    page.getByText('Private command output one', { exact: true }),
++  ).toBeHidden();
++  await expect(commandDetails).toContainText('Detail');
++  await commandDetails.locator('summary').first().click();
++  await expect(commandDetails).toContainText('Command');
++  await expect(commandDetails).toContainText('Output');
++  await expect(commandDetails).toContainText('Private command output one');
++  await expect(commandDetails).toContainText('Private command output two');
++  const testDetails = rows.nth(2).locator('details');
++  await testDetails.locator('summary').first().click();
++  await expect(testDetails).toContainText('Private test output');
++});
++
++test('Chat summarizes code review JSON and collapses other JSON responses', async ({
++  page,
++}, testInfo) => {
++  await mockWorkflowApis(page, mockWorkflow);
++  const reviewUpdates = [
++    {
++      candidate_sha: '9b40f73a6afedea0eee1d11ef58b86f32a2ff3f8',
++      findings: ['Review not yet completed.'],
++      verdict: 'rejected',
++    },
++    {
++      candidate_sha: '9b40f73a6afedea0eee1d11ef58b86f32a2ff3f8',
++      findings: [
++        'Review in progress; final verdict pending implementation and regression checks.',
++      ],
++      verdict: 'rejected',
++    },
++    {
++      candidate_sha: '9b40f73a6afedea0eee1d11ef58b86f32a2ff3f8',
++      findings: [
++        'Review in progress; final verdict pending implementation and regression checks.',
++      ],
++      verdict: 'rejected',
++    },
++    {
++      candidate_sha: '9b40f73a6afedea0eee1d11ef58b86f32a2ff3f8',
++      findings: ['Beginning independent review of the frozen candidate.'],
++      verdict: 'rejected',
++    },
++  ];
++  const reviewJson = reviewUpdates.map((item) => JSON.stringify(item)).join('');
++  const genericJson = JSON.stringify({ internal: true, count: 4 });
++  await page.route('http://127.0.0.1:18001/**', async (route) => {
++    const data = snapshot(reviewJson, 1);
++    data.conversations[0].turns.push({
++      id: 'turn-2',
++      input: '',
++      output: genericJson,
++      status: 'completed',
++      updatedAt: 2,
++      working: [],
++    });
++    await respondWithSnapshot(route, data);
++  });
++
++  await page.goto(workflowUrl);
++  const review = page.getByTestId('codex-review-summary');
++  await expect(review.getByRole('table')).toBeVisible();
++  await expect(review.getByRole('row')).toHaveCount(4);
++  await expect(review).toContainText('Review not yet completed.');
++  await expect(review).toContainText(
++    'Review in progress; final verdict pending implementation and regression checks.',
++  );
++  await expect(
++    review.getByText('9b40f73a6afedea0eee1d11ef58b86f32a2ff3f8'),
++  ).toBeHidden();
++  await expect(review.getByText('Incomplete', { exact: true })).toHaveCount(1);
++  await expect(review.getByText('In progress', { exact: true })).toHaveCount(1);
++  await review.screenshot({
++    path: testInfo.outputPath('compact-review.png'),
++  });
++  await review.locator('details > summary').click();
++  await expect(review.locator('pre')).toContainText('candidate_sha');
++
++  const generic = page.getByTestId('codex-json-summary');
++  await expect(generic).toContainText('{...}');
++  await expect(generic.locator('pre')).toBeHidden();
++  await generic.locator('summary').click();
++  await expect(generic.locator('pre')).toContainText('"internal":true');
++  expect(
++    await page.evaluate(
++      () => document.documentElement.scrollWidth <= window.innerWidth,
++    ),
++  ).toBe(true);
++});
++
++test('Chat colors test icons by recorded results including grouped failures', async ({
++  page,
++}) => {
++  await mockWorkflowApis(page, mockWorkflow);
++  await page.route('http://127.0.0.1:18001/**', async (route) => {
++    const data = snapshot('Checks finished', 1);
++    data.conversations[0].turns[0].activities = [
++      {
++        id: 'pass',
++        category: 'test',
++        summary: 'pytest | Passed (exit 0)',
++        text: '',
++      },
++      {
++        id: 'separator',
++        category: 'reasoning',
++        summary: 'Continue checks',
++        text: '',
++      },
++      {
++        id: 'group-pass',
++        category: 'test',
++        summary: 'pytest | Passed (exit 0)',
++        text: '',
++      },
++      {
++        id: 'group-fail',
++        category: 'test',
++        summary: 'pytest | Failed (exit 1)',
++        text: '',
++      },
++      {
++        id: 'separator-2',
++        category: 'reasoning',
++        summary: 'Check pending suite',
++        text: '',
++      },
++      {
++        id: 'unknown',
++        category: 'test',
++        summary: 'pytest | in_progress',
++        text: '',
++      },
++    ];
++    await respondWithSnapshot(route, data);
++  });
++  await page.goto(workflowUrl);
++  await expect(
++    page.getByLabel('Test passed', { exact: true }).locator('svg'),
++  ).toHaveClass(/text-success/);
++  await expect(
++    page.getByLabel('Test failed', { exact: true }).locator('svg'),
++  ).toHaveClass(/text-danger/);
++  await expect(
++    page.getByLabel('Test unknown', { exact: true }).locator('svg'),
++  ).toHaveClass(/text-secondary/);
++  await expect(page.getByTestId('codex-response')).toContainText('Agent');
 +});
 +
 +test('Chat defaults to the exact execution and explains planning before Codex starts', async ({
@@ -1092,7 +2037,7 @@ index 0000000..9090749
 +  await page.route('http://127.0.0.1:18001/**', async (route) => {
 +    const url = new URL(route.request().url());
 +    requests.push(url);
-+    await route.fulfill({ json: { conversations: [], cursor: 0 } });
++    await respondWithSnapshot(route, { conversations: [], cursor: 0 });
 +  });
 +  await page.goto(workflowUrl);
 +  await expect(page).toHaveURL(/\/chat$/);
@@ -1104,6 +2049,8 @@ index 0000000..9090749
 +  ).toBeVisible();
 +  expect(requests.length).toBeGreaterThan(0);
 +  for (const url of requests) {
++    expect(url.pathname).toBe('/api/v1/codex/stream');
++    expect(url.searchParams.get('view')).toBe('thread');
 +    expect(url.searchParams.get('namespace')).toBe('default');
 +    expect(url.searchParams.get('workflow_id')).toBe(workflowId);
 +    expect(url.searchParams.get('run_id')).toBe(runId);
@@ -1188,7 +2135,7 @@ index 0000000..9090749
 +        },
 +      ],
 +    });
-+    await route.fulfill({ json: data });
++    await respondWithSnapshot(route, data);
 +  });
 +  await page.goto(workflowUrl);
 +  const chat = page.getByTestId('workflow-chat');
@@ -1279,12 +2226,7 @@ index 0000000..9090749
 +      current ? 'New execution output' : 'Previous execution output',
 +      1,
 +    );
-+    if (url.pathname.endsWith('/stream')) {
-+      await route.fulfill({
-+        contentType: 'text/event-stream',
-+        body: `event: conversations\ndata: ${JSON.stringify(data)}\n\n`,
-+      });
-+    } else await route.fulfill({ json: data });
++    await respondWithSnapshot(route, data);
 +  });
 +  await page.goto(`${workflowUrl}/chat`);
 +  await expect(

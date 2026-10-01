@@ -1,9 +1,12 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from temporalio_codex.execution_status import ExecutionProgress, report_progress
+    from temporalio_codex.models import RunInput
+    from temporalio_codex.delivery_models import CandidateEvidence
+    from temporalio_codex.workflows import CodexRunWorkflow
     from temporalio_codex.ticket_scheduler import (
         SchedulerInput,
         SchedulerResult,
@@ -27,6 +30,47 @@ class TicketSchedulerWorkflow:
         self._active_child_id: str | None = None
         self._active_child_run_id: str | None = None
         self._active_ticket: str | None = None
+        self._configuration_error = ""
+
+    @workflow.signal(name="configure_codex_runs")
+    def configure_codex_runs(
+        self, codex_runs: tuple[tuple[str, RunInput], ...]
+    ) -> None:
+        if self._input is None or self._input.automatic:
+            return
+        active_spec = self._active_spec()
+        frontier = (
+            ready_frontier(self._input, active_spec, self._completed_tickets)
+            if active_spec is not None
+            else ()
+        )
+        configured_keys = tuple(key for key, _ in codex_runs)
+        completed_operations = dict(self._input.completion_operations)
+        expected_keys = {
+            ticket.key
+            for ticket in self._input.tickets
+            if ticket.key not in self._completed_tickets
+            and ticket.key not in completed_operations
+        }
+        parent = workflow.info().parent
+        if (
+            not frontier
+            or set(configured_keys) != expected_keys
+            or len(configured_keys) != len(set(configured_keys))
+            or parent is None
+            or any(
+                not run_input.automatic
+                or run_input.candidate is None
+                or run_input.parent_workflow_id != parent.workflow_id
+                or run_input.parent_workflow_run_id != parent.run_id
+                for _, run_input in codex_runs
+            )
+        ):
+            self._configuration_error = "Codex ticket configuration failed validation"
+            self._status = SchedulerStatus.BLOCKED
+            self._reason = self._configuration_error
+            return
+        self._input = replace(self._input, automatic=True, codex_runs=codex_runs)
 
     @workflow.signal(name="execution_progress")
     async def execution_progress(self, progress: ExecutionProgress) -> None:
@@ -70,6 +114,13 @@ class TicketSchedulerWorkflow:
             return self._result()
         completion_operations = dict(input.completion_operations)
         while len(self._completed_tickets) < len(input.tickets):
+            checkpoint = workflow.get_signal_handler("component_checkpoint")
+            if checkpoint is not None:
+                await checkpoint()
+            input = self._input
+            assert input is not None
+            if self._configuration_error:
+                return self._result()
             active_spec = self._active_spec()
             if active_spec is None:
                 self._status = SchedulerStatus.BLOCKED
@@ -93,19 +144,27 @@ class TicketSchedulerWorkflow:
                     self._active_child_id = f"{workflow.info().workflow_id}:codex:{ticket_key}"
                     await report_progress(phase="codex", active_ticket=ticket_key,
                                           next_action="start ticket Codex execution")
-                    handle = await workflow.start_child_workflow(
-                        "CodexRunWorkflow",
-                        codex_runs[ticket_key],
-                        id=f"{workflow.info().workflow_id}:codex:{ticket_key}",
-                        result_type=dict,
-                    )
-                    self._active_child_run_id = handle.first_execution_run_id
-                    try:
-                        result = await handle
-                    finally:
-                        self._active_child_id = None
-                        self._active_child_run_id = None
-                        self._active_ticket = None
+                    if input.inline_codex:
+                        run_input = replace(codex_runs[ticket_key], operation_prefix=f"ticket:{ticket_key}:")
+                        if self._codex_results and self._codex_results[-1].get("candidate"):
+                            run_input = replace(run_input, candidate=CandidateEvidence(
+                                **self._codex_results[-1]["candidate"]
+                            ))
+                        result = asdict(await CodexRunWorkflow().run(run_input))
+                    else:
+                        handle = await workflow.start_child_workflow(
+                            "CodexRunWorkflow",
+                            codex_runs[ticket_key],
+                            id=f"{workflow.info().workflow_id}:codex:{ticket_key}",
+                            result_type=dict,
+                        )
+                        self._active_child_run_id = handle.first_execution_run_id
+                        try:
+                            result = await handle
+                        finally:
+                            self._active_child_id = None
+                            self._active_child_run_id = None
+                    self._active_ticket = None
                     self._codex_results.append(result)
                     if result.get("status") != "completed":
                         self._status = SchedulerStatus.BLOCKED
@@ -116,7 +175,8 @@ class TicketSchedulerWorkflow:
                         return self._result()
                     self._complete(
                         ticket_key,
-                        f"{workflow.info().workflow_id}:codex:{ticket_key}",
+                        f"{workflow.info().workflow_id}:ticket:{ticket_key}" if input.inline_codex
+                        else f"{workflow.info().workflow_id}:codex:{ticket_key}",
                     )
                 continue
             if input.automatic:
@@ -133,6 +193,10 @@ class TicketSchedulerWorkflow:
                     set(self._completed_tickets).intersection(frontier)
                 )
                 or self._active_spec() != active_spec
+                or self._configuration_error
+                or bool(
+                    set(dict(self._input.codex_runs)).intersection(frontier)
+                )
             )
         self._status = SchedulerStatus.COMPLETED
         return self._result()

@@ -169,6 +169,7 @@ def whole_flow_input() -> WholeFlowInput:
         "review-missing",
         "review-mismatch",
         "review-dirty",
+        "review-rejected",
     ],
 )
 async def test_two_spec_whole_flow_runs_through_public_child_workflows(
@@ -268,8 +269,8 @@ async def test_two_spec_whole_flow_runs_through_public_child_workflows(
                         "candidate_sha": "wrong"
                         if failure_phase == "review-mismatch"
                         else sha,
-                        "verdict": "approved",
-                        "findings": [],
+                        "verdict": "rejected" if failure_phase == "review-rejected" else "approved",
+                        "findings": ["finding"] if failure_phase == "review-rejected" else [],
                     }
                 )
                 if failure_phase == "review-missing":

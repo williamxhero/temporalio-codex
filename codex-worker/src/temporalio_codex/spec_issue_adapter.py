@@ -23,6 +23,7 @@ class SpecDraft:
     testing_decisions: tuple[str, ...]
     dependencies: tuple[str, ...] = ()
     provenance: tuple[str, ...] = ()
+    number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,11 @@ def validate_spec_graph(drafts: tuple[SpecDraft, ...]) -> tuple[str, ...]:
         errors.append("SPEC keys must not be empty")
     if len(set(keys)) != len(keys):
         errors.append("SPEC keys must be unique")
+    issue_numbers = [draft.number for draft in drafts if draft.number is not None]
+    if any(number < 1 for number in issue_numbers):
+        errors.append("SPEC issue numbers must be positive")
+    if len(set(issue_numbers)) != len(issue_numbers):
+        errors.append("SPEC issue numbers must be unique")
     known = set(keys)
     for draft in drafts:
         missing = sorted(set(draft.dependencies) - known)
@@ -150,7 +156,11 @@ async def publish_specs(
     try:
         for draft in topological_specs(input.drafts):
             operation_id = f"{input.operation_id}:{draft.key}"
-            existing = await gateway.find_by_operation(operation_id)
+            existing = (
+                await gateway.read_issue(draft.number)
+                if draft.number is not None
+                else await gateway.find_by_operation(operation_id)
+            )
             if existing is None:
                 existing = await gateway.create_issue(
                     input,
@@ -162,7 +172,8 @@ async def publish_specs(
                 await gateway.add_parent(input.umbrella_issue_number, existing.issue_id)
             readback = await gateway.read_issue(existing.number)
             if (
-                readback.operation_id != operation_id
+                (draft.number is None and readback.operation_id != operation_id)
+                or readback.number != (draft.number or existing.number)
                 or readback.parent_issue_number != input.umbrella_issue_number
             ):
                 return SpecPublicationResult(
@@ -170,7 +181,16 @@ async def publish_specs(
                     tuple(issues),
                     f"SPEC {draft.key} readback identity or parent mismatch",
                 )
-            issues.append(readback)
+            issues.append(
+                SpecIssueRecord(
+                    number=readback.number,
+                    issue_id=readback.issue_id,
+                    title=readback.title,
+                    operation_id=operation_id,
+                    parent_issue_number=readback.parent_issue_number,
+                    state=readback.state,
+                )
+            )
     except Exception as error:
         return SpecPublicationResult(
             SpecPublicationStatus.UNKNOWN,

@@ -523,6 +523,14 @@ ext_action=execute Codex planning turn、retry 0、last_error=null，deadline 20
 - Official Replay/`recover-failed` then restored the same Workflow ID from source run `0cd1eaf1-aa2b-470c-87b9-3e5a75129e41`, reset point event `108`, new execution `ddc3d932-d491-48d9-b469-1f667649a853`, unchanged input identity and candidate SHA, `recovery_review_only=false`.
 - Current durable state at 10:23 UTC: `codex/active`, ticket `CompanionDecisionCycleSpec-01`, next action `execute Codex planning turn`, deadline `2026-10-01T10:51:31.294294+00:00`; no completed SPEC or delivery evidence yet.
 
+## 2026-10-01 修复、部署与恢复
+
+- 最新源 run `82167be7-fcd3-4d64-bd64-eb24a80176db` 的失败根因已核实为独立 review 拒绝：审查环境无法写临时 SQLite，且无法读取 `williamxhero/stock_advisor` Issue #82/#84；不是业务验收通过或 Temporal poller 故障。
+- 修复提交 `4b5933095`、`263cd7852` 已推送到 `origin/main`。恢复入口现在把 completed parent 的通用失败与持久 TicketScheduler `BLOCKED` 结果、Codex review 拒绝证据逐项绑定；不接受仅凭失败字符串的 reset。worker 新增显式 `TEMPORALIO_CODEX_SANDBOX` 配置，部署使用 `full-access`，只读 operation 仍强制 `read_only`。
+- 验证：worker 全量 `314 passed, 1 skipped`；恢复/SPEC/SDK 定向 `59 passed`；`stock_advisor` `scripts/test.ps1 -ProjectRegression` `172 passed`；真实 SDK 环境探针成功读取 GitHub #82/#84（无失败项）。
+- 新 worker poller `27944@PC-HOME` 已注册 `codex-worker` 队列，模型配置为 `gpt-6.1-sol`。通过官方 `recover-failed --run-id --source-run-id --input-identity --freeze-candidate` 完成 Replay/Reset，reset point event `129`；新 execution `2313a892-9a0c-4b9e-ab5f-3d969306164e`，同一 Workflow ID 与 input identity，未创建重复顶层 Workflow。
+- 当前 durable 状态：`active / codex`，SPEC `CompanionDecisionCycleSpec`，ticket `CompanionDecisionCycleSpec-01`，`next_action=execute Codex planning turn`，无 `last_error`；尚无 completed ticket/SPEC、approved review、PR/merge 或最终交付证据，继续监督。
+
 ### Automation check 2026-10-01 11:06:18 UTC
 - Same Workflow ID remains active on execution bd7d940f-357e-4f53-80f0-90b81f48863d; durable status active, phase codex, active SPEC/ticket CompanionDecisionCycleSpec / CompanionDecisionCycleSpec-01, retry 0, no reason or last error.
 - Durable progress advanced from execute Codex implementation turn to execute Codex review turn; deadline extended to 2026-10-01T11:33:51.560627+00:00. Pending scheduler child remains active; completed SPECs/tickets, approved review, acceptance, PR/merge, and final delivery evidence are still absent.

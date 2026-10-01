@@ -7,6 +7,7 @@ from temporalio.api.enums.v1 import EventType, WorkflowExecutionStatus
 from temporalio.api.history.v1 import HistoryEvent
 from temporalio.client import WorkflowHistory
 from temporalio.converter import DefaultPayloadConverter
+
 from temporalio_codex import entry
 from temporalio_codex.candidate_activities import CandidateCaptureResult
 from temporalio_codex.codex_models import (
@@ -42,7 +43,7 @@ def test_completed_failure_is_bound_to_durable_scheduler_result(reason):
         WholeFlowPhase.FAILED,
         WholeFlowStatus.FAILED,
         scheduler={"status": "failed", "runs": [scheduler.__dict__]},
-        reason=reason,
+        reason="ticket scheduling did not complete",
     )
     entry._validate_completed_ticket_failure(
         result,
@@ -64,7 +65,7 @@ def test_completed_failure_refuses_unbound_failure(change):
         "phase": WholeFlowPhase.FAILED,
         "status": WholeFlowStatus.FAILED,
         "scheduler": {"status": "failed", "runs": [scheduler.__dict__]},
-        "reason": reason,
+        "reason": "ticket scheduling did not complete",
     }
     if change == "child_status":
         scheduler = SchedulerResult(

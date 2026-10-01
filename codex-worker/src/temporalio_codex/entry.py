@@ -409,7 +409,8 @@ def _validate_completed_ticket_failure(result, history, payload_converter) -> No
         or not runs
         or runs[-1].get("workflow_id") != scheduler.workflow_id
         or runs[-1].get("status") != scheduler.status.value
-        or result.reason != (scheduler.reason or "ticket scheduling did not complete")
+        or result.reason != "ticket scheduling did not complete"
+        or runs[-1].get("reason") != scheduler.reason
     ):
         raise ValueError(
             "completed execution is not the verified ticket scheduling failure"
